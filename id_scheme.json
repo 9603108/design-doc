@@ -1,0 +1,282 @@
+{
+  "_meta": {
+    "schema_version": "1.0",
+    "_purpose": "design-doc skill v43 — ID 体系をスキル付属の汎用設定として外部化。16 カテゴリの prefix/display_name/source_field を定義し、スキル本体（migrate/apply_logging_steps/apply_trigger_dispatch/generate_docx.js 等）は本ファイル経由で接頭辞を取得することで、新カテゴリ追加時は本 JSON にエントリ追記のみで対応可能（スキル本体の改修不要）",
+    "_design_principles": [
+      "接頭辞は 2 文字統一（規則性最大、業務担当者の覚えやすさ）",
+      "連番は 1 始まり可変桁（FR1, FR2, ..., FR49 形式、ゼロパディングなし）",
+      "サブ ID（観測点のサブ観測等）は <prefix>#-<sub_label> 形式（例: LG4-a, LG4-b）",
+      "ID 接頭辞は全カテゴリ間で衝突しないこと（先頭2文字一意）",
+      "新カテゴリ追加時は本 JSON にエントリ追記のみ、スキル本体改修不要"
+    ],
+    "_changelog": "v43: 旧体系（A#/F###/B###/L# 等）から新体系（AR#/FR#/BE#/LG# 等）へ全面移行。1 始まり可変桁、2 文字接頭辞統一 / v48: 各カテゴリに header_self（自カテゴリ表の ID 列ヘッダ）と header_ref（他カテゴリから参照される時のヘッダ）を追加。generate_docx.js の表ヘッダ生成を id_scheme 経由化することで、別案件で『Step→ステップ』等の表記変更時にスキル本体改修不要 / v49: db_operation カテゴリは廃止予定（§6.11 DB操作 セクション廃止に伴い、SQL 詳細は §6.2 BEX 内の【②DB問合せ】に展開、SQL 識別子は §6.2.X.X.X.X.X の章内サブ番号 ②-1, ②-2, ... で代替）。response_to_screen_mapping は front_processes へ移動、API実行 ラベル統一、画面項目表は『AR# / IT# / 名称』統合表記の 4 列構成"
+  },
+
+  "format": {
+    "padding": "none",
+    "start_number": 1,
+    "sub_label_separator": "-",
+    "examples": ["FR1", "FR49", "LG4-a", "AR1", "BE10", "MS1"]
+  },
+
+  "_header_label_design": {
+    "_purpose": "v48 で追加。各カテゴリに 2 種類の表ヘッダラベルを定義し、generate_docx.js の固定文字列を本ファイル経由に変換することで、別案件での表記変更時にスキル本体改修ゼロを実現",
+    "header_self": "自カテゴリの ID 列ヘッダ（例: §4.3 画面項目表の『No』列、§6.7 観測点ログ表の『Step』列）。多くのカテゴリでは『No』だが、area は『エリア#』、step は『Step』のような特殊表記がある",
+    "header_ref": "他カテゴリから参照される時のヘッダ（例: §4.3 画面項目表の『イベントNo』列 = event カテゴリへの参照、§5.1 トリガー表の『エリア#』列 = area カテゴリへの参照）。参照先カテゴリの header_ref を使う",
+    "usage_in_generate_docx_js": "loadIdScheme() でロードし、getIdHeaderLabel(key, mode='self'|'ref') ヘルパーで取得。例: getIdHeaderLabel('event', 'ref') === 'イベントNo'"
+  },
+
+  "categories": [
+    {
+      "key": "area",
+      "prefix": "AR",
+      "display_name": "エリア",
+      "description": "画面の論理エリア（ヘッダ・グリッド・ナビゲーション 等の業務担当者語彙の区画）",
+      "source_field": "screen_layout.areas[].area_no",
+      "legacy_format": "A#",
+      "header_self": "エリア#",
+      "header_ref": "エリア#",
+      "appears_in_sections": ["§4.2", "§4.3.X (見出し)", "§5.1.X (見出し)"]
+    },
+    {
+      "key": "item",
+      "prefix": "IT",
+      "display_name": "画面項目",
+      "description": "画面上の入力・表示項目（テキスト入力、ボタン、ラベル、テーブルセル 等）",
+      "source_field": "screen_layout.items[].no",
+      "legacy_format": "数字（連番）",
+      "header_self": "No",
+      "header_ref": "項目No",
+      "appears_in_sections": ["§4.3.X (表)"]
+    },
+    {
+      "key": "event",
+      "prefix": "EV",
+      "display_name": "イベント",
+      "description": "画面で発生する全イベント（業務担当者の操作 + 内部処理 + 自動・外部 起動）",
+      "source_field": "events[].no",
+      "legacy_format": "数字（連番）",
+      "header_self": "No",
+      "header_ref": "イベントNo",
+      "appears_in_sections": ["§5.1, §5.2, §5.3 (表)", "§4.3.X (イベントNo 列)"]
+    },
+    {
+      "key": "trigger",
+      "prefix": "TR",
+      "display_name": "トリガー",
+      "description": "trigger_groups 内の各トリガー（グループ内連番）",
+      "source_field": "trigger_groups[].triggers[].trigger_no",
+      "legacy_format": "数字（グループ内連番）",
+      "header_self": "No",
+      "header_ref": "トリガーNo",
+      "appears_in_sections": ["§5.1.X.N, §5.2.X.N, §5.3.X.N (表)"]
+    },
+    {
+      "key": "front_process",
+      "prefix": "FR",
+      "display_name": "フロント処理",
+      "description": "業務処理のフロント側本体（画面操作の起点、API 呼出、画面更新 等）",
+      "source_field": "front_processes[].process_id",
+      "legacy_format": "F###",
+      "id_naming_convention": "数字連番が基本、URL パラメータ別の派生は <prefix>#-<suffix> 形式（例: FR1-EDIT、FR1-VIEW、FR1-MISC）",
+      "header_self": "No",
+      "header_ref": "処理No",
+      "appears_in_sections": ["§6.1.X.N (見出し + 表)"]
+    },
+    {
+      "key": "backend_process",
+      "prefix": "BE",
+      "display_name": "バックエンド処理",
+      "description": "業務処理のバックエンド側本体（バックエンドの action ディスパッチ単位）",
+      "source_field": "backend_processes[].process_id",
+      "legacy_format": "B###",
+      "header_self": "No",
+      "header_ref": "処理No",
+      "appears_in_sections": ["§6.2.X.N (見出し + 表)"]
+    },
+    {
+      "key": "logging",
+      "prefix": "LG",
+      "display_name": "観測点ログ処理",
+      "description": "観測点ログ処理の独立処理（project_config の logging.observation_points に定義した観測点 + サブ観測）。各 F00X/B00X の steps から呼出参照",
+      "source_field": "common_logging_processes[].process_id",
+      "legacy_format": "L# + L#a-f",
+      "id_naming_convention": "観測点番号と一致（LG1, LG2, ...）、サブ観測はサフィックス（LG4-a, LG4-b, ...）",
+      "header_self": "No",
+      "header_ref": "ログNo",
+      "appears_in_sections": ["§6.7.X (見出し + 表)", "各 F00X/B00X の steps 内呼出"]
+    },
+    {
+      "key": "step",
+      "prefix": "ST",
+      "display_name": "ステップ",
+      "description": "front_processes/backend_processes/common_logging_processes 内の処理ステップ（処理内連番）",
+      "source_field": "various.steps[].step_no",
+      "legacy_format": "数字（処理内連番）",
+      "header_self": "Step",
+      "header_ref": "ステップNo",
+      "appears_in_sections": ["§6.1, §6.2, §6.7 内の表"]
+    },
+    {
+      "key": "api",
+      "prefix": "AP",
+      "display_name": "API仕様",
+      "description": "API エンドポイント仕様（v17 体系の独立章、v18 以降は backend_processes に統合済だが docx 上では並列表示）",
+      "source_field": "api_spec[].no",
+      "legacy_format": "数字（連番）",
+      "header_self": "No",
+      "header_ref": "APINo",
+      "appears_in_sections": ["§6.10 (表)"]
+    },
+    {
+      "key": "db_operation",
+      "prefix": "DB",
+      "display_name": "DB操作",
+      "description": "DB 操作の独立仕様（SELECT/INSERT/UPDATE/DELETE 単位）",
+      "source_field": "db_operations[].id",
+      "legacy_format": "db_op_xxx（文字列 ID）",
+      "id_naming_convention": "数字連番に統一（DB1, DB2, ..., DB14）。旧 db_op_xxx 表記は legacy_id フィールドに保持",
+      "header_self": "No",
+      "header_ref": "DB操作No",
+      "appears_in_sections": ["§6.11 (表)"],
+      "_deprecated_since_v49": "§6.11 DB操作 セクションを廃止し、SQL 詳細は §6.2 BEX 内の【②DB問合せ】に展開する設計に変更。SQL 識別子は §6.2 BEX 内の章内サブ番号（②-1, ②-2, ...）で代替するため、本カテゴリの新規 ID 採番は v49 以降不要。既存中間 JSON の db_operations[] は backend_processes[].processing[].db_op_detail に統合済（v43 で完了）、apply_id_scheme.py は冪等性のため引き続き処理するが、generate_docx.js は §6.11 を出力しない"
+    },
+    {
+      "key": "validation",
+      "prefix": "VL",
+      "display_name": "バリデーション",
+      "description": "入力検証ルール（形式チェック、必須チェック、業務的制約 等）",
+      "source_field": "validations[].no",
+      "legacy_format": "数字（連番）",
+      "header_self": "No",
+      "header_ref": "バリデーションNo",
+      "appears_in_sections": ["§6.3, §6.8 (表)"]
+    },
+    {
+      "key": "calculation",
+      "prefix": "CA",
+      "display_name": "計算式",
+      "description": "業務計算式（請求額計算、消費税計算 等の式仕様）",
+      "source_field": "calculations[].no",
+      "legacy_format": "識別子列なし（result_name で識別）",
+      "id_naming_convention": "v43 で新規付与（CA1, CA2, ...）。既存 result_name は legacy_id として保持",
+      "header_self": "No",
+      "header_ref": "計算No",
+      "appears_in_sections": ["§6.4, §6.9 (表)"]
+    },
+    {
+      "key": "common_logic",
+      "prefix": "CL",
+      "display_name": "共通ロジック",
+      "description": "共通ビジネスロジック（業務横断で使われる関数・ルール）",
+      "source_field": "common_logic[].no",
+      "legacy_format": "数字（連番）",
+      "header_self": "No",
+      "header_ref": "ロジックNo",
+      "appears_in_sections": ["§6.5, §6.13 (表)"]
+    },
+    {
+      "key": "parameter",
+      "prefix": "PR",
+      "display_name": "パラメータ",
+      "description": "業務パラメータ（受注月、請求区分 等の入力パラメータ）",
+      "source_field": "parameters[].no",
+      "legacy_format": "識別子列なし（name で識別）",
+      "id_naming_convention": "v43 で新規付与（PR1, PR2, ...）",
+      "header_self": "No",
+      "header_ref": "パラメータNo",
+      "appears_in_sections": ["§6.6, §6.12 (表)"]
+    },
+    {
+      "key": "message",
+      "prefix": "MS",
+      "display_name": "メッセージ",
+      "description": "業務メッセージ（バリデーションエラー、情報メッセージ、確認ダイアログ 等）",
+      "source_field": "messages[].message_id",
+      "legacy_format": "MSE##### / MSI##### (旧システム由来(任意))",
+      "id_naming_convention": "v43 で新規付与（MS1, MS2, ...）。既存 MSE/MSI 表記は legacy_id として保持（旧システム移行時の業務追跡用(任意)）",
+      "header_self": "No",
+      "header_ref": "メッセージNo",
+      "appears_in_sections": ["§7 (表)", "バリデーションから参照"]
+    },
+    {
+      "key": "logical_name",
+      "prefix": "LN",
+      "display_name": "論理名対応",
+      "description": "DB 物理名 ↔ 論理名対応表のエントリ",
+      "source_field": "logical_names[].no",
+      "legacy_format": "識別子列なし",
+      "id_naming_convention": "v43 で新規付与（LN1, LN2, ...）",
+      "header_self": "No",
+      "header_ref": "論理名No",
+      "appears_in_sections": ["§8 (表)"]
+    },
+    {
+      "key": "report",
+      "prefix": "RP",
+      "display_name": "帳票",
+      "description": "業務帳票仕様（見積書 / 納品書 / 請求書 等の出力帳票）",
+      "source_field": "reports[].id",
+      "legacy_format": "識別子列なし",
+      "id_naming_convention": "v48 で新規付与（RP1, RP2, ...）",
+      "header_self": "No",
+      "header_ref": "帳票No",
+      "appears_in_sections": ["§9 帳票仕様 (将来拡張、generate_docx.js セクション追加が必要)"]
+    },
+    {
+      "key": "batch",
+      "prefix": "BT",
+      "display_name": "バッチ",
+      "description": "バッチ処理仕様（夜間バッチ / 月次バッチ / 年次締め 等の非対話処理）",
+      "source_field": "batches[].id",
+      "legacy_format": "識別子列なし",
+      "id_naming_convention": "v48 で新規付与（BT1, BT2, ...）",
+      "header_self": "No",
+      "header_ref": "バッチNo",
+      "appears_in_sections": ["§10 バッチ仕様 (将来拡張)"]
+    },
+    {
+      "key": "job",
+      "prefix": "JB",
+      "display_name": "ジョブ",
+      "description": "ジョブスケジュール（cron 起動 / スケジューラ 等の起動契機定義）",
+      "source_field": "jobs[].id",
+      "legacy_format": "識別子列なし",
+      "id_naming_convention": "v48 で新規付与（JB1, JB2, ...）",
+      "header_self": "No",
+      "header_ref": "ジョブNo",
+      "appears_in_sections": ["§11 ジョブ仕様 (将来拡張)"]
+    },
+    {
+      "key": "file",
+      "prefix": "FL",
+      "display_name": "ファイル",
+      "description": "ファイル仕様（CSV / 定型フォーマット / PDF / xlsx 等の入出力ファイル定義）",
+      "source_field": "files[].id",
+      "legacy_format": "識別子列なし",
+      "id_naming_convention": "v48 で新規付与（FL1, FL2, ...）",
+      "header_self": "No",
+      "header_ref": "ファイルNo",
+      "appears_in_sections": ["§12 ファイル仕様 (将来拡張)"]
+    }
+  ],
+
+  "_extension_guide": {
+    "_purpose": "新カテゴリ追加時の手順",
+    "steps": [
+      "1. 本 categories[] に新エントリ追加（key/prefix/display_name/description/source_field を定義）",
+      "2. prefix は既存 16 種と衝突しない 2 文字を選ぶ（例: 帳票=RP, バッチ=BT, ジョブ=JB, ファイル=FL）",
+      "3. header_self（自カテゴリ ID 列のヘッダ）と header_ref（他カテゴリから参照される時のヘッダ）を必ず定義（v48 以降の規約）",
+      "4. 該当する中間 JSON のセクションも追加（front_processes と並ぶ独立配列 or 既存配列の拡張）",
+      "5. generate_docx.js に該当セクションの表示処理を追加（既存 sectionXxx と同じパターン）",
+      "6. apply_id_scheme.py が自動的に新カテゴリの ID を生成・参照を更新（本ファイルを読むだけ、スクリプト改修不要）"
+    ],
+    "_promoted_in_v48": "report(RP) / batch(BT) / job(JB) / file(FL) は v48 で実カテゴリに昇格（categories[] 本体に移動）。中間 JSON 側に reports[]/batches[]/jobs[]/files[] 配列を追加するだけで apply_id_scheme.py が自動的に RP1/BT1/JB1/FL1 を採番することを実証",
+    "examples_of_future_categories": [
+      { "key": "external", "prefix": "EX", "header_self": "No", "header_ref": "外部連携No", "use_case": "外部 API/サービス連携仕様" },
+      { "key": "permission", "prefix": "PM", "header_self": "No", "header_ref": "権限No", "use_case": "権限・ロール定義" },
+      { "key": "session", "prefix": "SE", "header_self": "No", "header_ref": "セッションNo", "use_case": "セッション・コンテキスト" },
+      { "key": "config", "prefix": "CF", "header_self": "No", "header_ref": "設定No", "use_case": "設定値" }
+    ]
+  }
+}

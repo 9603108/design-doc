@@ -1,0 +1,295 @@
+{
+  "_meta": {
+    "目的": "架空の「受注入力」画面(examples/sample/src/order_detail.html)を design-doc スキルで解析するための、画面別の設定。",
+    "意味合い": "初めて使う人が書き方を真似るための雛形。自分の案件では、このファイルを複製して値を書き換える。",
+    "接続情報": "target/intermediate/ へ「受注入力_screen_config.json」の名前のまま置くと、target/scripts/_config_loader.py が機能名「受注入力」で読む。source_html_path は、このスキルを ${HOME}/.claude/skills/design-doc 以外に置いた場合に書き換える。trigger_dispatch の then_call(F002 など)は、中間 JSON の event_processes が EV01 から EV07 の順に並ぶ前提の番号(初期処理が F001、以降は並び順に F002 から)。screen_name は「〜画面」で終わる画面の正式名で、feature_name に「画面」を付けたものと一致させる(検証スクリプト verify_intermediate.py が、トリガー文の画面名をこの形で照合する)。initial_processes のうちバックエンドを呼ぶ step には backend_call.backend_id を書く。値は「B」と3桁の通し番号で、Phase 1 で作る api_spec の並び順に対応する(1件目が B001。このサンプルでは受注データの取得)。これが画面側の処理とバックエンドの処理を結ぶ。process_overview_overrides は、処理の概要を短い文で上書きする(キーは F001 などの処理番号)。概要は30字以内(25字が目安)で、物理名(英字の変数名や関数名)を含めない。初期処理(F001)の概要は自動生成だと長くなるので、ここで上書きする。F004・F005 は、Phase 1 で書く処理内容の最初の1文が30字を超える場合に備えた上書き。"
+  },
+  "feature_name": "受注入力",
+  "screen_name": "受注入力画面",
+  "source_html_path": "${HOME}/.claude/skills/design-doc/examples/sample/src/order_detail.html",
+  "project_pattern": "バックエンド統合型",
+  "profile": "CRUD型",
+  "backend_files": [
+    "order-handler/handler.py",
+    "common/python/db_utils.py"
+  ],
+  "shared_modules": [
+    {
+      "path": "common/python/db_utils.py",
+      "description": "データベース接続の共通モジュール"
+    }
+  ],
+  "file_descriptions": {
+    "js": {
+      "api.js": "API 呼出の共通関数(apiCall)",
+      "order_detail.js": "受注入力画面の処理(表示・入力・再計算・保存)"
+    },
+    "css": {}
+  },
+  "areas": [
+    {
+      "area_no": "A1",
+      "area_name": "ヘッダエリア",
+      "screen_no": "1",
+      "description": "受注番号・受注日・顧客コード・顧客名と、検索ボタン"
+    },
+    {
+      "area_no": "A2",
+      "area_name": "明細エリア",
+      "screen_no": "2",
+      "description": "受注明細の行(商品コード・商品名・数量・単価・金額)"
+    },
+    {
+      "area_no": "A3",
+      "area_name": "フッタエリア",
+      "screen_no": "3",
+      "description": "小計・消費税・請求額(いずれも自動計算の表示項目)"
+    },
+    {
+      "area_no": "A4",
+      "area_name": "ボタンエリア",
+      "screen_no": "4",
+      "description": "行追加・保存・クリアのボタンと、メッセージ欄"
+    }
+  ],
+  "process_names_by_event_code": {
+    "EV00": "初期表示",
+    "EV01": "顧客コード入力",
+    "EV02": "商品コード入力",
+    "EV03": "数量・単価変更",
+    "EV04": "検索ボタン",
+    "EV05": "行追加",
+    "EV06": "保存",
+    "EV07": "クリア"
+  },
+  "initial_processes": {
+    "processes": [
+      {
+        "process_id": "F001",
+        "name": "初期表示",
+        "url_param_match": "URL パラメータ order_no(受注番号)あり",
+        "preconditions": [
+          "業務担当者が受注番号つきの URL で画面を開く"
+        ],
+        "postconditions": [
+          "受注のヘッダと明細が画面に表示される",
+          "金額・小計・消費税・請求額が計算されて表示される"
+        ],
+        "steps": [
+          {
+            "kind": "backend_call",
+            "description": "受注番号で受注データ(ヘッダと明細)を取得する",
+            "backend_call": {
+              "backend_id": "B001",
+              "request_summary": "受注番号を渡し、受注のヘッダと明細を受け取る"
+            }
+          },
+          {
+            "kind": "screen_update",
+            "description": "受注番号・受注日・顧客コード・顧客名をヘッダエリアに表示する"
+          },
+          {
+            "kind": "screen_update",
+            "description": "受注明細を明細エリアに1行ずつ表示する"
+          },
+          {
+            "kind": "calculation",
+            "description": "金額・小計・消費税・請求額を再計算してフッタエリアに表示する"
+          }
+        ]
+      }
+    ]
+  },
+  "process_overview_overrides": {
+    "F001": "受注番号の指定があれば受注データを表示する",
+    "F004": "数量・単価の変更で金額と合計を再計算する",
+    "F005": "受注番号で受注データを取得して表示する"
+  },
+  "trigger_dispatch": {
+    "EV00": {
+      "trigger_match_kind": "auto",
+      "trigger_match_keyword": "初期表示",
+      "dispatch": [
+        {
+          "condition": "URL パラメータに受注番号がある",
+          "then_call": "F001"
+        },
+        {
+          "condition": "URL パラメータに受注番号が無い",
+          "then_terminate": true,
+          "then_message": "明細エリアに空の行を1行用意し、入力待ちにする"
+        }
+      ],
+      "strip_step_keywords": []
+    },
+    "EV01": {
+      "trigger_match_keyword": "顧客コード",
+      "dispatch": [
+        {
+          "condition": "(無条件)",
+          "then_call": "F002"
+        }
+      ],
+      "strip_step_keywords": []
+    },
+    "EV02": {
+      "trigger_match_keyword": "商品コード",
+      "dispatch": [
+        {
+          "condition": "(無条件)",
+          "then_call": "F003"
+        }
+      ],
+      "strip_step_keywords": []
+    },
+    "EV04": {
+      "trigger_match_keyword": "検索",
+      "dispatch": [
+        {
+          "condition": "(無条件)",
+          "then_call": "F005"
+        }
+      ],
+      "strip_step_keywords": []
+    },
+    "EV06": {
+      "trigger_match_keyword": "保存",
+      "dispatch": [
+        {
+          "condition": "受注番号が未入力",
+          "then_terminate": true,
+          "then_message": "「受注番号を入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "受注日が未入力",
+          "then_terminate": true,
+          "then_message": "「受注日を入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "顧客コードが未入力",
+          "then_terminate": true,
+          "then_message": "「顧客コードを入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "商品コードが未入力の行がある",
+          "then_terminate": true,
+          "then_message": "「商品コードを入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "数量が1以上の整数でない行がある",
+          "then_terminate": true,
+          "then_message": "「数量は1以上の整数で入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "単価が0以上の整数でない行がある",
+          "then_terminate": true,
+          "then_message": "「単価は0以上の整数で入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "入力済みの明細が1行も無い",
+          "then_terminate": true,
+          "then_message": "「明細を1行以上入力してください。」と表示し保存を中断"
+        },
+        {
+          "condition": "入力チェックをすべて通過",
+          "then_call": "F007"
+        }
+      ],
+      "strip_step_keywords": []
+    }
+  },
+  "diagrams": {
+    "process_structure": {
+      "type": "flowchart",
+      "title": "処理構成図",
+      "doc_section": "§2.1",
+      "spec": {
+        "nodes": [
+          {
+            "id": "start",
+            "label": "受注入力画面表示",
+            "style": "start"
+          },
+          {
+            "id": "has_order_no",
+            "label": "受注番号の指定あり",
+            "style": "decision"
+          },
+          {
+            "id": "load",
+            "label": "受注データ取得・表示",
+            "style": "process"
+          },
+          {
+            "id": "input",
+            "label": "ヘッダ・明細の入力",
+            "style": "process"
+          },
+          {
+            "id": "recalc",
+            "label": "金額・合計の再計算",
+            "style": "process"
+          },
+          {
+            "id": "validate",
+            "label": "入力チェック",
+            "style": "decision"
+          },
+          {
+            "id": "save",
+            "label": "受注の保存",
+            "style": "process"
+          },
+          {
+            "id": "done",
+            "label": "保存完了の表示",
+            "style": "end"
+          }
+        ],
+        "edges": [
+          {
+            "from": "start",
+            "to": "has_order_no"
+          },
+          {
+            "from": "has_order_no",
+            "to": "load",
+            "label": "あり"
+          },
+          {
+            "from": "has_order_no",
+            "to": "input",
+            "label": "なし"
+          },
+          {
+            "from": "load",
+            "to": "input"
+          },
+          {
+            "from": "input",
+            "to": "recalc"
+          },
+          {
+            "from": "recalc",
+            "to": "validate",
+            "label": "保存ボタン"
+          },
+          {
+            "from": "validate",
+            "to": "input",
+            "label": "エラー"
+          },
+          {
+            "from": "validate",
+            "to": "save",
+            "label": "OK"
+          },
+          {
+            "from": "save",
+            "to": "done"
+          }
+        ]
+      }
+    }
+  }
+}

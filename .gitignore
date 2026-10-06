@@ -1,0 +1,10 @@
+.serena/
+.claude/
+__pycache__/
+.state/
+*.bak*
+*.new-*
+.DS_Store
+target/intermediate/
+target/output/
+target/diagrams/

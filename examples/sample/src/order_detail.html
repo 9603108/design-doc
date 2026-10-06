@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>受注入力</title>
+<!--
+  目的: design-doc スキルのサンプル「受注入力」画面(架空の業務)。
+  意味合い: 設定の書き方を真似るための雛形であり、スクリプトが解析する入力でもある。
+            画面項目の id / class は js/order_detail.js が参照する名前なので、変えるときは両方を合わせる。
+  接続情報: 末尾の script 2本(共通の apiCall を定義する common/js/api.js、画面の処理 js/order_detail.js)を読み込む。
+            script の src は「/」始まりで書く(プロジェクトルート = common/ を持つ階層からの相対として解決される)。
+-->
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  label { display: inline-block; margin: 0 12px 8px 0; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #999; padding: 4px; }
+  input[readonly] { background: #eee; }
+  .num { text-align: right; }
+  #messageArea { color: #c00; min-height: 1.5em; }
+</style>
+</head>
+<body>
+<h1>受注入力</h1>
+
+<!-- メッセージ欄: 入力チェックと API のエラーメッセージを表示する -->
+<div id="messageArea" role="alert"></div>
+
+<!-- ヘッダ: 受注の見出し情報。顧客名は顧客コードから取得するので読取専用 -->
+<section id="headerArea">
+  <label>受注番号 <input type="text" id="orderNo"></label>
+  <button type="button" id="btnSearch">検索</button>
+  <br>
+  <label>受注日 <input type="date" id="orderDate"></label>
+  <label>顧客コード <input type="text" id="customerCode"></label>
+  <label>顧客名 <input type="text" id="customerName" readonly></label>
+</section>
+
+<!-- 明細: 1行が受注明細1件。商品名は商品コードから取得、金額は数量×単価の計算結果なので読取専用 -->
+<section id="detailArea">
+  <table>
+    <thead>
+      <tr><th>商品コード</th><th>商品名</th><th>数量</th><th>単価</th><th>金額</th></tr>
+    </thead>
+    <tbody id="itemRows">
+      <tr>
+        <td><input type="text" class="item-code"></td>
+        <td><input type="text" class="item-name" readonly></td>
+        <td><input type="number" class="quantity num" min="1" step="1"></td>
+        <td><input type="number" class="unit-price num" min="0" step="1"></td>
+        <td><input type="text" class="amount num" readonly></td>
+      </tr>
+    </tbody>
+  </table>
+  <button type="button" id="btnAddRow">行追加</button>
+</section>
+
+<!-- フッタ: 合計はすべて計算結果なので読取専用 -->
+<section id="footerArea">
+  <label>小計 <input type="text" id="subtotal" class="num" readonly></label>
+  <label>消費税 <input type="text" id="tax" class="num" readonly></label>
+  <label>請求額 <input type="text" id="totalAmount" class="num" readonly></label>
+</section>
+
+<section id="buttonArea">
+  <button type="button" id="btnSave">保存</button>
+  <button type="button" id="btnClear">クリア</button>
+</section>
+
+<script src="/common/js/api.js"></script>
+<script src="/js/order_detail.js"></script>
+</body>
+</html>
