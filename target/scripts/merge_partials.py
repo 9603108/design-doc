@@ -92,7 +92,8 @@ def build_initialization(events: list, screen_layout: dict) -> dict:
 
 def build_event_processes(events: list, db_operations: list) -> list:
     """機能別処理シートを最小テンプレで生成。
-    event_code と api_endpoint.action / trigger_event のマッチングで db_operations_ref を埋める。
+    event_code と api_endpoint.trigger_event(単数)/ trigger_events(event_code の配列)の
+    一致で db_operations_ref を埋める(action では照合しない。2026-10-09 trigger_events 対応)。
     pattern は GET/POST/INSERT/UPDATE/DELETE の operation_type から推定。
     Overview は events[].content をそのまま転載（業務担当者の語彙への変換は既に済んでいる前提）。"""
     pattern_map = {
@@ -108,11 +109,17 @@ def build_event_processes(events: list, db_operations: list) -> list:
         ev_code = ev.get("event_code", "")
         ev_content = ev.get("content", "")
 
-        # 紐づく DB操作を探す（api_endpoint.action / trigger_event いずれかでマッチ）
+        # 紐づく DB操作を探す（api_endpoint.trigger_event / trigger_events の event_code 一致でマッチ）
+        # 2026-10-09 trigger_events 対応:
+        #   目的: 同じ action を複数イベントから呼ぶ多対一を api_endpoint.trigger_events(event_code の配列)で表せるようにする。
+        #   意味合い: 単数 trigger_event と併用でき、キーが無い・null なら従来どおり単数のみで判定する。
+        #     op ごとに1回だけ判定するので、単数と配列に同じ event_code があっても db_operations_ref には1回だけ入る。
+        #     見落とすと多対一の API が db_operations_ref に出ず、pattern が §9-G に落ちる。
+        #   接続情報: 少なくとも migrate_v17_to_v18.fill_event_backend_calls が同じキー(trigger_event / trigger_events)を読む。
         related_db_ops = []
         for op in db_operations:
             api = op.get("api_endpoint", {}) or {}
-            if api.get("trigger_event") == ev_code:
+            if api.get("trigger_event") == ev_code or ev_code in (api.get("trigger_events") or []):
                 related_db_ops.append(op.get("id", ""))
 
         # pattern 推定

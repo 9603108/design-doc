@@ -16,7 +16,11 @@ from pathlib import Path
 # 目的: 特定案件の置き場・画面名に依存せず、どの機能の中間 JSON でも処理できるようにする。
 # 接続情報: 機能名は第1引数か環境変数 FEATURE_NAME（どちらも無ければ _config_loader 側が SystemExit で止める）。
 #           INTERMEDIATE は main() が読み込みと上書き保存の両方に使う。
-from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv
+# 2026-10-09 項目名の「の」対応: get_screen_name / get_areas を追加。
+# 目的: parse_trigger が screen_config の screen_name と areas[].area_name を前方一致で先に取り除き、
+#       残りの項目名を「の」で割らずに保てるようにする（「売上表の名称リンク」など）。
+# 接続情報: どちらも _config_loader の既存アクセサで、FEATURE_NAME を明示で渡す（normalize_screen_terminology.py と同じ流儀）。
+from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv, get_screen_name, get_areas
 
 FEATURE_NAME = get_feature_name_from_argv()
 INTERMEDIATE = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
@@ -102,6 +106,14 @@ def parse_trigger(trigger: str) -> dict:
     """trigger 文字列を action（動作）と location（階層配列）に分解する。
     意味合い: 「サンプル画面のワークフローステッパー[5]「確定」ボタンをクリックする。」を
               ['サンプル画面', 'ワークフローステッパー[5]', '「確定」ボタン'] + 'クリック' に分解。
+    分割規則（2026-10-09 改訂）:
+      新規則: screen_config の screen_name（直後の「（…）」は任意）を先頭から前方一致で取り除き、
+              続く「の」「で」を区切りとする。次に areas[].area_name のどれかが前方一致すれば（最長一致）
+              そのエリア名（直後に [N] があれば結合）を1要素とし、直後の「の」を捨てる。残りは [N] 区切りの
+              階層としてだけ分割し、各要素は「の」で割らない（例: ['売上レポート画面', '[22]', '売上表の名称リンク']）。
+      従来規則: screen_name が空・前方一致しない・screen_config が無い（FileNotFoundError）ときは、
+              非貪欲に「…画面」までを画面名とし、残りを [N] と「の」の両方で分割する。
+    接続情報: 出力の location は少なくとも migrate_v17_to_v18.py と normalize_screen_terminology.py が入力に使う。
     フォールバック: 解析できなかった場合、全文を location[0] に入れ、action は空文字。"""
     if not trigger or not isinstance(trigger, str):
         return {"action": "", "location": [], "raw": trigger or ""}
@@ -125,15 +137,39 @@ def parse_trigger(trigger: str) -> dict:
 
     parts = []
 
+    # 2026-10-09 項目名の「の」対応: screen_config の screen_name / areas[].area_name を読む。
+    # 目的: 画面名とエリア名を前方一致で先に取り除き、残りの項目名を「の」で割らないようにする。
+    # 意味合い: screen_config が無い機能では load_screen_config が FileNotFoundError を出す。
+    #           新しい設定を要求せず従来どおり動かすための仕様として捕まえ、従来規則（split_no=True）に落とす。
+    # 接続情報: get_screen_name / get_areas（_config_loader）。screen_name は trigger 文の先頭の語と同じ字面である前提。
+    try:
+        screen_name = get_screen_name(FEATURE_NAME)
+        area_names = [a.get('area_name', '') for a in get_areas(FEATURE_NAME)]
+    except FileNotFoundError:
+        screen_name, area_names = '', []
+    m_new = re.match('^(' + re.escape(screen_name) + r'(?:（[^）]+）)?)(?:の|で)(.+)$', rest) if screen_name else None
+    split_no = m_new is None  # 従来規則のときだけ、項目名を「の」でも割る
+
     # 3. 画面名（「...画面(...)」）を最初に抽出
-    m = re.match(r'^(.+?画面(?:（[^）]+）)?)(?:の|で)(.+)$', rest)
-    if m:
-        parts.append(m.group(1))
-        rest = m.group(2)
-    elif rest.endswith('画面') or '画面' in rest:
-        # 「で」「の」が無くても画面名で終わる場合（初期表示時など）
-        parts.append(rest)
-        rest = ''
+    if m_new:
+        parts.append(m_new.group(1))
+        rest = m_new.group(2)
+        # 3b. エリア名の前方一致（最長一致）。直後の [N] は結合して1要素、直後の区切りの「の」は捨てる
+        hits = [a for a in area_names if a and rest.startswith(a)]
+        if hits:
+            area = max(hits, key=len)
+            m_area = re.match(re.escape(area) + r'(\[\d+(?:/\[\d+\])*\])?の?', rest)
+            parts.append(area + (m_area.group(1) or ''))
+            rest = rest[m_area.end():]
+    else:
+        m = re.match(r'^(.+?画面(?:（[^）]+）)?)(?:の|で)(.+)$', rest)
+        if m:
+            parts.append(m.group(1))
+            rest = m.group(2)
+        elif rest.endswith('画面') or '画面' in rest:
+            # 「で」「の」が無くても画面名で終わる場合（初期表示時など）
+            parts.append(rest)
+            rest = ''
 
     # 4. 残り部分を [N] 区切りで分解（丸括弧内の [N] と「の」は事前マスクで保護）
     #    例: 「ワークフローステッパー[5]「確定」ボタン」
@@ -157,8 +193,9 @@ def parse_trigger(trigger: str) -> dict:
                 i += 1
 
         # 5. 各 merged 要素を「の」で分割（括弧内の「の」はマスク済なので保護される）
+        #    2026-10-09: 新規則（split_no=False）では「の」で割らず1要素に保つ（例: 「売上表の名称リンク」）
         for chunk in merged:
-            for sub in chunk.split('の'):
+            for sub in (chunk.split('の') if split_no else [chunk]):
                 sub_unmasked = _unmask(sub).strip()
                 if sub_unmasked:
                     parts.append(sub_unmasked)

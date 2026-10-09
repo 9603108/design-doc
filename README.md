@@ -2,7 +2,7 @@
 
 ## 概要
 
-`design-doc` は、Web アプリのソースから、画面ごとの詳細設計書(.docx)を自動生成する Claude Code のスキルです。HTML・JavaScript・Python のバックエンドを読み、HTML 1枚につき設計書1つを作ります。
+`design-doc` は、Web アプリのソースから、画面ごとの詳細設計書(.docx)を自動生成する Claude Code のスキルです。HTML・JavaScript・Python のバックエンドを読み、画面1つにつき設計書1つを作ります。入力の単位は、HTML 1枚、または React の画面コンポーネント(tsx)1つと、画面を構成するソースの一覧(`source_files`)の組のどちらでもかまいません。`source_files` の書き方は `SKILL.md` を参照してください。
 
 - ソースの解析と中間データの作成は、Python のスクリプト群が行います。
 - docx の生成は、Node.js の `docx` パッケージが行います。
@@ -11,8 +11,8 @@
 
 ## 対応する構成
 
-- 画面は、素の JavaScript(バニラ JS)の HTML です。React・Vue など、ビルドを伴うフレームワークは範囲外です。
-- 画面は、共通の関数 `apiCall(...)` で API を呼ぶ形を前提にしています。
+- 画面は、素の JavaScript(バニラ JS)の HTML か、React(TSX)の画面です。Vue など、React 以外のフレームワークは範囲外です。React の画面の設定(`source_files` など)は `SKILL.md` を参照してください。
+- 画面は、共通の関数 `apiCall(...)` で API を呼ぶ形を前提にしています。`call('<action>', ...)` のような関数で呼ぶ形も、その関数名を project_config の `api_call_functions` に書けば扱えます。
 - バックエンドは、1つの入口ファイルが、受け取った `action` の値で処理を振り分ける REST の形を前提にしています。URL のパスごとに処理を分ける API などは、画面と API の呼出の突き合わせで検出されません。
 
 詳しい前提は `SKILL.md` の冒頭にあります。

@@ -186,6 +186,23 @@ def get_source_html_path(feature_name: str = None) -> Path:
     return Path(raw)
 
 
+def get_source_files(feature_name: str = None) -> list:
+    """画面を構成するソースファイルのパスを、環境変数と ~ を展開した Path のリストで返す。
+
+    2026-10-09 React(TSX) 対応: screen_config の任意キー source_files（文字列の配列）を読む。
+    意味合い: React の画面は HTML の script タグを辿っても main.tsx で止まり、画面本体の tsx・
+              api.ts・CSS に届かないため、構成ファイルを設定で直接列挙できるようにする。
+              展開の取り決めは get_source_html_path と同じ（expandvars → expanduser）で、
+              ここに1つだけ置く。展開するのは返り値だけで、screen_config の値そのものは書き換えない。
+              キーが無い・空配列なら [] を返し、従来どおりの動きにする。空文字の要素は捨てる。
+              ファイルの存在確認はしない（呼出側の責務）。
+    接続情報: 入力 = screen_config.json の source_files。
+              少なくとも extract_source_files.py と build_call_graph.py が読む。
+    """
+    raw_list = load_screen_config(feature_name).get("source_files", [])
+    return [Path(os.path.expanduser(os.path.expandvars(raw))) for raw in raw_list if raw]
+
+
 def get_shared_modules(feature_name: str = None) -> list:
     """共通モジュール一覧（[{path, description}, ...]）を返す。"""
     return load_screen_config(feature_name).get("shared_modules", [])

@@ -569,7 +569,7 @@ def _derive_backend_area(api: dict) -> str:
        - "lock" → "排他制御"
        - "save" / "update" / "delete" / "create" / "insert" / "upsert" → "データ更新"
        - "suggest" → "マスタ参照"
-       - "get" / "fetch" / "search" → "データ取得"
+       - "get" / "fetch" / "search" / "list" → "データ取得"(list は 2026-10-09 追加。list_* の一覧取得 API 用)
     2. description キーワードで判定（action 名が不明確な場合のフォールバック）
        - 「ロック」→ "排他制御"
        - 「更新/登録/削除/保存/確定/UPSERT」かつ「取得/参照/復元」を含まない → "データ更新"
@@ -591,7 +591,13 @@ def _derive_backend_area(api: dict) -> str:
         return "データ更新"
     if "suggest" in action:
         return "マスタ参照"
-    if any(kw in action for kw in ["get", "fetch", "search"]):
+    # 2026-10-09: "list" を追加。
+    # 目的: list_sales_report のような list_* の action を「データ取得」に分類する。
+    # 意味合い: 従来は get/fetch/search のどれにも当たらず description の2次判定に落ち、
+    #   「その他」になっていた。更新系・suggest の判定より後に置くので、既存 action の分類順は変わらない。
+    # 接続情報: 戻り値は build_backend_processes が backend_processes[].area に入れ、
+    #   少なくとも generate_docx.js の BACKEND_AREA_ORDER(「データ取得」を含む)が並び順に使う。
+    if any(kw in action for kw in ["get", "fetch", "search", "list"]):
         return "データ取得"
 
     # 2次判定: description
@@ -744,7 +750,7 @@ def fill_event_backend_calls(front_processes: list, event_to_front_id: dict, db_
     """初期処理以外のイベントのフロント処理で、バックエンド呼出の step に backend_call.backend_id を補う。
 
     目的: _build_event_steps が作る step は kind と description だけで backend_call を持たない。
-          db_operations[].api_endpoint の {trigger_event, action} を手掛かりに、
+          db_operations[].api_endpoint の {trigger_event, action} と trigger_events（event_code の配列、多対一用。2026-10-09）を手掛かりに、
           「どのイベントがどの API を呼ぶか」を step.backend_call = {"backend_id": "B###"} として書き込む。
     意味合い: 初期処理は screen_config.json の initial_processes[].steps[].backend_call で backend_id を与えられるが、
               それ以外のイベントには設定にも Phase 1 の成果にも backend_id を書く場所が無い。
@@ -752,7 +758,8 @@ def fill_event_backend_calls(front_processes: list, event_to_front_id: dict, db_
               step の形は initial_processes の step が持つ backend_call に合わせる（ここで入れるのは backend_id だけ）。
     規則:
     - 対象は kind == "backend_call" で backend_call が未設定の step だけ（既にある値は上書きしない）。
-    - trigger_event が "EV00" のものは扱わない（初期処理は設定の記述をそのまま使う）。
+    - trigger_event が "EV00" のものは扱わない（初期処理は設定の記述をそのまま使う）。trigger_events の各要素も同じ。
+    - 呼出元イベントは trigger_event と trigger_events の和。同じイベントに同じ B### は1回だけ入れる。
     - 同じイベントに複数の action があれば、db_operations の出現順（同じ action は1回）で
       backend_call の step へ前から割り当てる。step が足りなければ余りは補わず、action が足りなければ残りの step は空のまま。
     - api_endpoint が無い・null・action が api_spec に無い db_operations は何もしない。
@@ -760,7 +767,7 @@ def fill_event_backend_calls(front_processes: list, event_to_front_id: dict, db_
     - 呼出元: main（build_backend_processes の後、link_backend_to_front の前）。
     - 入力: event_to_front_id は build_front_processes の戻り値（event_code → F###）、
             api_to_id は build_backend_processes の戻り値（action → B###）。
-            trigger_event は Phase 1 の events[].event_code と同じ値（merge_partials.py が db_operations_ref を作るときと同じキー）。
+            trigger_event と trigger_events の各要素は Phase 1 の events[].event_code と同じ値（merge_partials.py が db_operations_ref を作るときと同じキー。読み方も単数 ∪ 配列で揃える）。
     - 後段: link_backend_to_front がこの backend_id を見て backend_processes[].called_by_front に登録する。
             apply_id_scheme.py の update_cross_references は backend_id の値を新しい ID 体系へ置き換える。
             migrate_v48_to_v49.py は backend_call の step の backend_id を見て、その直後に response_mapping の step を挿入する。
@@ -772,13 +779,23 @@ def fill_event_backend_calls(front_processes: list, event_to_front_id: dict, db_
     ids_by_front = {}  # F### → [B###, ...]（db_operations の出現順、重複なし）
     for op in db_operations:
         ep = op.get("api_endpoint") or {}
-        ev_code = ep.get("trigger_event", "")
         action = ep.get("action", "")
-        if ev_code == "EV00" or not action or action not in api_to_id or ev_code not in event_to_front_id:
+        if not action or action not in api_to_id:
             continue
-        ids = ids_by_front.setdefault(event_to_front_id[ev_code], [])
-        if api_to_id[action] not in ids:
-            ids.append(api_to_id[action])
+        # 2026-10-09 多対一対応:
+        # 目的: 呼出元イベント集合を、単数 trigger_event と配列 trigger_events(event_code の配列)の和として作る。
+        # 意味合い: 同じ action を複数イベントから呼ぶ形(例: 一覧取得 API を検索・並べ替え・ページ送りから呼ぶ)を
+        #           Phase 1 の api_endpoint だけで書けるようにする。単数だけなら従来と同じ1要素で、結果も従来どおり。
+        #           EV00・event_to_front_id に無い event_code の除外は各要素に適用し、重複は下の ids の判定で吸収する。
+        # 接続情報: 少なくとも merge_partials.py の build_event_processes が同じ集合(単数 ∪ 配列)で db_operations_ref を作る。
+        #           ここで入れた backend_id は、少なくとも link_backend_to_front が called_by_front へ逆引き登録する。
+        ev_codes = [ep.get("trigger_event", "")] + list(ep.get("trigger_events") or [])
+        for ev_code in ev_codes:
+            if not ev_code or ev_code == "EV00" or ev_code not in event_to_front_id:
+                continue
+            ids = ids_by_front.setdefault(event_to_front_id[ev_code], [])
+            if api_to_id[action] not in ids:
+                ids.append(api_to_id[action])
 
     filled = 0
     for fp in front_processes:

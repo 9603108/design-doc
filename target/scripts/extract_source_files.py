@@ -19,10 +19,13 @@ screen_config.json に外出しし、本スクリプトを画面非依存（汎�
 - 機能名: 第1引数か環境変数 FEATURE_NAME（_config_loader.get_feature_name_from_argv。未指定なら SystemExit）
 - 入力: target/intermediate/{機能名}.json + target/intermediate/{機能名}_screen_config.json + 解析対象HTMLファイル
         + target/intermediate/{機能名}_project_config.json（任意。shared_module_patterns と backend_entry_patterns を upgrade_backend_files が読む）
+        + screen_config の source_files（任意。画面を構成するソースのパスの配列。_config_loader.get_source_files で ${HOME}/~ 展開。
+          あれば HTML 抽出結果の後ろに重複なく追記し、source_html_path が空なら HTML 解析を飛ばして source_files だけで作る）
 - 出力: 同 JSON を上書き
 - 仕様根拠: 15_中間JSONスキーマ.md「meta」セクション（v21 拡張）、SKILL.md「Phase 3-4 外部設定ファイル化」（v30）
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -36,6 +39,9 @@ from _config_loader import (
     get_shared_modules,
     get_file_descriptions,
     get_backend_entry_patterns,
+    # 2026-10-09 source_files 対応: 目的/意味合い/接続情報は _source_file_entries と main のコメントを参照
+    load_screen_config,
+    get_source_files,
 )
 
 # 2026-10-05 汎用化: 既定の機能名（_config_loader の旧 DEFAULT 定数）を廃止。
@@ -65,7 +71,13 @@ def classify_file(href_or_src: str) -> tuple:
     lower = path_only.lower()
     if lower.endswith(".css"):
         return ("css", _describe_css(href_or_src))
-    if lower.endswith(".js") or "/js/" in lower:
+    # 2026-10-09 React(TSX)対応:
+    # 目的: .ts / .tsx を kind=js と判定する。
+    # 意味合い: kind 列挙(html/css/js/external_cdn/image)の外の 'other' を出さないため。
+    #           TypeScript は JS 系のソースとして扱い、description は _describe_js で引く。
+    # 接続情報: 少なくとも extract_frontend_files(React の index.html が script src で
+    #           参照する main.tsx)と、main の source_files 経由の frontend_files 構築が依存する。
+    if lower.endswith((".js", ".ts", ".tsx")) or "/js/" in lower:
         return ("js", _describe_js(href_or_src))
     if lower.endswith(".html"):
         return ("html", "HTMLファイル")
@@ -158,6 +170,35 @@ def extract_frontend_files(html_path: Path) -> list:
     return files
 
 
+def _source_file_entries(source_files: list, existing: list) -> list:
+    """screen_config.source_files（展開済み Path のリスト）を frontend_files の要素に変換する。
+
+    2026-10-09 source_files 対応:
+    目的: 各ファイルを {path, kind, description} にする。kind/description は classify_file
+          （CSS は _describe_css、JS・TS・TSX は _describe_js が file_descriptions を引く）に任せる。
+    意味合い: path に個人の絶対パスを出さないため、screen_config.project_root（展開後）の配下なら
+              その相対パス、配下でない・project_root 無しならファイル名だけにする。
+              existing と path が一致するものは重複として飛ばし、存在しないファイルは [WARN] を出して飛ばす
+              （extract_frontend_files と同じ流儀）。
+    接続情報: 少なくとも main が呼ぶ。入力は _config_loader.get_source_files の返り値と screen_config.project_root。
+    """
+    raw_root = load_screen_config(FEATURE_NAME).get("project_root", "")
+    root = Path(os.path.expanduser(os.path.expandvars(raw_root))) if raw_root else None
+    seen = {f["path"] for f in existing}
+    entries = []
+    for p in source_files:
+        if not p.exists():
+            print(f"[WARN] source_files のファイルが見つかりません: {p}", file=sys.stderr)
+            continue
+        path = p.relative_to(root).as_posix() if root and p.is_relative_to(root) else p.name
+        if path in seen:
+            continue
+        seen.add(path)
+        kind, desc = classify_file(path)
+        entries.append({"path": path, "kind": kind, "description": desc})
+    return entries
+
+
 def _build_shared_module_desc_map() -> dict:
     """共通モジュールの「ファイル名 → 説明」マップを screen_config.json から構築する（v30）。
 
@@ -228,8 +269,23 @@ def main():
     meta = data.get("meta", {}) or {}
 
     # 1. frontend_files[] を HTML 解析で生成（v30: source_html_path は screen_config.json 経由）
-    source_html = get_source_html_path(FEATURE_NAME)
-    frontend_files = extract_frontend_files(source_html)
+    # 2026-10-09 source_files 対応:
+    # 目的: screen_config.source_files があれば、HTML 抽出結果の後ろへその各ファイルを追記する。
+    # 意味合い: React(TSX) の画面は index.html が main.tsx しか参照せず、画面本体の tsx・api.ts・CSS は
+    #           source_files からしか取れない。source_html_path が空（Path("") は IsADirectoryError になる）なら
+    #           HTML 解析を通さず source_files だけで作る。source_files が [] なら従来と同一の出力。
+    # 接続情報: _config_loader.get_source_files / load_screen_config を読み、_source_file_entries で要素化する。
+    #           結果は meta.frontend_files に入り、少なくとも generate_docx.js の §1.1 が表に出す。
+    source_files = get_source_files(FEATURE_NAME)
+    if not source_files:
+        source_html = get_source_html_path(FEATURE_NAME)
+        frontend_files = extract_frontend_files(source_html)
+    else:
+        if load_screen_config(FEATURE_NAME).get("source_html_path"):
+            frontend_files = extract_frontend_files(get_source_html_path(FEATURE_NAME))
+        else:
+            frontend_files = []
+        frontend_files += _source_file_entries(source_files, frontend_files)
 
     # 2. backend_files[] を object[] に拡張、共通モジュールを追加
     old_backend = meta.get("backend_files", []) or []

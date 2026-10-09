@@ -29,6 +29,7 @@
 | v48 | `backend_processes[].response_spec.response_to_screen_mapping[]` が存在した旧形式（v49 で移動） |
 | v49 | `steps[].kind: response_mapping` 新設。`response_to_screen_mapping[]` を `backend_processes` から `front_processes[].steps[]` へ移動（`migrate_v48_to_v49.py`）。`response_spec.items[].source` / `transform_backend` 新設。`db_op_detail.sub_no` 新設 |
 | v52 | `derived_processes[]` 新設（派生処理マーク）。`screen_layout.areas[].screen_no` に裏方領域パターン（`"0"`/`null`）新設。`dispatch[].derived_from` 新設 |
+| v53 | `db_operations[].api_endpoint.trigger_events`（event_code の配列。同じ action を複数イベントから呼ぶ多対一用。単数 `trigger_event` と併用可。`process_flows[]` の旧キーとは別物）を許容。`meta.frontend_files[]` は screen_config の `source_files` 指定時に HTML を介さず入る（`.tsx`/`.ts` は `kind: js`） |
 
 ---
 
@@ -153,7 +154,7 @@
 |:---|:---|:---:|:---|
 | `feature_name` | string | ◯ | 設計書タイトルに用いる機能名（業務担当者の語彙で。HTMLファイル名そのままは禁止） |
 | `source_html` | string | ◯ | 対象HTMLファイル名（パス除く） |
-| `frontend_files` | object[] | ◯ | **画面を構成する全フロントエンドファイル**（v21 で新設、HTML + CSS + JS + 外部CDN）。`{path, kind, description}` の object。kind: `html` / `css` / `js` / `external_cdn` / `image` |
+| `frontend_files` | object[] | ◯ | **画面を構成する全フロントエンドファイル**（v21 で新設、HTML + CSS + JS + 外部CDN）。`{path, kind, description}` の object。kind: `html` / `css` / `js` / `external_cdn` / `image`。screen_config の `source_files` を指定した画面（React(TSX) 等）は、そのファイルが HTML を介さず入る（HTML があればその抽出結果の後ろへ重複なく追記）。`.ts` / `.tsx` は kind=`js` として入り、kind の値は増やさない |
 | `backend_files` | object[] | △ | **関連バックエンドファイル**（v21 で string[] から object[] に拡張）。バックエンド統合型/フロント+バックエンド分離型のみ。`{path, kind, description}`。kind: `backend` / `shared_module` / `infra`（`backend` = バックエンドの入口ファイル。パスに project_config の `backend_entry_patterns` のいずれかを含むもの） |
 | `project_pattern` | string | ◯ | `"フロント単体型"` / `"バックエンド統合型"` / `"フロント+バックエンド分離型"`（汎用の呼び名。許容値は project_config の `allowed_project_patterns` で案件ごとに決める。キーが無ければ検査しない） |
 | `profile` | string | ◯ | `"CRUD型"` / `"レポート型"` / `"ハイブリッド型"` |
@@ -162,7 +163,7 @@
 
 **v21 変更履歴:**
 - `source_html_path`（絶対パス）を**削除**。実行環境ごとに異なる個人パスのため、設計書として無価値だった
-- `frontend_files[]`（HTML/CSS/JS 構成ファイル全網羅）を新設。HTML を解析して `<link rel="stylesheet">` / `<script src="...">` から自動抽出
+- `frontend_files[]`（HTML/CSS/JS 構成ファイル全網羅）を新設。HTML を解析して `<link rel="stylesheet">` / `<script src="...">` から自動抽出。ただし screen_config に `source_files`（画面を構成するソースのパス配列）があれば、それも HTML を介さず入る（HTML が無ければ source_files だけで作る）。`source_files` は screen_config のキーで、meta のキーではない
 - `backend_files[]` を string[] → object[] に拡張。種別（backend / 共通モジュール）と説明を持たせ docx 表示で意味が分かるように
 
 ### logical_names
@@ -623,7 +624,9 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 **location/action の生成元:**
 - 02_イベント一覧.md のトリガー定型文を `convert_events_location_action.py` がパース
 - パターン: `{画面名}の{階層1}[N]{階層2}を{動作}する。` → `location=[画面名, 階層1[N], 階層2], action=動作`
-  - `{画面名}` は screen_config の `screen_name` をそのまま書く。`screen_name` は「〜画面」で終わる正式名（例: 受注入力画面）なので、型の中で「{画面名}画面」と重ねて書かない（「受注入力画面画面」になり、パースできず location が外れる）
+  - `{画面名}` は screen_config の `screen_name` をそのまま書く。`screen_name` は「〜画面」で終わる正式名（例: 受注入力画面）なので、型の中で「{画面名}画面」と重ねて書かない（「受注入力画面画面」になり、パースできず location が外れる）。画面名は trigger 文の先頭に前方一致する条件なので、trigger 文の先頭の語と同じ字面で書く
+  - 分割規則: screen_config の `screen_name`（直後に「（…）」が任意で付いてよい）と `areas[].area_name` を trigger 文の先頭から前方一致で取り除き、残りを `[N]` 区切りの階層として扱う。項目名は「の」で割らないので、「の」を含む項目名を書ける
+  - `screen_name` が空、前方一致しない、または設定ファイルが読めないときは従来規則（非貪欲に「…画面」までを取り、「の」でも割る）に落ちる
 - パース失敗時は `location=[trigger全文], action=""` でフォールバック
 
 ### initialization
@@ -726,6 +729,8 @@ INSERT/UPDATE/DELETE の場合:
 - `id`: 内部参照キー。`event_processes[].db_operations_ref` から参照
 - `transaction`: INSERT/UPDATE/DELETE は必ず `true`
 - `operation_type` ごとに必要なフィールドが変わる（上記の通り）
+- `api_endpoint.trigger_event`: この API を呼ぶ Phase 1 の event_code（`events[].event_code` と同じ語彙。例 `EV01`）。1件に1つ
+- `api_endpoint.trigger_events`（任意）: event_code の配列。同じ action を複数イベントから呼ぶ多対一に使う。単数 `trigger_event` は従来どおりで併用できる。Phase 1 では event_code で書く（最終形で `events[].no` に置き換わる場合があるが、書き手は event_code のまま書けばよい）。`process_flows[]` の旧キー `trigger_events`（events[].no へ変換される）とは別物で、api_endpoint の中のキー
 
 ### parameters
 

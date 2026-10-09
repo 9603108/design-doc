@@ -17,7 +17,9 @@ build_call_graph.py — フロント JS の apiCall とバックエンドの入�
 【接続情報】
 - 入力: target/intermediate/{機能名}.json + target/intermediate/{機能名}_screen_config.json + {機能名}_project_config.json
   - screen_config.project_root（任意）: プロジェクトルート。無ければ _detect_project_root(html_path) で自動検出（main が読む）
+  - screen_config.source_files（任意、既定 []）: 画面を構成するソースのパス。非空なら .js/.ts/.tsx の実在分を走査対象にし、HTML の script src は辿らない（2026-10-09、main が _config_loader.get_source_files で読む）
   - project_config.api_wrapper_classes（任意、既定 []）: `new クラス名(` で API を呼ぶ共通部品のクラス名（main が読む）
+  - project_config.api_call_functions（任意、既定 []）: `call('<action>', ...)` の形で API を呼ぶ関数名。第1引数の文字列リテラルを action として拾う（main が読む、2026-10-09）
 - 出力: 同 JSON を上書き
   - backend_processes[].called_by_front_processes[]: { js_file, action, line_no } の参照配列
   - backend_processes[].api_callsite_count: フロントでの呼出箇所数
@@ -45,6 +47,7 @@ from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
     get_source_html_path,
+    get_source_files,
     get_logging_spec,
     get_audit_logging_spec,
     get_backend_entry_patterns,
@@ -261,6 +264,91 @@ def extract_apicalls(js_path: Path) -> list:
     return results
 
 
+def extract_wrapper_function_calls(js_path: Path, func_names: list) -> list:
+    """関数ラッパー形式の API 呼出 `call('<action>', ...)` を抽出する（2026-10-09 追加）。
+
+    目的: React(TSX) 等で API 呼出を `call<T>('list_sales_report', {...})` のような関数で包む構成から、
+          第1引数の文字列リテラルを action として拾う。func_names は project_config.api_call_functions。
+    意味合い: extract_apicalls は apiCall(...) 固定で body 内の `action:` を探す方式のため、第1引数に
+              action を置く関数ラッパーを拾えない（marionet-pilot の api.ts で 0 件だった）。
+              action は静的に決まるもの（第1引数が引用符の文字列リテラルで、直後が `,` か `)`）だけを採る。
+              テンプレートリテラル・連結（`'x' + y`）・三項・変数など静的に決まらないものは捨てる。
+              関数名は単語境界つきで探し、`xxx.call(` のメソッド呼出や `recall(` の部分一致は拾わない。
+              関数名の直後の型引数 `<...>` は `<` `>` の深さで読み飛ばす（複数行可。`=>` の `>` は数えない）。
+              関数の定義行（直前が `function`、または `const 名 =` 等の代入）は呼出として数えない。
+              await / return / `const x =` が前に付く呼出はそのまま拾う。
+    接続情報: 戻りは extract_apicalls と同形の dict（method・path は空文字）。少なくとも main() の
+              all_apicalls 抽出ループが、api_call_functions が非空のときに呼び、all_apicalls へ合流させる
+              （source:"apiCall" の付与と apicall_sites への登録は main 側の既存処理に任せる）。
+    """
+    text = js_path.read_text(encoding="utf-8", errors="ignore")
+    pattern_action = re.compile(r"[a-z_][a-z0-9_]*")
+    pattern_def_head = re.compile(r"\bfunction\s*$|\b(?:const|let|var)\s+$")
+    results = []
+    for name in func_names:
+        # 直前が識別子文字・`.`・`$` でない位置の name（メソッド呼出・部分一致を除く）
+        pattern_call = re.compile(r"(?<![\w.$])" + re.escape(name) + r"\b")
+        for m in pattern_call.finditer(text):
+            line_head = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+            if pattern_def_head.search(line_head):
+                continue
+            i = m.end()
+            while i < len(text) and text[i].isspace():
+                i += 1
+            # 型引数 `<...>` の読み飛ばし（`=>` の `>` は深さに数えない。暴走防止に 2000 文字で打ち切る）
+            if i < len(text) and text[i] == "<":
+                depth = 0
+                start = i
+                while i < len(text) and i - start <= 2000:
+                    ch = text[i]
+                    if ch == "<":
+                        depth += 1
+                    elif ch == ">" and text[i - 1] != "=":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    i += 1
+                if depth != 0:
+                    continue
+                i += 1
+                while i < len(text) and text[i].isspace():
+                    i += 1
+            if i >= len(text) or text[i] != "(":
+                continue
+            i += 1
+            while i < len(text) and text[i].isspace():
+                i += 1
+            # 第1引数が引用符の文字列リテラルで始まるときだけ（バッククォート・識別子始まりは捨てる）
+            if i >= len(text) or text[i] not in "'\"":
+                continue
+            end = text.find(text[i], i + 1)
+            if end < 0:
+                continue
+            literal = text[i + 1:end]
+            if not pattern_action.fullmatch(literal):
+                continue
+            j = end + 1
+            while j < len(text) and text[j].isspace():
+                j += 1
+            # 直後が `,` か `)` でなければ連結・三項などの式の一部なので捨てる
+            if j >= len(text) or text[j] not in ",)":
+                continue
+            line_no = text[:m.start()].count("\n") + 1
+            # 呼出元関数名の推定は extract_apicalls と同じ（直前 800 文字内の関数定義/メソッド）
+            head = text[max(0, m.start() - 800):m.start()]
+            candidates = list(re.finditer(r"(?:^|\n)\s*(?:async\s+)?(?:function\s+|(?:const|let|var)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*[(:]", head))
+            caller = candidates[-1].group(1) if candidates else ""
+            results.append({
+                "method": "",
+                "path": "",
+                "action": literal,
+                "js_file": str(js_path),
+                "line_no": line_no,
+                "caller_hint": caller
+            })
+    return results
+
+
 def extract_backend_actions(py_path: Path) -> list:
     """バックエンドの入口ファイル（Python）から action ディスパッチを抽出する。
 
@@ -343,7 +431,33 @@ def main():
     root_prefix = f"{project_root}/"
     # 接続情報: project_config.api_wrapper_classes（既定 []）→ extract_action_references の context 判定
     wrapper_classes = load_project_config(feature_name).get("api_wrapper_classes", [])
-    js_files = find_frontend_js_files(html_path, project_root)
+    # 2026-10-09 関数ラッパー対応: project_config.api_call_functions（既定 []）を読む。
+    # 目的: `call('<action>', ...)` のような関数呼出形の API 呼出を Stage 1 で拾う関数名を受ける。
+    # 意味合い: React 等で API を関数ラッパーで包む構成に対応する。キーが無い・空なら抽出関数を呼ばず、
+    #          all_apicalls・件数ログ・Stage 1 の分母・apicall_sites は従来と同じになる。
+    # 接続情報: 下の「2. フロント apiCall 抽出」ループで extract_wrapper_function_calls に渡す。
+    #          extract_action_references の context 判定（wrapper_classes）には渡さず、影響しない
+    call_functions = load_project_config(feature_name).get("api_call_functions", [])
+    # 2026-10-09 React(TSX) 対応: js_files の出所を screen_config.source_files で切り替える。
+    # 目的: source_files が非空なら、その中の .js/.ts/.tsx で実在するものを設定の並び順で走査対象にする。
+    # 意味合い: find_frontend_js_files は HTML の script src の .js しか辿らず、React の index.html からは
+    #          main.tsx しか出ない（画面本体の tsx と api.ts が走査されない）。source_files 経路では HTML を
+    #          読まないので source_html_path は空でよい。キーが無ければ従来経路で、出力は変わらない。
+    #          meta.frontend_files は読まない（extract_source_files.py の実行順に依存しないため）。
+    # 接続情報: _config_loader.get_source_files（展開済み Path のリスト、キー無しは []）。
+    #          少なくとも下の Stage 1 / Stage 2 / ログ呼出の走査が js_files に依存する
+    source_files = get_source_files(feature_name)
+    if source_files:
+        js_files = []
+        for sf in source_files:
+            if sf.suffix not in (".js", ".ts", ".tsx"):
+                continue
+            if not sf.exists():
+                print(f"[WARN] source_files のパスが存在しません: {sf}", file=sys.stderr)
+                continue
+            js_files.append(sf)
+    else:
+        js_files = find_frontend_js_files(html_path, project_root)
     # 2026-10-05 汎用化: 入口ファイルの判定語を設定から読む（特定の実行基盤のファイル名の直書きを廃止）。
     # 目的: project_config.backend_entry_patterns（既定 ["handler"]）を読み、入口ファイルの探索へ渡す。
     # 意味合い: 入口ファイルの名前は案件の実行基盤で決まるため、スクリプトに持たず設定で受ける。
@@ -351,12 +465,25 @@ def main():
     #          少なくとも extract_source_files.py が同じアクセサで meta.backend_files[].kind を決める
     entry_patterns = get_backend_entry_patterns(feature_name)
     py_files = find_backend_entry_files(data.get("meta", {}), project_root, entry_patterns)
-    print(f"[INFO] 解析対象: HTML 1 件、フロント JS {len(js_files)} 件、バックエンド入口 {len(py_files)} 件")
+    # 2026-10-09: source_files 経路では HTML を読まないので、HTML 件数の代わりに source_files 件数を出す
+    # （従来経路の文言は変えない。接続情報: 上の js_files の出所切替と対）
+    if source_files:
+        print(f"[INFO] 解析対象: source_files {len(source_files)} 件、フロント JS {len(js_files)} 件、バックエンド入口 {len(py_files)} 件")
+    else:
+        print(f"[INFO] 解析対象: HTML 1 件、フロント JS {len(js_files)} 件、バックエンド入口 {len(py_files)} 件")
 
     # 2. フロント apiCall 抽出
     all_apicalls = []
     for js in js_files:
         all_apicalls.extend(extract_apicalls(js))
+        # 2026-10-09 関数ラッパー対応: api_call_functions が非空のときだけ関数呼出形を合流させる。
+        # 目的: `call('<action>', ...)` の呼出を apiCall と同じ all_apicalls に入れる。
+        # 意味合い: 合流した呼出は Stage 1 と同じ扱い（source "apiCall"）で apicall_sites に入り、
+        #          Stage 2 の ±15 行の重複除外の基準にもなる。同名を apiCall 側と両方に設定しない前提。
+        # 接続情報: 呼出先 = extract_wrapper_function_calls / 出力 = backend_processes の
+        #          called_by_front_processes と api_callsite_count
+        if call_functions:
+            all_apicalls.extend(extract_wrapper_function_calls(js, call_functions))
     print(f"[INFO] apiCall 呼出箇所: {len(all_apicalls)} 件")
 
     # 3. バック action ディスパッチ抽出
