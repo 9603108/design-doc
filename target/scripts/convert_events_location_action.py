@@ -155,7 +155,11 @@ def parse_trigger(trigger: str) -> dict:
         parts.append(m_new.group(1))
         rest = m_new.group(2)
         # 3b. エリア名の前方一致（最長一致）。直後の [N] は結合して1要素、直後の区切りの「の」は捨てる
-        hits = [a for a in area_names if a and rest.startswith(a)]
+        # 2026-10-10 境界つきの前方一致:
+        # 目的: 「明細エリア一覧の行追加ボタン」が、エリア名「明細エリア」で途中から切れて「一覧の行追加ボタン」になるのを防ぐ。
+        # 意味合い: エリア名の直後が [N]・「の」・文末のいずれかのときだけエリアとみなす。それ以外は項目名の一部として1要素に保つ。
+        # 接続情報: 直後の m_area が同じ形（[N] と「の」）で読み進めるので、ここでも同じ形で判定する。
+        hits = [a for a in area_names if a and re.match(re.escape(a) + r'(?:\[\d+(?:/\[\d+\])*\])?(?:の|$)', rest)]
         if hits:
             area = max(hits, key=len)
             m_area = re.match(re.escape(area) + r'(\[\d+(?:/\[\d+\])*\])?の?', rest)
@@ -195,6 +199,12 @@ def parse_trigger(trigger: str) -> dict:
         # 5. 各 merged 要素を「の」で分割（括弧内の「の」はマスク済なので保護される）
         #    2026-10-09: 新規則（split_no=False）では「の」で割らず1要素に保つ（例: 「売上表の名称リンク」）
         for chunk in merged:
+            # 2026-10-10 [N] 直後の区切りの「の」:
+            # 目的: 「[1]の受注番号」が「[1]」と「の受注番号」に割れるのを防ぐ（新規則は「の」で割らないため、先頭の「の」が残る）。
+            # 意味合い: [N] の直後の「の」は階層の区切りなので、先頭の1つだけ捨てる。従来規則（split_no）は split が空要素にするので触らない。
+            # 接続情報: 下の末尾クリーンアップは末尾の「の」しか除かないため、ここで先頭を除く。
+            if not split_no:
+                chunk = re.sub(r'^の', '', chunk, count=1)
             for sub in (chunk.split('の') if split_no else [chunk]):
                 sub_unmasked = _unmask(sub).strip()
                 if sub_unmasked:

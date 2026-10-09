@@ -1064,8 +1064,14 @@ def check_structure(merged: dict, project_config: dict) -> list:
         if not meta.get(k):
             issues.append(("ERROR", f"meta.{k} が空"))
     # source_html / source_html_path のいずれかは必須（HTML 解析の起点として使われる）
-    if not meta.get("source_html") and not meta.get("source_html_path"):
-        issues.append(("ERROR", "meta.source_html / meta.source_html_path のいずれも空（HTML 解析起点が不明）"))
+    # 2026-10-10 React(TSX) 対応: meta.frontend_files（画面を構成するソース）があれば起点ありとみなす。
+    # 目的: HTML を持たず screen_config.source_files だけで書く React の画面が、必ず ERROR になるのを防ぐ。
+    # 意味合い: そうした画面は merge_partials.py が source_html / source_html_path を空で書き、extract_source_files.py が
+    #          source_html_path を消すため、従来の2つだけを見る検査では起点が無いと誤判定される。
+    #          HTML の画面は従来どおり source_html で通るので、結果は変わらない。
+    # 接続情報: frontend_files は extract_source_files.py が source_files から作る（Phase 3）。この検査は Phase 6 なので届いている。
+    if not meta.get("source_html") and not meta.get("source_html_path") and not meta.get("frontend_files"):
+        issues.append(("ERROR", "meta.source_html / meta.source_html_path / meta.frontend_files のいずれも空（解析起点が不明）"))
     # v49: project_pattern / profile / generated_at / source_html_path 単独は WARN に格下げ
     for k in ("source_html_path", "project_pattern", "profile", "generated_at"):
         if not meta.get(k):
