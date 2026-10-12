@@ -77,6 +77,13 @@ _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 _FAIL_HINT = re.compile(r"\bcatch\s*\(|\bset\w*(?:Err|err)\w*\s*\(")
 _RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)  # 末尾: useRef の連番(++seq.current)
 _EMPTY_HINT = re.compile(r"\.length\s*(?:===|==)\s*0\b")
+# 意味合い: JSX の 0件分岐(`!x.length && <p>文言</p>` / `x.length === 0 ? <p>文言</p>`)から、x と表示文言を拾う。
+#          接続: analyze_sources() が画面の状態 x と照合し、link["empty"] に積む。
+# ponytail: `!x.length && !y && (` のように間に別の && が挟まる形も拾う(挟む式に < や ; が無い範囲だけ)
+_EMPTY_AND = re.compile(r"!\s*([A-Za-z_$][\w$]*)\.length\b[^<;]*?&&\s*\(?\s*<[^>]*>\s*([^<{}]+?)\s*<")
+_EMPTY_TERN = re.compile(r"\b([A-Za-z_$][\w$]*)\.length\s*===?\s*0\s*\?\s*\(?\s*<[^>]*>\s*([^<{}]+?)\s*<")
+# 型宣言(interface / type)の先頭行。excerpt で参照される型を抜くのに使う
+_TYPE_DECL = re.compile(r"^(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)\b", re.M)
 
 
 def _walk(text, i, end=None):
@@ -211,6 +218,9 @@ def _resolve(span, ctx, seen, acc):
     # 目的: 失敗時・連続操作・0件の目印を拾うため、辿った本体の文字を acc に積む(_robust_lines が使う)
     acc["texts"].append(text[s:e])
     for name, i in _idents(text, s, e):
+        # 目的: 画面が使う API 関数の定義(api.ts 側)を、excerpt に抜くために覚える。接続: _excerpt_chunks()
+        if name in ctx["funcs"] and ctx["funcs"][name][0].suffix not in (".tsx", ".jsx"):
+            ctx["used"].add(name)
         if name in ctx["api"]:
             if re.search(r"\bfunction\s*$", text[max(0, i - 20):i]):
                 continue  # 呼出関数そのものの定義
@@ -231,6 +241,40 @@ def _resolve(span, ctx, seen, acc):
             acc["hit"] = True
 
 
+def _excerpt_chunks(used, funcs):
+    """画面が使う API 関数の定義と、その本体・ヘッダに名前が出る型宣言を、出典つきの TS 断片として返す。
+
+    呼出元: analyze_sources()。意味合い: api.ts(330KB)は LLM が全文で読めないため、要る断片だけを機械で抜く。
+    接続: main() が <機能名>_api_excerpt.ts として書く。型は名前が断片に出たものだけ(推測で足さない)。
+    """
+    if not used:
+        return ""
+    parts, joined = [], []
+    for name in sorted(used):
+        path, text, s, e = funcs[name]
+        hs = text.rfind("\n", 0, text.rfind(name, 0, s)) + 1
+        body = text[hs:e]
+        joined.append(body)
+        parts.append(f"// 出典: {path}\n{body}")
+    all_text = "\n".join(joined)
+    seen = set()
+    for name in sorted(used):
+        path, text = funcs[name][0], funcs[name][1]
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        for m in _TYPE_DECL.finditer(text):
+            if not re.search(rf"\b{re.escape(m.group(1))}\b", all_text):
+                continue
+            brace, nl = text.find("{", m.end()), text.find("\n", m.end())
+            if brace >= 0 and (nl < 0 or brace < nl):
+                end = _close(text, brace) + 1
+            else:
+                end = len(text) if nl < 0 else nl
+            parts.append(f"// 出典: {path}\n{text[m.start():end]}")
+    return "\n\n".join(parts) + "\n"
+
+
 def analyze_sources(source_files, api_call_functions):
     """TSX を解析し、(links, unresolved) を返す。
 
@@ -239,6 +283,7 @@ def analyze_sources(source_files, api_call_functions):
              続けて JSX のイベント属性1件ごとの dict をソースの出現順に並べる。
              { file, line, element(要素の表示名), attr(例 onClick), handler(関数名), actions([action,...] 呼ぶ順) }
       unresolved: [{ file, line, reason }]
+      excerpt: 画面が使う API 関数と参照する型の断片(TS の文字列。無ければ空文字)。main() が書き出す
     辿り方: イベント属性の式 → 局所関数(useCallback を含む)・api_call_functions の直接呼出 → setter で変わる状態
             → その状態に依存する派生値(const・useCallback/useMemo の依存配列)を閉包 → 依存配列が交わる useEffect の本体。
     参照先を1つも解決できないイベント属性(子の props 経由の呼出など)は links に入れず unresolved に出す。
@@ -248,7 +293,14 @@ def analyze_sources(source_files, api_call_functions):
     funcs, setters, derived, effects, unresolved = {}, {}, {}, [], []
     for p, t in texts.items():
         _collect_defs(p, t, funcs, setters, derived, effects, unresolved)
-    ctx = {"api": set(api_call_functions), "funcs": funcs, "setters": setters, "unresolved": unresolved}
+    ctx = {"api": set(api_call_functions), "funcs": funcs, "setters": setters, "unresolved": unresolved, "used": set()}
+    # 目的: JSX の 0件分岐を画面の状態名で引けるように、状態 → 表示文言 を先に集める。接続: 下の links 組立の "empty"
+    branches = {}
+    for p, t in texts.items():
+        if p.suffix in (".tsx", ".jsx"):
+            for rx in (_EMPTY_AND, _EMPTY_TERN):
+                for bm in rx.finditer(t):
+                    branches.setdefault(bm.group(1), bm.group(2))
     links = []
     for p, t in texts.items():
         if p.suffix not in (".tsx", ".jsx"):
@@ -279,6 +331,8 @@ def analyze_sources(source_files, api_call_functions):
                 "file": str(p), "line": _line(t, m.start()),
                 "element": tags[-1].group(1) if tags else "",
                 "attr": m.group(1), "handler": expr, "actions": acc["actions"], "texts": acc["texts"],
+                "ui_label": _ui_label(t, tags, m, be),
+                "empty": [(x, branches[x]) for x in sorted(acc["states"]) if x in branches],
             })
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
     # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
@@ -290,7 +344,7 @@ def analyze_sources(source_files, api_call_functions):
     links.insert(0, {
         "file": str(first[0]) if first else "", "line": _line(first[1], first[2]) if first else 0,
         "element": "", "attr": "mount", "handler": "useEffect(マウント時)", "actions": mount["actions"],
-        "texts": mount["texts"],
+        "texts": mount["texts"], "ui_label": "", "empty": [],
     })
     seen_u, uniq = set(), []
     for u in unresolved:
@@ -298,7 +352,32 @@ def analyze_sources(source_files, api_call_functions):
         if key not in seen_u:
             seen_u.add(key)
             uniq.append(u)
-    return links, uniq
+    return links, uniq, _excerpt_chunks(ctx["used"], funcs)
+
+
+def _ui_label(t, tags, m, be):
+    """イベント属性を持つ要素の表示名を返す。aria-label・label・placeholder の属性、無ければ開きタグ後の子テキスト。
+
+    呼出元: analyze_sources()。意味合い: 操作の名前をソースの文言のまま下書きに残す(推測で訳さない)。
+    ponytail: 開きタグの終わりは属性値に '>' が無い前提で最初の '>' とする。=> を含む後続の属性があると取り違えうる
+    """
+    gt = t.find(">", be)
+    if gt < 0:
+        return ""
+    start = tags[-1].start() if tags else m.start()
+    am = re.search(r"\b(?:aria-label|label|placeholder)=\{?[\"']([^\"']+)[\"']", t[start:gt])
+    if am:
+        return am.group(1)
+    lt = t.find("<", gt)
+    txt = t[gt + 1:lt if lt >= 0 else len(t)].strip()
+    if txt and "{" not in txt:
+        return txt
+    if m.group(1) == "onSubmit":
+        # 目的: 送信(form の onSubmit)の表示名は、その form の submit ボタンの文言。接続: </form> までを見る
+        end = t.find("</form>", be)
+        sm = re.search(r"type=\"submit\"[^>]*>\s*([^<{}]+?)\s*<", t[be:end if end >= 0 else len(t)])
+        return sm.group(1) if sm else ""
+    return ""
 
 
 def _robust_lines(texts):
@@ -314,6 +393,20 @@ def _robust_lines(texts):
         lines.append("連続して操作したときは、最後の要求の応答だけを反映する")
     if _EMPTY_HINT.search(body):
         lines.append("0件のときは〈該当なし表示〉を出す")
+    return lines
+
+
+def _detail_lines(link, called):
+    """呼ぶ API があるイベントの details に足す描画の行。0件分岐は状態が一致した分だけ、分岐の文言つきに置き換える。
+
+    呼出元: build_draft()。意味合い: 0件の行を、JSX に書かれた表示文言で具体化する(文言が無ければ〈〉の印のまま)。
+    """
+    if not called:
+        return []
+    lines = _robust_lines(link["texts"])
+    if link.get("empty"):
+        lines = [ln for ln in lines if not ln.startswith("0件のとき")]
+        lines += [f"0件のときは〈該当なし表示〉を出す(画面の文言: 「{txt}」)" for _x, txt in link["empty"]]
     return lines
 
 
@@ -342,6 +435,7 @@ def build_draft(links, unresolved, screen_name):
             "action": action_word,
             "content": "",
             "classification": "サーバー" if link["actions"] else "クライアント",
+            "ui_label": link.get("ui_label", ""),
             "source": {"file": link["file"], "line": link["line"], "handler": link["handler"]},
         })
         for act in link["actions"]:
@@ -362,7 +456,7 @@ def build_draft(links, unresolved, screen_name):
         event_processes.append({
             "event_code": ev["event_code"],
             "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
-            + (_robust_lines(link["texts"]) if called else []),
+            + _detail_lines(link, called),
         })
     return {
         "events": events,
@@ -416,9 +510,13 @@ def main(argv=None):
         print(f"[入力不正] source_files が空か、無いファイルがある: {missing}", file=sys.stderr)
         return 2
 
-    links, unresolved = analyze_sources(sources, pcfg.get("api_call_functions", []))
+    links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
     draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
     write_draft(draft, Path(args.out))
+    # api.ts から抜いた断片は下書きと同じフォルダへ、<機能名>_api_excerpt.ts として書く(機能名は config の名前から)
+    if excerpt:
+        feature = Path(args.config).name.replace("_screen_config.json", "")
+        (Path(args.out).parent / f"{feature}_api_excerpt.ts").write_text(excerpt, encoding="utf-8")
     print(f"[OK] events={len(draft['events'])} db_operations={len(draft['db_operations'])} "
           f"unresolved={len(unresolved)} -> {args.out}")
     return 1 if unresolved else 0
@@ -461,11 +559,13 @@ def selftest():
             dp = Path(d)
             (dp / "api.ts").write_text(api_src, encoding="utf-8")
             (dp / "Screen.tsx").write_text(view_src, encoding="utf-8")
-            links, unresolved = analyze_sources([dp / "api.ts", dp / "Screen.tsx"], ["call"])
+            links, unresolved, _excerpt = analyze_sources([dp / "api.ts", dp / "Screen.tsx"], ["call"])
         assert [k["attr"] for k in links] == ["mount", "onClick", "onChange"], f"links の attr: {[k['attr'] for k in links]}"
         assert links[0]["actions"] == ["load", "init"], f"mount の actions(全 useEffect・出現順): {links[0]['actions']}"
         assert links[1]["actions"] == ["load"], f"button の actions: {links[1]['actions']}"
         assert links[2]["actions"] == ["wrapped"], f"input の actions: {links[2]['actions']}"
+        assert "export function call" in _excerpt, "excerpt に api.ts の定義が出ない"
+        assert "Screen.tsx" not in _excerpt, "画面の関数が excerpt に混ざった"
         assert len(unresolved) == 1 and "props.onSave" in unresolved[0]["reason"], f"unresolved: {unresolved}"
         draft = build_draft(links, unresolved, "テスト画面")
         assert [e["event_code"] for e in draft["events"]] == ["EV00", "EV01", "EV02"], "event_code(EV00 = 初期表示、以降 EV01…)"

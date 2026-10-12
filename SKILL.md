@@ -223,6 +223,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 | 2 | （メイン） | - | `_unit_*.json` 7本 | 問題の一覧 | `verify_partials.py --units` |
 | 3 | （メイン） | - | `_unit_*.json` | partial 4本 | `merge_partials.py "$FEATURE_NAME" --compose-units` → 実行順序の Phase 1 の残り（apply_react_draft --stage partial）→ Phase 2 以降 |
 
+- メインの手順: `python3 target/scripts/run_units.py prompts <機能名> --out <出力先> --src <絶対パス>`（複数可）で依頼文を書く → 順1の7体を並行に起動 → `run_units.py after <機能名>` で検査と後段を流す → 差し戻しがあれば `run_units.py retry <機能名> <単位> --issues <after の出力JSON>` でその単位だけ起こし直し、after を再実行する
 - 順序の依存は S0 だけ（画面名とエリア名を全単位が読むため）。screen_config が揃っていれば S0 は飛ばし、順1の7体を1つのメッセージで同時に起動する
 - 単位どうしは互いの出力を待たない。同じ行（api_spec の action、db_operations の id など）は識別子をソースから同じ規則で導いて指す（`prompts/_共通.md`）。食い違いは順2の検査が `[参照]` で拾う
 - 断片は単位ごとに別ファイルで、同じ行の別の欄を書く。合成は `merge_partials.py --compose-units` が識別子で突き合わせて行い、partial 4本（従来と同じ形）を書く。partial に入口の無かった details は、断片の `event_processes` から `merge_partials.py` が `event_processes[].details` へ写すので、Phase 4 の前の手作業は要らない
@@ -754,6 +755,7 @@ screen_config.json が「画面別の業務的構造」を持つのに対し、*
 | `allowed_project_patterns[]` / `allowed_profiles[]` | `meta.project_pattern` / `meta.profile` に書いてよい値の一覧（キーが無ければ検査しない） | `verify_intermediate.py` |
 | `api_wrapper_classes[]` | API 呼出を包む共通部品のクラス名（`new クラス名(` の形で API を呼ぶもの。既定 `[]`） | `build_call_graph.py` |
 | `api_call_functions[]`（任意） | API 呼出の関数名の配列（例: `call`）。`call('<action>', ...)` 形の呼出の第1引数の文字列リテラルを action として拾う（既定 `[]`） | `build_call_graph.py` |
+| `common_errors[]` / `auth_description`（任意） | 全 API 共通のエラー（配列）/ 認証の説明（文字列）。`_units.py` が各 api_spec の error_patterns・auth へ足す（500 系・認証切れの共通設定） | `_units.py` |
 | `step_kind_keywords.branch[]` / `.calculation[]` | 処理ステップを「分岐」「計算」に分類するときに足す、案件固有の語（既定は空） | `migrate_v17_to_v18.py` |
 | `docx_output.doc_title` | 文書種別名。表題とヘッダーに出る（既定 `"詳細設計書"`） | `generate_docx.js` |
 | `docx_output.font` | 本文の字体（既定 `'Meiryo UI'`） | `generate_docx.js` |

@@ -194,7 +194,7 @@ def check_fragments(spec, frags, only=None):
     return problems
 
 
-def compose(spec, frags):
+def compose(spec, frags, project_config=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
     out = {}
@@ -212,6 +212,29 @@ def compose(spec, frags):
                     out[k] = copy.deepcopy(frags[u][k])
                 else:
                     out[k] = _merge(out[k], frags[u][k], k)
+    # project_config の common_errors(全 API 共通のエラー)と auth_description(認証の説明)を各 api_spec へ足す。
+    # 意味合い: 共通のエラーを単位ごとに書かせると食い違うため、設定から機械的に入れる。
+    # 同じ status_code が既にあれば足さず、認証の欄が埋まっていれば触らない。設定が無ければ何もしない。
+    # 接続情報: 呼出元 = merge_partials.py --compose-units が _config_loader.load_project_config() の値を渡す。
+    # 足した message_id は messages_backend にも入れ、check_refs の参照検査で実在を確かめる。
+    common = (project_config or {}).get("common_errors") or []
+    auth_desc = (project_config or {}).get("auth_description") or ""
+    if common or auth_desc:
+        for api in out.get("api_spec") or []:
+            if auth_desc and not api.get("auth"):
+                api["auth"] = auth_desc
+            errs = api.setdefault("error_patterns", [])
+            for ce in common:
+                if not any(e.get("status_code") == ce.get("status_code") for e in errs):
+                    errs.append(copy.deepcopy(ce))
+        if common and "api_spec" in out:
+            msgs = out.setdefault("messages_backend", [])
+            have = {m.get("message_id") for m in msgs if isinstance(m, dict)}
+            for ce in common:
+                mid = ce.get("message_id")
+                if mid and mid not in have:
+                    msgs.append({**{k: ce[k] for k in ("code", "severity", "message") if k in ce}, "message_id": mid})
+                    have.add(mid)
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
             row["no"] = i

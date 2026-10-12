@@ -22,6 +22,7 @@ from pathlib import Path
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
+    load_project_config,
     get_source_html_path,
     load_screen_config,
 )
@@ -156,7 +157,7 @@ def compose_units() -> int:
         print(f"[入力不正] {INTERMEDIATE_DIR} に _unit_*.json が無い", file=sys.stderr)
         return 2
     problems += _units.check_all(spec, frags)
-    composed = _units.compose(spec, frags)
+    composed = _units.compose(spec, frags, load_project_config())
     parts, unknown = _units.split_partials(composed)
     problems += [f"[範囲外] 最上位キー {k}: partial に入口が無い" for k in unknown]
     if problems:

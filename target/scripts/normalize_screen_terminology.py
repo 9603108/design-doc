@@ -59,9 +59,30 @@ SCREEN_NAME_ALIAS = get_screen_name_aliases(FEATURE_NAME)
 ITEM_NAME_ALIAS = get_item_name_aliases(FEATURE_NAME)
 
 
+def _require_keys(node: dict, keys: tuple, where: str) -> None:
+    """必須キーが欠けた要素があれば、欠けたキーと項目名を示して差し戻し先 S1 を stderr に出し exit 1 にする。
+
+    意味合い: 旧実装は it["no"] 等の直接参照で KeyError の traceback を出していた。どの項目のどのキーが
+              欠けたかを1行で示し、原因を中間 JSON 生成段（S1）で直せるようにする。
+    接続情報: build_authority から呼ばれる（screen_layout.areas[] と items[] の検査）。
+    """
+    missing = [k for k in keys if k not in node]
+    if missing:
+        label = node.get("item_name") or node.get("area_name") or where
+        print(f"ERROR: {where}（{label}）に必須キー {missing} がありません → 差し戻し先 S1", file=sys.stderr)
+        sys.exit(1)
+
+
 def build_authority(data):
     """画面用語の権威集合を返す: {area_name: area_dict}, {item_no: item_dict}, {item_name: item_dict}"""
     sl = data.get("screen_layout", {})
+    # 目的: 必須キーが欠けた入力を KeyError の traceback で落とさず、欠けたキーと項目名を示して差し戻す
+    # 意味合い: 入力不備は中間 JSON 生成段（S1）で直すべきものなので、差し戻し先を明記して止める
+    # 接続情報: 呼出元は main()。ここで検査したキー（area_name / area_no / no / item_name）を後段が直接参照する
+    for i, a in enumerate(sl.get("areas", [])):
+        _require_keys(a, ("area_name", "area_no"), f"screen_layout.areas[{i}]")
+    for i, it in enumerate(sl.get("items", [])):
+        _require_keys(it, ("no", "item_name"), f"screen_layout.items[{i}]")
     areas_by_name = {a["area_name"]: a for a in sl.get("areas", [])}
     items_by_no = {it["no"]: it for it in sl.get("items", [])}
     items_by_name = {}
