@@ -8,7 +8,8 @@ screen_config の source_files に並ぶ TSX を静的に解析し、
 JSX のイベント属性(onClick/onChange 等) → ハンドラ関数 → 状態の更新 → その状態を依存配列に持つ useEffect
 → project_config.api_call_functions の呼出(api.ts 等のラッパー関数経由を含む) を結んで、
 次の下書きを JSON で出す。
-  - events[]: JSX のイベント属性1件を1イベントとし、ソースの出現順に EV01 形式の連番を振る
+  - events[]: 先頭は EV00(初期表示。マウント時に走る useEffect の呼出を集める)。続けて JSX のイベント属性
+    1件を1イベントとし、ソースの出現順に EV01 形式の連番を振る(パイプラインの決まり: EV00 = 初期表示、以降 EV01…)
   - db_operations[].api_endpoint.trigger_events: action ごとに、それを呼ぶ event_code の配列
   - event_processes[].details: イベントごとの呼出の行。並びは db_operations の並びに一致させる
   - unresolved[]: 解析できなかった箇所 {file, line, reason}。推測で埋めず、ここにだけ出す
@@ -186,7 +187,10 @@ def _collect_defs(path, text, funcs, setters, derived, effects, unresolved):
         if deps is None:
             unresolved.append({"file": str(path), "line": _line(text, m.start()),
                                "reason": "依存配列の無い useEffect は呼ばれる契機を決められない"})
-        elif deps:  # [] は初期表示だけで動くので、操作の連鎖には入れない
+        else:
+            # 目的: useEffect は依存配列によらず、マウント時に必ず1回走る。[] の effect も含めて全部を集め、
+            #       analyze_sources が EV00(初期表示)の呼出にする。接続: 操作の連鎖(deps & changed)では
+            #       [] は何とも交わらないので、従来どおり連鎖には入らない。
             fs, fe = _top_split(text, po + 1, pe)[0]
             effects.append((deps, (path, text, fs, fe)))
 
@@ -219,7 +223,8 @@ def analyze_sources(source_files, api_call_functions):
     """TSX を解析し、(links, unresolved) を返す。
 
     契約(出力側 build_draft が依存する形):
-      links: JSX のイベント属性1件ごとの dict をソースの出現順に並べた list。
+      links: 先頭は attr="mount" の1件(EV00 初期表示。マウント時に走る useEffect 全部の呼出を、ソースの出現順に集める)。
+             続けて JSX のイベント属性1件ごとの dict をソースの出現順に並べる。
              { file, line, element(要素の表示名), attr(例 onClick), handler(関数名), actions([action,...] 呼ぶ順) }
       unresolved: [{ file, line, reason }]
     辿り方: イベント属性の式 → 局所関数(useCallback を含む)・api_call_functions の直接呼出 → setter で変わる状態
@@ -263,6 +268,17 @@ def analyze_sources(source_files, api_call_functions):
                 "element": tags[-1].group(1) if tags else "",
                 "attr": m.group(1), "handler": expr, "actions": acc["actions"],
             })
+    # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
+    # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
+    # ponytail: effect 内の条件分岐(if で呼ばない場合)は見ない。呼ぶ可能性のある action を全部出す。
+    mount = {"actions": [], "states": set(), "hit": False}
+    for _deps, span in effects:
+        _resolve(span, ctx, set(), mount)
+    first = effects[0][1] if effects else None
+    links.insert(0, {
+        "file": str(first[0]) if first else "", "line": _line(first[1], first[2]) if first else 0,
+        "element": "", "attr": "mount", "handler": "useEffect(マウント時)", "actions": mount["actions"],
+    })
     seen_u, uniq = set(), []
     for u in unresolved:
         key = (u["file"], u["line"], u["reason"])
@@ -282,12 +298,18 @@ def build_draft(links, unresolved, screen_name):
     events = []
     op_order = []  # action の初出順 = db_operations の並び
     triggers = {}  # action -> [event_code,...]
-    for i, link in enumerate(links, start=1):
-        code = f"EV{i:02d}"
-        action_word = ACTION_WORDS.get(link["attr"], link["attr"])
+    n = 0  # EV01 からの連番。attr="mount" の link だけ EV00(初期表示)で、連番を進めない
+    for link in links:
+        if link["attr"] == "mount":
+            code, trigger, action_word = "EV00", f"{screen_name}の初期表示時", "初期表示"
+        else:
+            n += 1
+            code = f"EV{n:02d}"
+            action_word = ACTION_WORDS.get(link["attr"], link["attr"])
+            trigger = f"{screen_name}の{link['element']}を{action_word}する。"
         events.append({
             "event_code": code,
-            "trigger": f"{screen_name}の{link['element']}を{action_word}する。",
+            "trigger": trigger,
             "action": action_word,
             "content": "",
             "classification": "サーバー" if link["actions"] else "クライアント",
@@ -392,6 +414,7 @@ def selftest():
         '  const [count, setCount] = useState(0);\n'
         '  const handleClick = () => { setCount(count + 1); };\n'
         '  useEffect(() => { call("load"); }, [count]);\n'
+        '  useEffect(() => { call("init"); }, []);\n'
         '  return (\n'
         '    <div>\n'
         '      <button onClick={handleClick}>go</button>\n'
@@ -407,18 +430,22 @@ def selftest():
             (dp / "api.ts").write_text(api_src, encoding="utf-8")
             (dp / "Screen.tsx").write_text(view_src, encoding="utf-8")
             links, unresolved = analyze_sources([dp / "api.ts", dp / "Screen.tsx"], ["call"])
-        assert [k["attr"] for k in links] == ["onClick", "onChange"], f"links の attr: {[k['attr'] for k in links]}"
-        assert links[0]["actions"] == ["load"], f"button の actions: {links[0]['actions']}"
-        assert links[1]["actions"] == ["wrapped"], f"input の actions: {links[1]['actions']}"
+        assert [k["attr"] for k in links] == ["mount", "onClick", "onChange"], f"links の attr: {[k['attr'] for k in links]}"
+        assert links[0]["actions"] == ["load", "init"], f"mount の actions(全 useEffect・出現順): {links[0]['actions']}"
+        assert links[1]["actions"] == ["load"], f"button の actions: {links[1]['actions']}"
+        assert links[2]["actions"] == ["wrapped"], f"input の actions: {links[2]['actions']}"
         assert len(unresolved) == 1 and "props.onSave" in unresolved[0]["reason"], f"unresolved: {unresolved}"
         draft = build_draft(links, unresolved, "テスト画面")
-        assert [e["event_code"] for e in draft["events"]] == ["EV01", "EV02"], "event_code の連番"
+        assert [e["event_code"] for e in draft["events"]] == ["EV00", "EV01", "EV02"], "event_code(EV00 = 初期表示、以降 EV01…)"
+        assert draft["events"][0]["trigger"] == "テスト画面の初期表示時", "EV00 の trigger"
         assert draft["db_operations"] == [
-            {"api_endpoint": {"action": "load", "trigger_events": ["EV01"]}},
+            {"api_endpoint": {"action": "load", "trigger_events": ["EV00", "EV01"]}},
+            {"api_endpoint": {"action": "init", "trigger_events": ["EV00"]}},
             {"api_endpoint": {"action": "wrapped", "trigger_events": ["EV02"]}},
         ], f"db_operations: {draft['db_operations']}"
-        assert draft["event_processes"][0]["details"] == ["・load をリクエストする"], "EV01 の details"
-        assert draft["event_processes"][1]["details"] == ["・wrapped をリクエストする"], "EV02 の details"
+        assert draft["event_processes"][0]["details"] == ["・load をリクエストする", "・init をリクエストする"], "EV00 の details"
+        assert draft["event_processes"][1]["details"] == ["・load をリクエストする"], "EV01 の details"
+        assert draft["event_processes"][2]["details"] == ["・wrapped をリクエストする"], "EV02 の details"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

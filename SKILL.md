@@ -378,7 +378,8 @@ INPUT_JSON="target/intermediate/${FEATURE_NAME}.json" \
 | `_config_loader.py` | `{機能名}_screen_config.json` 読込ヘルパー。`get_areas()` / `get_process_names_by_event_code()` / `get_diagram_spec(id)` 等のセクション別アクセサを提供 | 汎用 | **v30** |
 | **基盤スクリプト（v17 以前から）** | | | |
 | `merge_partials.py` | 4 Agent の出力（_partial_*.json）を統合し中間JSON 本体生成 | 汎用 | v1 |
-| `extract_react_draft.py` | React（TSX）の画面の source_files を静的に解析し、JSX のイベント属性 → ハンドラ → 状態の更新 → useEffect → `api_call_functions` の呼出（ラッパー経由を含む）を結んで、events（EV01… の連番）・`db_operations[].api_endpoint.trigger_events`・`event_processes[].details` の呼出の行・`unresolved` の下書き JSON を出す。解析できない箇所は推測で埋めず `unresolved` にだけ出す。HTML の画面では使わない | 汎用（`source_files` / `screen_name` は screen_config.json、`api_call_functions` は project_config.json 経由） | 2026-10-12 |
+| `extract_react_draft.py` | React（TSX）の画面の source_files を静的に解析し、JSX のイベント属性 → ハンドラ → 状態の更新 → useEffect → `api_call_functions` の呼出（ラッパー経由を含む）を結んで、events（EV00 = 初期表示、以降 EV01… の連番）・`db_operations[].api_endpoint.trigger_events`・`event_processes[].details` の呼出の行・`unresolved` の下書き JSON を出す。解析できない箇所は推測で埋めず `unresolved` にだけ出す。HTML の画面では使わない | 汎用（`source_files` / `screen_name` は screen_config.json、`api_call_functions` は project_config.json 経由） | 2026-10-12 |
+| `apply_react_draft.py` | extract_react_draft.py の下書きを機械で当てはめる。`--stage partial`（merge の前）は _partial_backend.json の `api_endpoint.trigger_events` を、同じ action を持つ全 db_operations に写す。`--stage merge`（merge の後）は event_processes[].details の呼出の行の並びと数を下書きに揃える（空なら入れ、業務語彙の文は残す）。既存の値と食い違えば上書きせず一覧に出して終了コード 1。EV00 は対象外 | 汎用 | 2026-10-12 |
 | `verify_partials.py` | merge 前に partial と details を検査（event_code の連番・trigger_events の参照先の実在・overview 30字以内・details の呼出の行の数と並びが api_endpoint と一致・trigger 文が screen_name で始まる）。問題は1行1件「[種別] 場所: 内容」、1件でもあれば終了コード 1 | 汎用 | 2026-10-12 |
 | `convert_events_location_action.py` | events[].trigger を location/action/source_kind に分解 | 汎用 | v10 |
 | `replace_hatsuka.py` | 「発火」を「呼出/実行」に置換（業務語彙統一） | 汎用 | v11 |
@@ -424,14 +425,23 @@ export FEATURE_NAME="受注入力"   # 例: 受注入力 / 受注照会 / 顧客
 # 処理ステップを docx に出すには、merge_partials.py の後・Phase 4 の前に event_processes[].details を埋める（Step 3「Phase 1 の成果物の渡し方」）
 # React（TSX）の画面だけ: partial を作る前に下書きを機械で出す。受注入力のような HTML の画面では実行しない
 python3 target/scripts/extract_react_draft.py --config "target/intermediate/${FEATURE_NAME}_screen_config.json" --out "target/intermediate/${FEATURE_NAME}_react_draft.json"
-#   下書きの events（EV01… の連番）・db_operations[].api_endpoint.trigger_events・event_processes[].details の呼出の行を partial と details の土台にする
+#   下書きの events（EV00 = 初期表示。マウント時に走る useEffect の呼出を集める。以降 EV01… の連番）を partial の events の土台にする（event_code は下書きのまま使う）
+#   手で書くのは業務語彙の文だけ（events の content・trigger の言い回し・details の業務の文・overview 等）。events と API の対応・呼出の行の並びと数は下の apply_react_draft.py が機械で当てはめる
 #   unresolved に出た箇所（解析できなかった所）は機械が埋めていないので、LLM がソースを読解して埋める。終了コード 1 は unresolved が1件以上ある意味
 # React（TSX）の画面だけ: merge_partials.py の前に partial と details を検査する（event_code の連番・trigger_events の参照先・overview 30字以内・呼出の行の数と並び・trigger 文の先頭）
 python3 target/scripts/verify_partials.py "target/intermediate/${FEATURE_NAME}_react_draft.json" --screen-name "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['screen_name'])" "target/intermediate/${FEATURE_NAME}_screen_config.json")"
 #   問題は1行1件「[種別] 場所: 内容」で出て、1件でもあれば終了コード 1。直してから Phase 2 に進む
+# React（TSX）の画面だけ: merge_partials.py の前に、下書きの trigger_events を _partial_backend.json の db_operations へ写す
+#   同じ action を複数の db_operations に分けていれば、同じ action を持つ全件に写す。EV00（初期表示）の呼出は initial_processes 側で持つので写さない
+#   既存の値が下書きと食い違えば上書きせず「[種別] 場所: 内容」を出して終了コード 1（直してから再実行する）
+python3 target/scripts/apply_react_draft.py "${FEATURE_NAME}" --stage partial
 
 # === Phase 2: v17 形式中間JSON 構築 ===
 python3 target/scripts/merge_partials.py "${FEATURE_NAME}"                       # _partial 統合
+# React（TSX）の画面だけ: merge の直後に、event_processes[].details の呼出の行を下書きの並びと数で保証する
+#   details が空なら下書きの呼出の行（「・<action> をリクエストする」）を入れる。LLM が書いた業務語彙の文は残し、呼出の行の数が下書きと同じことだけを確かめる
+#   食い違えば上書きせず一覧に出して終了コード 1。EV00 は対象外（初期処理側）
+python3 target/scripts/apply_react_draft.py "${FEATURE_NAME}" --stage merge
 python3 target/scripts/convert_events_location_action.py "${FEATURE_NAME}"        # events に location/action/source_kind 付与
 python3 target/scripts/replace_hatsuka.py "${FEATURE_NAME}"                       # 必要時のみ: 「発火」→「呼出」置換
 

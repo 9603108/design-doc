@@ -88,8 +88,11 @@ def check_partial(draft, screen_name):
         if p.get("event_code") not in known:
             problems.append(f"[参照] event_processes: {p.get('event_code')} が events に無い")
     for ev in (codes if "event_processes" in draft else []):
-        expected = [(op.get("api_endpoint") or {}).get("action") for op in ops
-                    if ev in ((op.get("api_endpoint") or {}).get("trigger_events") or [])]
+        # 目的: 同じ action を複数の db_operations に分ける案件(売上レポートは3件)でも、呼出の行は action ごとに1行。
+        #       並びは db_operations の初出順のまま、重複だけ除く(dict.fromkeys が出現順を保つ)。
+        expected = list(dict.fromkeys(
+            (op.get("api_endpoint") or {}).get("action") for op in ops
+            if ev in ((op.get("api_endpoint") or {}).get("trigger_events") or [])))
         proc = by_code.get(ev) or {}
         lines = proc.get("details") or []
         actual = []
