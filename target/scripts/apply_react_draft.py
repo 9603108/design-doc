@@ -116,9 +116,11 @@ def apply_backend(bdraft, backend):
         # WHY: LLM が括り表記(「[」「]」「（」を含む論理名・物理名が仮のまま)で書いた行だけの dataset は下書きで置き換える。
         # 正常な行が1つでもあれば LLM の記述を尊重して触らない(下書きとの食い違いは人が決める)
         # verify_intermediate と同じ基準: テーブル名の仮表記(角括弧・集計結果の列)、物理名が英数字と _ だけでない、論理列の括り表記(各列/など/…/等)
+        # physical_table はスキーマ(15_中間JSONスキーマ.md)の dataset に無い任意のキー。無い行を仮とみなすと、
+        # スキーマどおりに LLM が書いた dataset が全部下書きで消える(2026-10-12 H3 で 62 列が消えた)。verify と同じく、あるときだけ見る
         provisional = [bool(re.search(r"[\[\]［］（]|集計結果の列", f"{r.get('logical_table') or ''}{r.get('physical_table') or ''}"))
-                       or not re.fullmatch(r"[A-Za-z0-9_]+", r.get("physical_table") or "")
-                       or bool(re.search(r"各列|など|…|等(?![一-鿿])", r.get("logical_column") or "")) for r in rows]
+                       or bool(r.get("physical_table") and not re.fullmatch(r"[A-Za-z0-9_]+", r["physical_table"]))
+                       or bool(re.search(r"各列|各\S{1,10}の列|など|…|等(?![一-鿿])", r.get("logical_column") or "")) for r in rows]
         if rows and not all(provisional):
             continue
         op["dataset"] = [{"no": i, "logical_table": "", "logical_column": "", "physical_table": d["table"],
@@ -278,6 +280,11 @@ def selftest():
                                                   "dataset": [{"logical_table": "店舗", "physical_table": "mise"},
                                                               {"logical_table": "[仮]", "physical_table": "x"}]}]}
         assert apply_backend(bd, bk4) == 0 and bk4["db_operations"][0]["dataset"][0]["physical_table"] == "mise", "正常な行があれば触らない"
+        # (e) スキーマどおりの行(physical_table のキーが無い)は LLM の中身なので消さない(2026-10-12 H3 の退行)
+        bk5 = {"api_spec": [], "db_operations": [{"api_endpoint": {"action": "a1"},
+                                                  "dataset": [{"no": 1, "logical_table": "店舗", "logical_column": "店舗番号",
+                                                               "physical_column": "p.mise_no"}]}]}
+        assert apply_backend(bd, bk5) == 0 and bk5["db_operations"][0]["dataset"][0]["logical_column"] == "店舗番号", "スキーマどおりの行を消した"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

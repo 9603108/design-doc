@@ -6,8 +6,8 @@ extract_backend_draft.py — backend(Python) から API ごとの dataset / resp
 【目的】
 screen_config.backend_files に並ぶ Python を ast で静的解析し、ディスパッチ表(handler.py の
 ACTIONS = {"action名": module.func, ...} のような「文字列 → 関数参照」の dict)から action ごとの処理関数を引き、
-その関数(と、同じ backend_files 内で呼ばれる補助関数)から次を JSON で出す。
-  - dataset[]: {column, table}。SQL 文字列(SELECT で始まる f 文字列を含む)の最上位 SELECT 句の列(AS の別名優先)と、
+その関数(と、同じ backend_files 内で呼ばれる補助関数。from X import f の f は同じフォルダの X.py からも辿る)から次を JSON で出す。
+  - dataset[]: {column, table}。SQL 文字列(SELECT で始まる f 文字列を含む)の最上位 SELECT 句の列(別名.列 AS x は物理列、式 AS x は別名)と、
     その列の出所テーブル(別名・WITH の名前は FROM / JOIN から解決)
   - response_items[]: {key}。action の関数が return する dict のキー(return が補助関数の呼出なら、その return を辿る)
   - error_patterns[]: {condition, status_code, message}。raise と _err(...) の返却。condition は業務語彙なので空文字(LLM が書く)
@@ -50,13 +50,16 @@ class Module:
     def __init__(self, path):
         self.path = path
         self.tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        self.funcs, self.consts, self.imports = {}, {}, {}
+        self.funcs, self.consts, self.imports, self.from_imports = {}, {}, {}, {}
         for n in self.tree.body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.funcs[n.name] = n
             elif isinstance(n, ast.Import):
                 for a in n.names:
                     self.imports[a.asname or a.name] = a.name
+            elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+                for a in n.names:  # from queries import _require_date → 呼出 _require_date(...) を queries の関数へ辿る
+                    self.from_imports[a.asname or a.name] = (n.module, a.name)
             elif isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
                 try:
                     self.consts[n.targets[0].id] = ast.literal_eval(n.value)
@@ -175,7 +178,9 @@ def _dataset(sql, unresolved, action):
                 continue
             am = re.search(r"\bAS\s+([^\W\d]\w*)\s*$", item, re.IGNORECASE)
             if am:
-                col = am.group(1)
+                # p.mise_no AS id は物理列 mise_no(別名 id を物理名にしない)。式の列(count(*) AS days 等)は別名のまま
+                src = item[:am.start()].strip()
+                col = src.split(".")[-1] if re.fullmatch(r"[A-Za-z_]\w*\.\w+", src) else am.group(1)
             elif re.fullmatch(r"[\w.]+", item):
                 col = item.split(".")[-1]
             else:
@@ -198,6 +203,19 @@ def _callees(fn, mod, mods):
         f = n.func
         if isinstance(f, ast.Name) and f.id in mod.funcs:
             yield mod, mod.funcs[f.id]
+        elif isinstance(f, ast.Name) and f.id in mod.from_imports:
+            # 入力検査の補助(_require_date 等)は backend_files に無い共通モジュールにあることが多い。
+            # 同じフォルダの <module>.py があれば読んで辿る(ディスパッチ表の走査には加えない)
+            mname, fname = mod.from_imports[f.id]
+            if mname not in mods:
+                p = mod.path.parent / f"{mname}.py"
+                try:
+                    mods[mname] = Module(p) if p.is_file() else None
+                except (OSError, SyntaxError, UnicodeDecodeError):
+                    mods[mname] = None
+            m2 = mods.get(mname)
+            if m2 and fname in m2.funcs:
+                yield m2, m2.funcs[fname]
         elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
             m2 = mods.get(mod.imports.get(f.value.id, ""))
             if m2 and f.attr in m2.funcs:
@@ -262,7 +280,7 @@ def extract(files):
     """backend ファイル(Path の並び)から {apis, unresolved} を作る。"""
     mods = {p.stem: Module(p) for p in files}
     apis, unresolved = {}, []
-    for mod in mods.values():
+    for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
         for n in mod.tree.body:
             if not (isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and n.value.keys):
                 continue
@@ -311,10 +329,12 @@ def selftest():
     import tempfile
     h = 'import q\nA = {"get_x": q.get_x, "get_y": q.get_y}\n'
     qs = (
+        'from common import _req\n'  # backend_files に無い同じフォルダの補助モジュールの raise も拾う
         'COLS = ["a", "b"]\n'
         'def _sel():\n    return ", ".join(f"SUM(t.{c}) AS {c}" for c in COLS)\n'
         'def get_x(p):\n'
         '    if not p:\n        raise ValidationError("必須です")\n'
+        '    _req(p)\n'
         '    sql = f"""WITH d AS (SELECT t.* FROM real_tbl t) SELECT t.id AS x_id, {_sel()}, s.name FROM d t LEFT JOIN shops s ON s.id=t.id"""\n'
         '    return {"rows": sql, "n": 1}\n'
         'def get_y(p):\n'  # CTE の連鎖(t → k → 実表)は実表へ、FROM が動的な CTE は unresolved へ
@@ -325,14 +345,16 @@ def selftest():
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "h.py").write_text(h, encoding="utf-8")
         (Path(d) / "q.py").write_text(qs, encoding="utf-8")
+        (Path(d) / "common.py").write_text('def _req(p):\n    raise ValidationError(f"{p} は必須")\n', encoding="utf-8")
         r = extract([Path(d) / "h.py", Path(d) / "q.py"])
     a = r["apis"]["get_x"]
     cols = {(x["column"], x["table"]) for x in a["dataset"]}
-    assert {("x_id", "real_tbl"), ("a", "real_tbl"), ("b", "real_tbl"), ("name", "shops")} <= cols, cols
+    assert {("id", "real_tbl"), ("a", "real_tbl"), ("b", "real_tbl"), ("name", "shops")} <= cols, cols
     assert [x["key"] for x in a["response_items"]] == ["rows", "n"], a["response_items"]
-    assert a["error_patterns"] == [{"condition": "", "status_code": 400, "message": "必須です"}], a["error_patterns"]
+    assert {e["message"] for e in a["error_patterns"]} == {"必須です", "{p} は必須"}, a["error_patterns"]
+    assert "common" not in r["apis"] and set(r["apis"]) == {"get_x", "get_y"}, "補助モジュールを API として数えた"
     ycols = {(x["column"], x["table"]) for x in r["apis"]["get_y"]["dataset"]}
-    assert ycols == {("y_id", "real_tbl")}, ycols
+    assert ycols == {("id", "real_tbl")}, ycols
     print("[selftest OK] extract_backend_draft")
     return 0
 

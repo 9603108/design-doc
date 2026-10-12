@@ -185,7 +185,8 @@ def check_logical_names(merged: dict) -> list:
             lc = ds_item.get("logical_column")
             lt = ds_item.get("logical_table")
             if lc and lc not in known_logical_columns:
-                issues.append(("WARN", f"db_operations[{op.get('id')}].dataset の logical_column={lc} が logical_names[] に未登録"))
+                # 2026-10-12 WARN から格上げ: H3 で logical_names が 67→7 件に減っても通っていた(8章の論理名対応表が欠ける)
+                issues.append(("ERROR", f"db_operations[{op.get('id')}].dataset の logical_column={lc} が logical_names[] に未登録（logical_names に物理名と対で書く）"))
             if lt and lt not in known_logical_tables:
                 issues.append(("WARN", f"db_operations[{op.get('id')}].dataset の logical_table={lt} が logical_names[] に未登録"))
     return issues
@@ -357,6 +358,18 @@ def check_response_to_screen_mapping(merged: dict) -> list:
 
     for i, api in enumerate(merged.get("api_spec", []) or []):
         mapping = api.get("response_to_screen_mapping", []) or []
+        # 2026-10-12: 返す項目があるのに画面への写しが無いと、migrate_v48_to_v49 が response_mapping の step を作れず
+        #             5.1 の「画面表示変換」と「レスポンス→画面項目マッピング」表が丸ごと消える
+        if api.get("response_items") and not mapping and not api.get("response_to_screen_mapping_none_reason"):
+            issues.append(("ERROR", f"api_spec[{i}]({api.get('action', '')}): response_items があるのに response_to_screen_mapping が空"
+                                    "（{api_field_path, screen_area_no, screen_item_name, transform} を書く。画面に出さない API なら response_to_screen_mapping_none_reason に理由を書く）"))
+        # 2026-10-12: パスに「api.ts の apiConfig.salesPath」のようなソース上の在り処を書くと、エンドポイント欄が URL にならない
+        path = str(api.get("path") or "")
+        if path and not path.startswith("/") and "://" not in path:
+            issues.append(("ERROR", f"api_spec[{i}]({api.get('action', '')}): path「{path}」が URL のパスでない（/api/sales のように実際のパスを書く）"))
+        for k, prm in enumerate(api.get("request_params") or []):
+            if not str(prm.get("location") or "").strip():
+                issues.append(("ERROR", f"api_spec[{i}]({api.get('action', '')}).request_params[{k}] {prm.get('name')}: location が空（body / query / path / header を書く）"))
         for j, m in enumerate(mapping):
             label = f"api_spec[{i}]({api.get('description','')[:30]}).response_to_screen_mapping[{j}]"
             sn = m.get("screen_no")
@@ -660,7 +673,7 @@ def check_screen_operation_trigger_area_ref(merged: dict) -> list:
 
 
 # 複数の項目を1行に括った表記。「等」は後ろに漢字が続くもの（等級 など）を除く
-BUNDLED_KEY_RE = re.compile(r"各列|など|…|等(?![一-鿿])")
+BUNDLED_KEY_RE = re.compile(r"各列|各\S{1,10}の列|など|…|等(?![一-鿿])")  # 各…の列: 「各金額・点数の列」(H3)
 
 # 入力欄とみなす画面項目の種類（小文字で比べる）。check_coverage_and_details が使う
 INPUT_ITEM_TYPES = {
@@ -693,6 +706,18 @@ def check_coverage_and_details(merged: dict) -> list:
             col = str(ds.get("logical_column") or "")
             if BUNDLED_KEY_RE.search(col):
                 issues.append(("ERROR", f"db_operations[{op.get('id') or '?'}].dataset: 列「{col}」が括り表記（1列1行で書く）"))
+            # 2026-10-12: backend 下書き(apply_react_draft --backend-draft)は論理名を空で入れる。空のまま docx へ出ると 5.2 の表が空欄になる
+            if not col.strip() or not str(ds.get("logical_table") or "").strip():
+                issues.append(("ERROR", f"db_operations[{op.get('id') or '?'}].dataset[no={ds.get('no')}]: 論理テーブル名・論理列名が空"
+                                        f"（物理名 {ds.get('physical_table') or ''}.{ds.get('physical_column') or ''} の業務の名前を書く）"))
+    # 2026-10-12: 入力の誤りで返す 400 のエラーは、バリデーション一覧にも載るはず。載っていなければ書き漏れ
+    vl_msgs = {v.get("message_id") for v in merged.get("validations", []) or []}
+    for api in merged.get("api_spec", []) or []:
+        for e in api.get("error_patterns") or []:
+            mid = e.get("message_id")
+            if str(e.get("status_code")) == "400" and mid and mid not in vl_msgs:
+                issues.append(("ERROR", f"api_spec[{api.get('action', '')}].error_patterns: 400 のエラー {mid} が validations に無い"
+                                        "（入力の検査として validations に1件書き、message_id で結ぶ）"))
     for ep in merged.get("event_processes", []) or []:
         ref = ep.get("event_ref") or ep.get("event_code") or "?"
         raw = ep.get("details") or []
@@ -1205,7 +1230,7 @@ def check_file_descriptions(merged: dict) -> list:
 
 
 def check_message_code_format(merged: dict) -> list:
-    """2026-10-12 新設: messages[].code がメッセージID形式でないものを WARN で検出する。
+    """2026-10-12 新設: messages[].code がメッセージID形式でないものを ERROR で検出する(同日 WARN から格上げ)。
 
     意味合い: code 列に validation_error のような種別名が入ると、業務担当者がメッセージを特定できない。
     判定: 空の code は対象外。
@@ -1216,7 +1241,8 @@ def check_message_code_format(merged: dict) -> list:
         code = str(m.get("code") or "").strip()
         if code and not MESSAGE_CODE_ID_RE.match(code):
             mid = m.get("message_id") or m.get("msg_id") or m.get("id") or "?"
-            issues.append(("WARN", f"messages[{mid}].code={code} がメッセージID形式（例 MSE00001）でない"))
+            # 2026-10-12 WARN から格上げ: WARN のままだと Haiku が直さずに docx へ出す
+            issues.append(("ERROR", f"messages[{mid}].code={code} がメッセージID形式（例 MSE00001）でない（code には message_id と同じ ID を書く）"))
     return issues
 
 
