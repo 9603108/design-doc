@@ -740,7 +740,9 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
                 "items": api.get("response_items", []) or [],
                 "response_to_screen_mapping": api.get("response_to_screen_mapping", []) or []
             },
-            "error_patterns": []
+            # api_spec[].error_patterns を写す。目的: 中間JSONのエラー定義を backend_processes に届ける。
+            # 接続: 呼出元は build_backend_processes。api_spec に無い案件は空配列のまま。
+            "error_patterns": api.get("error_patterns", []) or []
         })
 
     return backend_processes, api_to_id

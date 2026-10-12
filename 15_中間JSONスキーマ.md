@@ -30,6 +30,7 @@
 | v49 | `steps[].kind: response_mapping` 新設。`response_to_screen_mapping[]` を `backend_processes` から `front_processes[].steps[]` へ移動（`migrate_v48_to_v49.py`）。`response_spec.items[].source` / `transform_backend` 新設。`db_op_detail.sub_no` 新設 |
 | v52 | `derived_processes[]` 新設（派生処理マーク）。`screen_layout.areas[].screen_no` に裏方領域パターン（`"0"`/`null`）新設。`dispatch[].derived_from` 新設 |
 | v53 | `db_operations[].api_endpoint.trigger_events`（event_code の配列。同じ action を複数イベントから呼ぶ多対一用。単数 `trigger_event` と併用可。`process_flows[]` の旧キーとは別物）を許容。`meta.frontend_files[]` は screen_config の `source_files` 指定時に HTML を介さず入る（`.tsx`/`.ts` は `kind: js`） |
+| v54 | Phase 1 の機械下書き `extract_react_draft.py`（React の画面だけ）を追加。出力は中間JSON本体ではなく下書きJSON（`target/intermediate/{機能名}_react_draft.json`）で、キーは `events[]`（`event_code` は EV01 形式の連番）/ `db_operations[].api_endpoint.{action, trigger_events}` / `event_processes[].{event_code, details}`（details の呼出の行は `db_operations` の並びに一致）/ `unresolved[{file, line, reason}]`。`unresolved` は下書きJSONだけのキーで、中間JSON本体には無い。merge 前の検査 `verify_partials.py` を追加（event_code の連番・`trigger_events` の参照先の実在・overview 30字以内・details の呼出の行の数と並びが `api_endpoint` と一致・trigger 文が `screen_name` で始まる）。`api_spec[].error_patterns` を Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す |
 
 ---
 
@@ -566,7 +567,7 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 | `response_spec` | ◯ | `{pattern, schema, items[]}`（`response_to_screen_mapping[]` は `front_processes[].steps[]` に移動済、詳細はチェンジログ v49 参照） |
 | `response_spec.items[].source` | ◯ | `{type, source_ref, source_column}`。type は `request`（リクエスト透過）/ `db`（DB SELECT 直結）/ `calculated`（DB + バック計算）/ `merged`（複数 SELECT 統合）/ `const`（固定値）。source_ref は `②-X データセット名`、source_column は `テーブル.列名` |
 | `response_spec.items[].transform_backend` | ◯ | バック側 Python での加工内容を業務語彙で記述（例: `"date → 'YYYY/MM/DD' 書式変換"`, `"数量 × 単価 × 税率 ÷ 100（小数切り捨て）"`, `"パターン単位で辞書化、商品配列にネスト"`）。「そのまま」「DB の生値をそのまま」も明示する（不可視の加工がないことを示す） |
-| `error_patterns[]` | △ | エラー応答パターン一覧 |
+| `error_patterns[]` | △ | エラー応答パターン一覧。Phase 4 の `migrate_v17_to_v18.py` が、同じ action の `api_spec[].error_patterns` をそのまま写す（無ければ空配列） |
 | `notes[]` | △ | 業務担当者への注意書き。各要素は `{kind: '注意'|'補足'|'制約', text: string}`。フェーズB施策B3で新設、追加のみで既存フィールドへの影響なし |
 
 ### v18 整合性ルール（14_チェックリスト.md / verify_intermediate.py で機械検証）
@@ -859,6 +860,8 @@ INSERT/UPDATE/DELETE の場合:
 ### api_spec
 
 SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` / `response_to_screen_mapping` / `related_cache_operations` 各フィールドの追加経緯はチェンジログ参照。**現行有効**（generate_docx.js の `sectionApiSpec` で現役描画中、既存中間JSONに実データあり）。
+
+`error_patterns[]`（`{condition, status_code, message_id}` の配列）を Phase 1 で書くと、Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す。
 
 ```json
 [

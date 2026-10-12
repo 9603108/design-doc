@@ -257,6 +257,8 @@ Agent({
 
 Phase 4 の後に中間 JSON へ手で書いた内容は、Phase 4（`migrate_v17_to_v18.py`）をやり直すと消える。やり直す前に中間 JSON の控えを取る。
 
+`error_patterns` は Phase 1 で `api_spec[].error_patterns`（`{condition, status_code, message_id}` の配列）に書けば、Phase 4 の `migrate_v17_to_v18.py` が対応する `backend_processes[].error_patterns` へ写す（Phase 4 をやり直しても消えない入口）。
+
 渡し方:
 
 - **partial 4本で渡す場合（実行順序の Phase 2 からそのまま流す）**: 上のプロンプトの手順7・9の保存先を、最初の表の partial とキーに読み替える。`event_processes[].details` は partial に入口が無いので、`merge_partials.py` の後、Phase 4 の前に `{機能名}.json` へ書く。partial は画面どうしで共有されるので、複数画面を同時に処理しない（1画面ぶんの partial 4本を作り、その画面の `merge_partials.py` を済ませてから、次の画面の Phase 1 に進む）
@@ -376,6 +378,8 @@ INPUT_JSON="target/intermediate/${FEATURE_NAME}.json" \
 | `_config_loader.py` | `{機能名}_screen_config.json` 読込ヘルパー。`get_areas()` / `get_process_names_by_event_code()` / `get_diagram_spec(id)` 等のセクション別アクセサを提供 | 汎用 | **v30** |
 | **基盤スクリプト（v17 以前から）** | | | |
 | `merge_partials.py` | 4 Agent の出力（_partial_*.json）を統合し中間JSON 本体生成 | 汎用 | v1 |
+| `extract_react_draft.py` | React（TSX）の画面の source_files を静的に解析し、JSX のイベント属性 → ハンドラ → 状態の更新 → useEffect → `api_call_functions` の呼出（ラッパー経由を含む）を結んで、events（EV01… の連番）・`db_operations[].api_endpoint.trigger_events`・`event_processes[].details` の呼出の行・`unresolved` の下書き JSON を出す。解析できない箇所は推測で埋めず `unresolved` にだけ出す。HTML の画面では使わない | 汎用（`source_files` / `screen_name` は screen_config.json、`api_call_functions` は project_config.json 経由） | 2026-10-12 |
+| `verify_partials.py` | merge 前に partial と details を検査（event_code の連番・trigger_events の参照先の実在・overview 30字以内・details の呼出の行の数と並びが api_endpoint と一致・trigger 文が screen_name で始まる）。問題は1行1件「[種別] 場所: 内容」、1件でもあれば終了コード 1 | 汎用 | 2026-10-12 |
 | `convert_events_location_action.py` | events[].trigger を location/action/source_kind に分解 | 汎用 | v10 |
 | `replace_hatsuka.py` | 「発火」を「呼出/実行」に置換（業務語彙統一） | 汎用 | v11 |
 | **v18-v23 体系拡張（v30 で screen_config.json 経由に汎用化）** | | | |
@@ -418,6 +422,13 @@ export FEATURE_NAME="受注入力"   # 例: 受注入力 / 受注照会 / 顧客
 # Step 3 のプロンプトで {機能名}.json を直接保存した場合は、次の merge_partials.py を実行しない（実行すると空に近い中間JSON で上書きされる）
 # Phase 1 の出力では events[] に event_code（EV00 = 初期表示、以降 EV01… の連番）を付ける。event_processes は merge_partials.py が events から作る（details は空）
 # 処理ステップを docx に出すには、merge_partials.py の後・Phase 4 の前に event_processes[].details を埋める（Step 3「Phase 1 の成果物の渡し方」）
+# React（TSX）の画面だけ: partial を作る前に下書きを機械で出す。受注入力のような HTML の画面では実行しない
+python3 target/scripts/extract_react_draft.py --config "target/intermediate/${FEATURE_NAME}_screen_config.json" --out "target/intermediate/${FEATURE_NAME}_react_draft.json"
+#   下書きの events（EV01… の連番）・db_operations[].api_endpoint.trigger_events・event_processes[].details の呼出の行を partial と details の土台にする
+#   unresolved に出た箇所（解析できなかった所）は機械が埋めていないので、LLM がソースを読解して埋める。終了コード 1 は unresolved が1件以上ある意味
+# React（TSX）の画面だけ: merge_partials.py の前に partial と details を検査する（event_code の連番・trigger_events の参照先・overview 30字以内・呼出の行の数と並び・trigger 文の先頭）
+python3 target/scripts/verify_partials.py "target/intermediate/${FEATURE_NAME}_react_draft.json" --screen-name "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['screen_name'])" "target/intermediate/${FEATURE_NAME}_screen_config.json")"
+#   問題は1行1件「[種別] 場所: 内容」で出て、1件でもあれば終了コード 1。直してから Phase 2 に進む
 
 # === Phase 2: v17 形式中間JSON 構築 ===
 python3 target/scripts/merge_partials.py "${FEATURE_NAME}"                       # _partial 統合

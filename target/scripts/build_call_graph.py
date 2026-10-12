@@ -334,9 +334,10 @@ def extract_wrapper_function_calls(js_path: Path, func_names: list) -> list:
             if j >= len(text) or text[j] not in ",)":
                 continue
             line_no = text[:m.start()].count("\n") + 1
-            # 呼出元関数名の推定は extract_apicalls と同じ（直前 800 文字内の関数定義/メソッド）
+            # 呼出元関数名の推定: 直前 800 文字内の関数定義/メソッド。export / export default 付きの function 定義も拾う
+            # （extract_apicalls の同じ推定はこの修飾子を拾えず、別件として未対応）
             head = text[max(0, m.start() - 800):m.start()]
-            candidates = list(re.finditer(r"(?:^|\n)\s*(?:async\s+)?(?:function\s+|(?:const|let|var)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*[(:]", head))
+            candidates = list(re.finditer(r"(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\s+|(?:const|let|var)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*[(:]", head))
             caller = candidates[-1].group(1) if candidates else ""
             results.append({
                 "method": "",
