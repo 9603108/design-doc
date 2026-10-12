@@ -23,13 +23,31 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _ja_font() -> str:
+    """fontconfig が実際に解決できる日本語フォント名(Noto 優先、macOS は Hiragino)。無ければ Noto のまま"""
+    import subprocess
+    for name in ("Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic", "Meiryo"):
+        try:
+            out = subprocess.run(["fc-match", "-f", "%{family}", name],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            break
+        if name in out.split(","):
+            return name
+    return "Noto Sans CJK JP"
+
+
 def svg_to_png(svg_path: Path, png_path: Path, output_width: int = 1200) -> int:
     """SVGをPNGに変換。output_widthはPNG出力幅px（高DPI想定）。バイト数を返す"""
     if not svg_path.exists():
         raise FileNotFoundError(f"SVG が見つからない: {svg_path}")
     png_path.parent.mkdir(parents=True, exist_ok=True)
+    # WHY: cairosvg は font-family の先頭1つしか使わず、無ければ fontconfig の sans-serif にも
+    #      落ちない(macOS + brew cairo で日本語が□になる実測)。SVG は Noto Sans CJK JP 固定なので、
+    #      未導入の機械では導入済みの日本語フォントへ読み替える
+    svg = svg_path.read_text(encoding="utf-8").replace("Noto Sans CJK JP", _ja_font())
     cairosvg.svg2png(
-        url=str(svg_path),
+        bytestring=svg.encode("utf-8"),
         write_to=str(png_path),
         output_width=output_width,
     )
