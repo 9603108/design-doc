@@ -24,6 +24,7 @@ screen_config.json に外出しし、本スクリプトを画面非依存（汎�
 - 出力: 同 JSON を上書き
 - 仕様根拠: 15_中間JSONスキーマ.md「meta」セクション（v21 拡張）、SKILL.md「Phase 3-4 外部設定ファイル化」（v30）
 """
+import ast
 import json
 import os
 import re
@@ -121,6 +122,40 @@ def _describe_js(path: str) -> str:
     return descriptions.get(name, "スクリプト")
 
 
+def _project_root():
+    """screen_config.project_root を展開した Path を返す。未設定なら None。
+
+    意味合い: backend_files の相対パスを実ファイルへ解決する基点。
+    接続情報: upgrade_backend_files が呼ぶ（_head_description で先頭の説明を読むため）。
+    """
+    raw = load_screen_config(FEATURE_NAME).get("project_root", "")
+    return Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
+
+
+def _head_description(path: Path) -> str:
+    """ファイル先頭の説明を1行返す。.py は docstring の1行目、.ts/.tsx/.js は先頭の // か /* */ の1行目。
+
+    意味合い: screen_config に説明が無いファイルを、ファイル自身の記述で埋めて説明を空のまま残さない。
+              書かれていなければ "" を返す（種別は呼出側で決まっている）。
+    接続情報: upgrade_backend_files と _source_file_entries が呼ぶ。
+    """
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if path.suffix == ".py":
+        doc = (ast.get_docstring(ast.parse(text)) or "").strip()
+        return doc.splitlines()[0] if doc else ""
+    stripped = text.lstrip()
+    if stripped.startswith("//"):
+        return stripped.splitlines()[0][2:].strip()
+    if stripped.startswith("/*"):
+        for line in stripped[2:].split("*/", 1)[0].splitlines():
+            s = line.strip().lstrip("*").strip()
+            if s:
+                return s
+    return ""
+
+
 def extract_frontend_files(html_path: Path) -> list:
     """HTML を解析して frontend_files[] を生成する。
 
@@ -195,7 +230,8 @@ def _source_file_entries(source_files: list, existing: list) -> list:
             continue
         seen.add(path)
         kind, desc = classify_file(path)
-        entries.append({"path": path, "kind": kind, "description": desc})
+        # 説明が空（classify_file の other）のときだけ、ファイル先頭の説明を使う。
+        entries.append({"path": path, "kind": kind, "description": desc or _head_description(p)})
     return entries
 
 
@@ -240,19 +276,32 @@ def upgrade_backend_files(old_backend: list) -> list:
     #           付けた kind は meta.backend_files[].kind に入り、少なくとも generate_docx.js が表の種別列にそのまま表示する。
     entry_patterns = get_backend_entry_patterns(FEATURE_NAME)
     result = []
+    root = _project_root()
+    file_descs = get_file_descriptions(FEATURE_NAME)
     for path in old_backend or []:
         if not path:
             continue
+        name = path.rsplit("/", 1)[-1]
         if any(p in path for p in shared_patterns):
             kind = "shared_module"
-            name = path.rsplit("/", 1)[-1]
             desc = descs.get(name, "共通モジュール")
         elif any(p in path for p in entry_patterns):
             kind = "backend"
             desc = f"バックエンド関数: {path.split('/')[0]}"
+        elif name.endswith(".py") and (name.startswith("queries") or name.endswith("_queries.py")):
+            # 2026-10-12 queries 対応: DB 問い合わせ用の .py は共通モジュール（shared_module）とする。
+            # 意味合い: 画面の入口でも共通モジュールの一覧にも載らないと、種別が other のまま説明も空になるため。
+            # 接続情報: 説明は下の処理（file_descriptions → _head_description）で埋める。
+            kind = "shared_module"
+            desc = ""
         else:
             kind = "other"
             desc = ""
+        # screen_config.file_descriptions（ファイル名 → 説明。css/js 等の区分の下）があれば優先する。
+        # 説明が空のままなら、ファイル先頭の説明（docstring・先頭コメント）を使う。入口ファイルは対象外。
+        desc = next((d[name] for d in file_descs.values() if isinstance(d, dict) and name in d), "") or desc
+        if not desc and kind != "backend" and root is not None:
+            desc = _head_description(root / path)
         result.append({"path": path, "kind": kind, "description": desc})
 
     return result

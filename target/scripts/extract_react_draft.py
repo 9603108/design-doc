@@ -71,6 +71,14 @@ _TAG = re.compile(r"<([A-Za-z][\w.]*)")
 _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 
 
+# 意味合い: 失敗時・連続操作・0件の分岐を TSX の文字から機械的に拾う目印。拾えた場合だけ details の下書き行に足す。
+#          文言の〈〉は LLM が埋める印。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
+# ponytail: 目印は文字列の一致だけ。catch や setError 等が別の用途で出ると、要らない行が1つ付く
+_FAIL_HINT = re.compile(r"\bcatch\s*\(|\bset\w*(?:Err|err)\w*\s*\(")
+_RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*", re.IGNORECASE)
+_EMPTY_HINT = re.compile(r"\.length\s*(?:===|==)\s*0\b")
+
+
 def _walk(text, i, end=None):
     """text[i:end] を、文字列・コメントを飛ばして (位置, 文字, 括弧の深さ) で返す。深さは i 起点の相対値。"""
     n = len(text) if end is None else end
@@ -200,6 +208,8 @@ def _collect_defs(path, text, funcs, setters, derived, effects, unresolved):
 def _resolve(span, ctx, seen, acc):
     """本体 span から、呼ぶ action(呼ぶ順)と更新する状態を acc に積む。局所関数・ラッパーは辿る。"""
     path, text, s, e = span
+    # 目的: 失敗時・連続操作・0件の目印を拾うため、辿った本体の文字を acc に積む(_robust_lines が使う)
+    acc["texts"].append(text[s:e])
     for name, i in _idents(text, s, e):
         if name in ctx["api"]:
             if re.search(r"\bfunction\s*$", text[max(0, i - 20):i]):
@@ -246,7 +256,7 @@ def analyze_sources(source_files, api_call_functions):
         for m in _EVENT_ATTR.finditer(t):
             bo = m.end() - 1
             be = _close(t, bo)
-            acc = {"actions": [], "states": set(), "hit": False}
+            acc = {"actions": [], "states": set(), "hit": False, "texts": []}
             _resolve((p, t, bo + 1, be), ctx, set(), acc)
             expr = " ".join(t[bo + 1:be].split())[:80]
             if not acc["hit"] and not acc["actions"]:
@@ -268,18 +278,19 @@ def analyze_sources(source_files, api_call_functions):
             links.append({
                 "file": str(p), "line": _line(t, m.start()),
                 "element": tags[-1].group(1) if tags else "",
-                "attr": m.group(1), "handler": expr, "actions": acc["actions"],
+                "attr": m.group(1), "handler": expr, "actions": acc["actions"], "texts": acc["texts"],
             })
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
     # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
     # ponytail: effect 内の条件分岐(if で呼ばない場合)は見ない。呼ぶ可能性のある action を全部出す。
-    mount = {"actions": [], "states": set(), "hit": False}
+    mount = {"actions": [], "states": set(), "hit": False, "texts": []}
     for _deps, span in effects:
         _resolve(span, ctx, set(), mount)
     first = effects[0][1] if effects else None
     links.insert(0, {
         "file": str(first[0]) if first else "", "line": _line(first[1], first[2]) if first else 0,
         "element": "", "attr": "mount", "handler": "useEffect(マウント時)", "actions": mount["actions"],
+        "texts": mount["texts"],
     })
     seen_u, uniq = set(), []
     for u in unresolved:
@@ -288,6 +299,22 @@ def analyze_sources(source_files, api_call_functions):
             seen_u.add(key)
             uniq.append(u)
     return links, uniq
+
+
+def _robust_lines(texts):
+    """辿った本体の文字から、失敗時・連続操作・0件の下書き行を返す(拾えたものだけ)。
+
+    呼出元: build_draft()。意味合い: API を呼ぶイベントの処理ステップに、画面の振る舞いの骨格を機械的に足す。
+    """
+    body = "\n".join(texts)
+    lines = []
+    if _FAIL_HINT.search(body):
+        lines.append("取得に失敗したときは〈エラー表示の項目〉にメッセージを表示する")
+    if _RACE_HINT.search(body):
+        lines.append("連続して操作したときは、最後の要求の応答だけを反映する")
+    if _EMPTY_HINT.search(body):
+        lines.append("0件のときは〈該当なし表示〉を出す")
+    return lines
 
 
 def build_draft(links, unresolved, screen_name):
@@ -334,7 +361,8 @@ def build_draft(links, unresolved, screen_name):
         todo = [] if ev["event_code"] == "EV00" else [DETAIL_TODO]
         event_processes.append({
             "event_code": ev["event_code"],
-            "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called],
+            "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
+            + (_robust_lines(link["texts"]) if called else []),
         })
     return {
         "events": events,

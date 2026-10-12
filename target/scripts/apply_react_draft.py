@@ -35,6 +35,7 @@ Phase 1 の LLM は業務語彙の文面だけを書く。events と API の対�
 import argparse
 import copy
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -85,6 +86,43 @@ def apply_partial(draft, backend, event_codes):
         if act not in seen and want[act]:
             conflicts.append(f"[action] 下書きの {act} を持つ db_operations が partial に無い")
     return changed, conflicts
+
+
+def apply_backend(bdraft, backend):
+    """extract_backend_draft の出力(apis)を _partial_backend の api_spec と db_operations へ当てはめる。
+
+    空の欄だけを埋める(response_items・error_patterns)。db_operations の dataset は、空か全行が括り表記の仮のときだけ埋める。LLM が書いた中身は上書きせず、
+    論理名・業務の文は空のまま残す。api_spec は action、db_operations は api_endpoint.action で対応づける。
+    戻り: 書いた欄の件数。backend は破壊的に更新する。
+    """
+    apis = bdraft.get("apis") or {}
+    changed = 0
+    for spec in backend.get("api_spec") or []:
+        a = apis.get(spec.get("action"))
+        if not a:
+            continue
+        if not spec.get("response_items") and a.get("response_items"):
+            spec["response_items"] = [{"no": i, "key": r["key"], "display_name": "", "data_type": "", "source": ""}
+                                      for i, r in enumerate(a["response_items"], 1)]
+            changed += 1
+        if not spec.get("error_patterns") and a.get("error_patterns"):
+            spec["error_patterns"] = [dict(e) for e in a["error_patterns"]]
+            changed += 1
+    for op in backend.get("db_operations") or []:
+        a = apis.get((op.get("api_endpoint") or {}).get("action"))
+        if not a or not a.get("dataset"):
+            continue
+        rows = op.get("dataset") or []
+        # WHY: LLM が括り表記(「[」「]」「（」を含む論理名・物理名が仮のまま)で書いた行だけの dataset は下書きで置き換える。
+        # 正常な行が1つでもあれば LLM の記述を尊重して触らない(下書きとの食い違いは人が決める)
+        provisional = [bool(re.search(r"[\[\]（]", f"{r.get('logical_table') or ''}{r.get('physical_table') or ''}"))
+                       or not re.fullmatch(r"[A-Za-z0-9_]+", r.get("physical_table") or "") for r in rows]
+        if rows and not all(provisional):
+            continue
+        op["dataset"] = [{"no": i, "logical_table": "", "logical_column": "", "physical_table": d["table"],
+                          "physical_column": d["column"]} for i, d in enumerate(a["dataset"], 1)]
+        changed += 1
+    return changed
 
 
 def apply_details(draft, merged):
@@ -139,6 +177,7 @@ def main(argv=None):
     p.add_argument("feature", nargs="?", help="機能名(省略時は環境変数 FEATURE_NAME)")
     p.add_argument("--stage", choices=["partial", "merge"], help="partial=merge_partials の前 / merge=merge_partials の後")
     p.add_argument("--draft", help="下書きJSONのパス(省略時は target/intermediate/{機能名}_react_draft.json)")
+    p.add_argument("--backend-draft", help="extract_backend_draft の出力JSON(partial のみ・任意)。空欄の欄だけ埋める")
     p.add_argument("--selftest", action="store_true", help="組込みの検査を走らせる")
     args = p.parse_args(argv)
     if args.selftest:
@@ -159,6 +198,12 @@ def main(argv=None):
         ev = _load(ev_path) if ev_path.exists() else None
         codes = {e.get("event_code") for e in (ev or {}).get("events", [])} if ev else None
         changed, conflicts = apply_partial(draft, data, codes)
+        # backend 下書きは任意。与えられたときだけ api_spec・dataset の空欄を埋める(既存の値は触らない)
+        if args.backend_draft:
+            bd = _load(args.backend_draft)
+            if bd is None:
+                return 2
+            changed += apply_backend(bd, data)
     else:
         target = INTERMEDIATE_DIR / f"{feature}.json"
         data = _load(target)
@@ -211,6 +256,26 @@ def selftest():
         assert n == 1 and mg["event_processes"][0]["details"] == ["・load をリクエストする"], f"空の details: {n}"
         assert mg["event_processes"][1]["details"][0] == "入力を確定する", "業務語彙の文は残す"
         assert len(bad) == 1 and "EV03" in bad[0], f"数の食い違い: {bad}"
+        # (c) backend 下書き: 空欄だけ埋める / 再実行は何もしない / 既存の値は上書きしない
+        bd = {"apis": {"a1": {"dataset": [{"column": "p.mise_no", "table": "pos"}],
+                              "response_items": [{"key": "data.rows[].id"}],
+                              "error_patterns": [{"condition": "x", "status_code": 500, "message": "m"}]}}}
+        bk = {"api_spec": [{"action": "a1", "response_items": [], "error_patterns": []}, {"action": "a2"}],
+              "db_operations": [{"api_endpoint": {"action": "a1"}, "dataset": []}]}
+        n = apply_backend(bd, bk)
+        assert n == 3 and bk["api_spec"][0]["response_items"][0]["key"] == "data.rows[].id", f"backend: {n}"
+        assert bk["db_operations"][0]["dataset"][0]["physical_column"] == "p.mise_no", "dataset の写し"
+        assert apply_backend(bd, bk) == 0, "再実行は何もしない"
+        bk2 = {"api_spec": [{"action": "a1", "response_items": [{"key": "keep"}], "error_patterns": [{"x": 1}]}]}
+        assert apply_backend(bd, bk2) == 0 and bk2["api_spec"][0]["response_items"][0]["key"] == "keep", "既存は上書きしない"
+        # (d) dataset が括り表記だけの行なら下書きで置き換える / 正常な行が1つでもあれば触らない
+        bk3 = {"api_spec": [], "db_operations": [{"api_endpoint": {"action": "a1"},
+                                                  "dataset": [{"logical_table": "[店舗]", "physical_table": "[店舗テーブル]"}]}]}
+        assert apply_backend(bd, bk3) == 1 and bk3["db_operations"][0]["dataset"][0]["physical_column"] == "p.mise_no", "括り表記は置換"
+        bk4 = {"api_spec": [], "db_operations": [{"api_endpoint": {"action": "a1"},
+                                                  "dataset": [{"logical_table": "店舗", "physical_table": "mise"},
+                                                              {"logical_table": "[仮]", "physical_table": "x"}]}]}
+        assert apply_backend(bd, bk4) == 0 and bk4["db_operations"][0]["dataset"][0]["physical_table"] == "mise", "正常な行があれば触らない"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

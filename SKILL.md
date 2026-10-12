@@ -20,6 +20,8 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
   - `api_spec[].no` は `AP1` 形式（AP + 連番）で書く
   - `events[].trigger` の操作場所は「[項目番号]項目名」で書く（例: 「売上レポート画面の[4]集計軸を変更する。」）
   - `event_processes[].details` は必須。下書きの未記入の印を業務の文に置き換え、異常系の観点（04_機能別処理.md 5.4）も書く
+  - `db_operations[].dataset` の論理テーブル名は、実テーブルの業務名で書く（仮表記は不可）。下書きの〈〉の印は業務の文か論理名に置き換える
+  - `messages[].code` はメッセージID を書く（業務の文は入れない）
 
 **前提条件:**
 
@@ -438,7 +440,8 @@ python3 target/scripts/verify_partials.py "target/intermediate/${FEATURE_NAME}_r
 # React（TSX）の画面だけ: merge_partials.py の前に、下書きの trigger_events を _partial_backend.json の db_operations へ写す
 #   同じ action を複数の db_operations に分けていれば、同じ action を持つ全件に写す。EV00（初期表示）の呼出は initial_processes 側で持つので写さない
 #   既存の値が下書きと食い違えば上書きせず「[種別] 場所: 内容」を出して終了コード 1（直してから再実行する）
-python3 target/scripts/apply_react_draft.py "${FEATURE_NAME}" --stage partial
+python3 target/scripts/extract_backend_draft.py --screen-config "target/intermediate/${FEATURE_NAME}_screen_config.json" --out "target/intermediate/${FEATURE_NAME}_backend_draft.json"   # React の backend 下書き（api_spec の response_items・error_patterns、db_operations の dataset の機械抽出）
+python3 target/scripts/apply_react_draft.py "${FEATURE_NAME}" --stage partial --backend-draft "target/intermediate/${FEATURE_NAME}_backend_draft.json"
 
 # === Phase 2: v17 形式中間JSON 構築 ===
 python3 target/scripts/merge_partials.py "${FEATURE_NAME}"                       # _partial 統合

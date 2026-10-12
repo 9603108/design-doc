@@ -143,6 +143,11 @@ def build_event_processes(events: list, db_operations: list) -> list:
 
 
 def main():
+    # --help / -h は機能名ではなく使い方の要求。FEATURE_NAME に入ると screen_config 読込で落ちるため先に返す。
+    #   接続: 第1引数の判定だけ。機能名の解決（モジュール先頭）は変えない。
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("usage: merge_partials.py [機能名]  (機能名省略時は環境変数 FEATURE_NAME)")
+        return
     se = load_partial("screen_events")
     cs = load_partial("calc_state")
     be = load_partial("backend")

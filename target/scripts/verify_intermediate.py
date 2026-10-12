@@ -1152,6 +1152,74 @@ def check_structure(merged: dict, project_config: dict) -> list:
     return issues
 
 
+# 2026-10-12 新設: 論理・物理テーブル名の仮表記と物理名の形式（検査 (1)）
+# ponytail: 仮表記は角括弧と「集計結果の列」だけを見る。他の仮表記は見逃すので、増えたら語を足す
+PLACEHOLDER_NAME_RE = re.compile(r"[\[\]［］]|集計結果の列")
+PHYSICAL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# messages[].code のメッセージID形式（例 MSE00001 / MSG_POS_001）（検査 (3)）
+MESSAGE_CODE_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*\d+$")
+
+
+def check_table_name_placeholders(merged: dict) -> list:
+    """2026-10-12 新設: 論理テーブル名・物理テーブル名の仮表記と物理名の形式を ERROR で検出する。
+
+    判定ルール:
+      - db_operations[].dataset[] と logical_names[] の logical_table / physical_table に
+        角括弧や「集計結果の列」等の仮表記が残る → ERROR
+      - 物理テーブル名が英数字と _ だけでない → ERROR
+    意味合い: 仮の名前のまま docx に出る事故を止める。値は直さず、業務の名前への置き換えを促す。
+    接続情報: 入力 = merged / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    rows = []
+    for op in merged.get("db_operations", []) or []:
+        for ds in op.get("dataset") or []:
+            rows.append((f"db_operations[{op.get('id') or '?'}].dataset", ds.get("logical_table"), ds.get("physical_table")))
+    for ln in merged.get("logical_names", []) or []:
+        rows.append((f"logical_names[{ln.get('no') or '?'}]", ln.get("logical_table"), ln.get("physical_table")))
+    for label, logical, physical in rows:
+        for kind, name in (("論理", logical), ("物理", physical)):
+            if name and PLACEHOLDER_NAME_RE.search(str(name)):
+                issues.append(("ERROR", f"{label}: {kind}テーブル名「{name}」が仮表記のまま（業務の名前に置き換える）"))
+        if physical and not PHYSICAL_NAME_RE.match(str(physical)):
+            issues.append(("ERROR", f"{label}: 物理テーブル名「{physical}」が英数字と _ だけでない"))
+    return issues
+
+
+def check_file_descriptions(merged: dict) -> list:
+    """2026-10-12 新設: 1.1/1.2 のファイル構成（meta.frontend_files / meta.backend_files）の説明空・種別 other を WARN で検出する。
+
+    意味合い: 表に何のためのファイルかが空欄のまま出るのを防ぐ。種別 other は分類が決まっていない合図。
+    接続情報: 入力 = merged['meta'] の frontend_files / backend_files / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    meta = merged.get("meta") or {}
+    for key in ("frontend_files", "backend_files"):
+        for f in meta.get(key) or []:
+            path = f.get("path") or "?"
+            if not str(f.get("description") or "").strip():
+                issues.append(("WARN", f"meta.{key}[{path}]: 説明が空（1.1/1.2 のファイル構成に何のためのファイルかを書く）"))
+            if str(f.get("kind") or "").lower() == "other":
+                issues.append(("WARN", f"meta.{key}[{path}]: 種別が other（js / css / backend 等に分類する）"))
+    return issues
+
+
+def check_message_code_format(merged: dict) -> list:
+    """2026-10-12 新設: messages[].code がメッセージID形式でないものを WARN で検出する。
+
+    意味合い: code 列に validation_error のような種別名が入ると、業務担当者がメッセージを特定できない。
+    判定: 空の code は対象外。
+    接続情報: 入力 = merged['messages'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    for m in merged.get("messages", []) or []:
+        code = str(m.get("code") or "").strip()
+        if code and not MESSAGE_CODE_ID_RE.match(code):
+            mid = m.get("message_id") or m.get("msg_id") or m.get("id") or "?"
+            issues.append(("WARN", f"messages[{mid}].code={code} がメッセージID形式（例 MSE00001）でない"))
+    return issues
+
+
 def main():
     # 目的: 引数で指定された機能名の中間 JSON を検証する。引数なしなら環境変数 FEATURE_NAME、
     #       どちらも無ければ _config_loader 側が「feature_name 未指定」で止める（既定の機能名は持たない）。
@@ -1214,6 +1282,11 @@ def main():
     # A8（2026-07-18）: 同一エリア内 item_name 重複 / overview 文言使い回し検出（可読性の底上げ）
     all_issues.extend(check_item_name_duplication(merged))
     all_issues.extend(check_overview_duplication(merged))
+
+    # 2026-10-12: 論理・物理テーブル名の仮表記 / 1.1・1.2 のファイル説明・種別 / messages.code の ID 形式
+    all_issues.extend(check_table_name_placeholders(merged))
+    all_issues.extend(check_file_descriptions(merged))
+    all_issues.extend(check_message_code_format(merged))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]
