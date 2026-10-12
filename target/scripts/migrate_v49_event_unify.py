@@ -25,7 +25,7 @@ event_code 旧形式が残ると、業務記述（remarks 等）に旧コード�
 【設計原則】
 - 汎用: 機能名・event_code 形式（EV00 のような連番形式 / 案件独自の旧形式）に依存しない、events[].event_code → events[].no で動的にマップ構築
 - 冪等: 既に event_ref に rename 済みのフィールドは再変換しない（events[].event_code が存在しなければ skip）
-- 安全: バックアップを /tmp に保存
+- 安全: バックアップを中間 JSON と同じ場所の backup/ 下に保存
 - legacy_id 保持: events[].legacy_event_code に旧値を保存し、業務トレーサビリティ維持
 """
 import json
@@ -50,9 +50,12 @@ INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 
 def backup(intermediate_json: Path) -> Path:
-    """現状を /tmp にバックアップ。意味合い: v50 移行前の状態を復元できるよう保存"""
+    """現状を中間 JSON と同じ場所の backup/ にバックアップ。意味合い: v50 移行前の状態を復元できるよう保存"""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = Path(f"/tmp/{intermediate_json.stem}_pre-v50_{ts}.json")
+    # 意味合い: 控えを /tmp に置くと再起動や掃除で消えて復元できなくなるため、入力と同じ場所へ残す
+    backup_dir = intermediate_json.parent / "backup"
+    backup_dir.mkdir(exist_ok=True)
+    backup_path = backup_dir / f"{intermediate_json.stem}_pre-v50_{ts}.json"
     shutil.copy(intermediate_json, backup_path)
     return backup_path
 

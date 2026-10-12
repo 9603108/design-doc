@@ -40,7 +40,7 @@ v48 「id_scheme 経由ヘッダ」と続いた一連の汎用化の集大成と
 【設計原則】
 - 冪等: 既に v49 化されたエントリは再変換しない（response_mapping kind step / source フィールド存在で判定）
 - 汎用: 機能名・接頭辞・パターンに依存しない（screen_config.json の strip_step_keywords は拡張可能）
-- 安全: backup を /tmp に保存（v48 形式が必要な場合の復元用）
+- 安全: backup を中間 JSON と同じ場所の backup/ 下に保存（v48 形式が必要な場合の復元用）
 """
 import json
 import re
@@ -66,9 +66,12 @@ INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 
 def backup_v48(intermediate_json: Path) -> Path:
-    """v48 形式の現状を /tmp にバックアップ"""
+    """v48 形式の現状を中間 JSON と同じ場所の backup/ にバックアップ"""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = Path(f"/tmp/{intermediate_json.stem}_v48_backup_{ts}.json")
+    # 意味合い: 控えを /tmp に置くと消えて復元できなくなるため、入力と同じ場所へ残す
+    backup_dir = intermediate_json.parent / "backup"
+    backup_dir.mkdir(exist_ok=True)
+    backup_path = backup_dir / f"{intermediate_json.stem}_v48_backup_{ts}.json"
     shutil.copy(intermediate_json, backup_path)
     return backup_path
 
