@@ -48,9 +48,12 @@ AFTER = [
     "python3 target/scripts/_fill_event_processes.py {feat}",
     "python3 target/scripts/_fix_derived_dispatch.py {feat}",
     "python3 target/scripts/add_diagrams_to_intermediate.py {feat}",
+    "python3 target/scripts/build_ipo_flowchart_svg.py {feat}",
     DIAGRAM_MARK,
     "python3 target/scripts/apply_logical_name_substitution.py {feat}",
     "python3 target/scripts/build_call_graph.py {feat}",
+    # WHY: logging.observation_points が無い案件ではスクリプト自身が「スキップ」で正常終了する。
+    "python3 target/scripts/apply_logging_steps.py {feat}",
     "python3 target/scripts/apply_id_scheme.py {feat}",
     "python3 target/scripts/migrate_v49_event_unify.py {feat}",
     "python3 target/scripts/migrate_v48_to_v49.py {feat}",
@@ -134,13 +137,17 @@ def diagram_commands(feat):
     p = subprocess.run([sys.executable, "-c", probe], cwd=SKILL, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError("get_all_diagram_ids failed: " + p.stderr[-400:])
-    cmds = []
-    for did in p.stdout.split():
-        if did == "ipo_flowchart":
-            continue
-        cmds.append(f"python3 target/scripts/build_generic_diagram_svg.py {feat} {did}")
-        cmds.append(f"python3 target/scripts/extract_svg.py {did}")
-        cmds.append(f"python3 target/scripts/svg_to_png.py {did}")
+    return diagram_steps(feat, p.stdout.split())
+
+
+def diagram_steps(feat, ids):
+    # WHY: SKILL.md Phase 5 の2つのループと同じ形。build は ipo_flowchart 以外(IPO は AFTER の build_ipo_flowchart_svg)、
+    # extract_svg / svg_to_png は ipo_flowchart を含む全 id を target/diagrams/{feat}_{id}.html/.svg/.png で回す。
+    cmds = [f"python3 target/scripts/build_generic_diagram_svg.py {feat} {did}" for did in ids if did != "ipo_flowchart"]
+    for did in ids:
+        base = f"target/diagrams/{feat}_{did}"
+        cmds.append(f"python3 target/scripts/extract_svg.py {base}.html {base}.svg")
+        cmds.append(f"python3 target/scripts/svg_to_png.py {base}.svg {base}.png 1400")
     return cmds
 
 
@@ -179,6 +186,24 @@ def selftest():
     text = build_prompt(units, "テスト機能", "S1", sendbacks=["ERROR 欄 → 差し戻し先 S1"])
     assert "_unit_S1.json" in text and "ERROR 欄 → 差し戻し先 S1" in text, text
     assert "【差し戻し】" not in build_prompt(units, "テスト機能", "S1")
+    check_step_args("テスト機能")
+
+
+def check_step_args(feat):
+    """各段のスクリプトが在り、`len(sys.argv) < N` で求める位置引数の数を満たすかを見る。
+
+    ponytail: スクリプト本文の `len(sys.argv) < N` だけを見る。argparse の必須引数は見ない(要れば --help を流す)。
+    """
+    steps = [s for t in AFTER if t != DIAGRAM_MARK for s in [t.replace("{feat}", feat)]]
+    steps += diagram_steps(feat, ["ipo_flowchart", "process_structure"])
+    for cmd in steps:
+        toks = cmd.split()
+        i = next(k for k, t in enumerate(toks) if t.endswith((".py", ".js")))
+        script = SKILL / toks[i]
+        assert script.exists(), cmd
+        argc = 1 + len([t for t in toks[i + 1:] if not t.startswith("-")])
+        need = [int(n) for n in re.findall(r"len\(sys\.argv\)\s*<\s*(\d+)", script.read_text(encoding="utf-8"))]
+        assert all(argc >= n for n in need), f"引数が足りない: {cmd} (要 {max(need)}、有 {argc})"
 
 
 def main(argv=None):
