@@ -115,8 +115,10 @@ def apply_backend(bdraft, backend):
         rows = op.get("dataset") or []
         # WHY: LLM が括り表記(「[」「]」「（」を含む論理名・物理名が仮のまま)で書いた行だけの dataset は下書きで置き換える。
         # 正常な行が1つでもあれば LLM の記述を尊重して触らない(下書きとの食い違いは人が決める)
-        provisional = [bool(re.search(r"[\[\]（]", f"{r.get('logical_table') or ''}{r.get('physical_table') or ''}"))
-                       or not re.fullmatch(r"[A-Za-z0-9_]+", r.get("physical_table") or "") for r in rows]
+        # verify_intermediate と同じ基準: テーブル名の仮表記(角括弧・集計結果の列)、物理名が英数字と _ だけでない、論理列の括り表記(各列/など/…/等)
+        provisional = [bool(re.search(r"[\[\]［］（]|集計結果の列", f"{r.get('logical_table') or ''}{r.get('physical_table') or ''}"))
+                       or not re.fullmatch(r"[A-Za-z0-9_]+", r.get("physical_table") or "")
+                       or bool(re.search(r"各列|など|…|等(?![一-鿿])", r.get("logical_column") or "")) for r in rows]
         if rows and not all(provisional):
             continue
         op["dataset"] = [{"no": i, "logical_table": "", "logical_column": "", "physical_table": d["table"],

@@ -75,7 +75,7 @@ _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 #          文言の〈〉は LLM が埋める印。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
 # ponytail: 目印は文字列の一致だけ。catch や setError 等が別の用途で出ると、要らない行が1つ付く
 _FAIL_HINT = re.compile(r"\bcatch\s*\(|\bset\w*(?:Err|err)\w*\s*\(")
-_RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*", re.IGNORECASE)
+_RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)  # 末尾: useRef の連番(++seq.current)
 _EMPTY_HINT = re.compile(r"\.length\s*(?:===|==)\s*0\b")
 
 

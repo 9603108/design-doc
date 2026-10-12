@@ -40,7 +40,7 @@ from pathlib import Path
 _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON", "GROUP", "ORDER", "LIMIT",
        "UNION", "USING", "SET", "HAVING", "WINDOW", "OFFSET", "FOR", "RETURNING", "AS", "WITH"}
 _SQL_HEAD = re.compile(r"^\s*(?:--[^\n]*\n\s*)*(WITH|SELECT)\b", re.IGNORECASE)
-_FROM_TBL = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?", re.IGNORECASE)
+_FROM_TBL = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)(?:\s+(?:AS\s+)?(?!(?:" + "|".join(_KW) + r")\b)([A-Za-z_]\w*))?", re.IGNORECASE)  # キーワードは別名に食わせない(FROM t JOIN u の JOIN を落とさない)
 _CTE = re.compile(r"\b([A-Za-z_]\w*)\s+AS\s*\(", re.IGNORECASE)
 
 
@@ -148,13 +148,22 @@ def _dataset(sql, unresolved, action):
         if al and al.upper() not in _KW:
             alias.setdefault(al, tbl)
     for c in _CTE.finditer(m):  # WITH d AS (SELECT ... FROM <実表>) の d を実表へ解決する
-        f = _FROM_TBL.search(m, c.end())
-        if f:
-            ctes[c.group(1)] = f.group(1)
+        end, depth = len(m), 1  # 本体は対応する ")" まで。外の FROM(次の CTE や本文)を拾わない
+        for i in range(c.end(), len(m)):
+            depth += (m[i] == "(") - (m[i] == ")")
+            if depth == 0:
+                end = i
+                break
+        f = _FROM_TBL.search(m, c.end(), end)
+        ctes[c.group(1)] = f.group(1) if f else "X"  # 本体に実表が見えない(f 文字列の穴など)CTE は X = 不明
 
     def real(name):
         name = alias.get(name, name)
-        return ctes.get(name, name)
+        seen = set()
+        while name in ctes and name not in seen:  # CTE が別の CTE を FROM する連鎖(t → k → cur → 実表)を実表まで辿る
+            seen.add(name)
+            name = ctes[name]
+        return name
 
     rows = []
     for s, f in _depth0_selects(m):
@@ -176,6 +185,8 @@ def _dataset(sql, unresolved, action):
             tbl = real(q.group(1)) if q and q.group(1) in alias else main
             if tbl != "X":
                 rows.append({"column": col, "table": tbl})
+            else:
+                unresolved.append({"action": action, "reason": f"列「{col}」の出所テーブルを静的に取れない(CTE の FROM が動的)"})
     return rows
 
 
@@ -298,7 +309,7 @@ def extract(files):
 def selftest():
     """最小の 2 ファイルで、ディスパッチ解決・別名/CTE/テーブル・return キー・raise を assert する。"""
     import tempfile
-    h = 'import q\nA = {"get_x": q.get_x}\n'
+    h = 'import q\nA = {"get_x": q.get_x, "get_y": q.get_y}\n'
     qs = (
         'COLS = ["a", "b"]\n'
         'def _sel():\n    return ", ".join(f"SUM(t.{c}) AS {c}" for c in COLS)\n'
@@ -306,6 +317,10 @@ def selftest():
         '    if not p:\n        raise ValidationError("必須です")\n'
         '    sql = f"""WITH d AS (SELECT t.* FROM real_tbl t) SELECT t.id AS x_id, {_sel()}, s.name FROM d t LEFT JOIN shops s ON s.id=t.id"""\n'
         '    return {"rows": sql, "n": 1}\n'
+        'def get_y(p):\n'  # CTE の連鎖(t → k → 実表)は実表へ、FROM が動的な CTE は unresolved へ
+        '    sql = f"""WITH k AS (SELECT id FROM real_tbl), t AS (SELECT k.id FROM k), u AS (SELECT 1 AS z FROM {p()})\n'
+        '    SELECT t.id AS y_id, u.z AS z FROM t JOIN u ON 1=1"""\n'
+        '    return {"rows": sql}\n'
     )
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "h.py").write_text(h, encoding="utf-8")
@@ -316,6 +331,8 @@ def selftest():
     assert {("x_id", "real_tbl"), ("a", "real_tbl"), ("b", "real_tbl"), ("name", "shops")} <= cols, cols
     assert [x["key"] for x in a["response_items"]] == ["rows", "n"], a["response_items"]
     assert a["error_patterns"] == [{"condition": "", "status_code": 400, "message": "必須です"}], a["error_patterns"]
+    ycols = {(x["column"], x["table"]) for x in r["apis"]["get_y"]["dataset"]}
+    assert ycols == {("y_id", "real_tbl")}, ycols
     print("[selftest OK] extract_backend_draft")
     return 0
 
