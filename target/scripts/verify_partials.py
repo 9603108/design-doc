@@ -203,14 +203,14 @@ def selftest_units():
     spec = _units.load_spec()
     assert _units.check_spec(spec) == [], f"分担表に重なり: {_units.check_spec(spec)}"
     good = {
-        "H1": {"events": [{"event_code": "EV00", "trigger": "受注入力画面の初期表示時", "content": "一覧を表示する"},
-                          {"event_code": "EV01", "trigger": "受注入力画面の確定ボタンをクリックする。", "content": "保存する"}]},
+        "H1": {"events": [{"event_code": "EV00", "trigger": "受注入力画面の初期表示時", "content": "一覧を表示する", "classification": "サーバー"},
+                          {"event_code": "EV01", "trigger": "受注入力画面の確定ボタンをクリックする。", "content": "保存する", "classification": "サーバー"}]},
         "H2": {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save", "trigger_events": ["EV01"]},
                                   "operation_type": "INSERT"}]},
         "H3": {"api_spec": [{"action": "save", "method": "POST", "path": "/api/order",
                              "response_items": [{"key": "result", "no": 1, "data_type": "string"}]}]},
-        "H4": {"messages_backend": [{"message_id": "MSE00001", "code": "MSE00001", "message": "保存に失敗しました"}]},
-        "S1": {"screen_layout": {"items": [{"item_name": "確定", "item_type": "Button", "event_code": "EV01"}]}},
+        "H4": {"messages_backend": [{"message_id": "MSE00001", "code": "MSE00001", "severity": "error", "message": "保存に失敗しました"}]},
+        "S1": {"screen_layout": {"items": [{"item_name": "確定", "area_ref": "A1", "item_type": "Button", "event_code": "EV01"}]}},
         "S2": {"api_spec": [{"action": "save", "description": "受注を保存する", "related_db_operations": ["db_op_save"],
                              "response_items": [{"key": "result", "source": {"type": "const"}}],
                              "response_to_screen_mapping": [{"api_field_path": "result", "screen_item_name": "確定"}],
@@ -224,6 +224,15 @@ def selftest_units():
     assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "source": {"type": "const"}}, "行の合成が違う"
     parts, unknown = _units.split_partials(comp)
     assert "event_processes" in parts["screen_events"] and not unknown, "partial への振り分けが違う"
+    assert comp["screen_layout"]["items"][0]["no"] == 1, "合成で items の no を振っていない"
+    # 合成後に必須のキーの欠けは、そのキーを持つ単位へ戻す。担当の断片が未着なら照合しない
+    lack = copy.deepcopy(good)
+    del lack["S1"]["screen_layout"]["items"][0]["item_type"]
+    del lack["S2"]["api_spec"][0]["description"]
+    out = _units.check_all(spec, lack)
+    assert any(p.startswith("[必須]") and p.endswith("差し戻し先 S1") for p in out), f"S1 の欠けを拾わない: {out}"
+    assert any(p.startswith("[必須]") and p.endswith("差し戻し先 S2") for p in out), f"S2 の欠けを拾わない: {out}"
+    assert not [p for p in _units.check_all(spec, {"H3": good["H3"]}) if p.startswith("[必須]")], "担当が未着でも [必須] を出した"
 
     bad = copy.deepcopy(good)
     bad["H3"]["api_spec"][0]["description"] = "勝手に書いた"                    # 範囲外 + 重複

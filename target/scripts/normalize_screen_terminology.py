@@ -220,6 +220,15 @@ def normalize_event(ev: dict, areas_by_name: dict, items_by_no: dict, items_by_n
             ev["external_trigger_kind"] = "devtools"
             return ev
 
+    # 2026-10-12: 「{画面名}の{エリア名}の{項目}を{動作}する。」(H1 の手順書の型)は PATTERN_FREE で
+    #   area_raw=「{エリア名}の{項目}」になりエリアが解決しない。既知のエリア名の前方一致で割る(長い名前を先に)
+    if parsed and parsed.get("area_raw") and parsed.get("item_name_raw") is None:
+        for name in sorted(areas_by_name, key=len, reverse=True):
+            if parsed["area_raw"].startswith(name + "の"):
+                parsed["item_name_raw"] = parsed["area_raw"][len(name) + 1:]
+                parsed["area_raw"] = name
+                break
+
     if parsed:
         # 画面名は権威語彙に統一（「{画面名}（編集モード）」→「{画面名}」）
         screen_name = SCREEN_NAME_ALIAS.get(parsed["screen"], parsed["screen"])

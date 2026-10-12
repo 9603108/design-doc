@@ -53,6 +53,31 @@ PARTIAL_OF = {
 }
 PARTIAL_NAMES = ["screen_events", "calc_state", "backend", "peripheral"]
 
+# 1からの通し番号 no を持つ一覧。no は並び順で機械的に決まるので、単位には書かせず合成で振る(書いてあっても振り直す)
+NUMBERED = ["screen_layout.items", "validations_frontend", "calculations", "parameters_backend", "common_logic"]
+
+# 合成後に必須のキー(15_中間JSONスキーマ.md の「必須 ◯」のうち、単位が書くもの)。一覧の汎用パス → キー。
+# 識別子(IDENTITY)・合成で振る no・後段の script が付けるキー(events の no・location・action・source_kind 等)は含めない。
+# 欠けの差し戻し先は分担表の owns から引く。担当の単位の断片がまだ無いとき(並行の途中)は照合しない
+REQUIRED = {
+    "screen_layout.items": ["area_ref", "item_type"],  # screen_no は add_screen_areas.py が area_ref から写す
+    "events": ["trigger", "content", "classification"],
+    "validations_frontend": ["field", "rule", "applied_when"],
+    "calculations": ["name", "formula"],
+    "messages_backend": ["code", "severity", "message"],
+    "parameters_backend": ["name"],
+    "common_logic": ["name", "expression"],
+    "api_spec": ["method", "path", "description"],
+    "db_operations": ["operation_type"],
+}
+
+
+def _rows(composed, generic):
+    node = composed
+    for k in generic.split("."):
+        node = node.get(k) if isinstance(node, dict) else None
+    return [e for e in node or [] if isinstance(e, dict)]
+
 
 def load_spec(path=None):
     return json.loads(Path(path or UNITS_SPEC_PATH).read_text(encoding="utf-8"))
@@ -187,7 +212,23 @@ def compose(spec, frags):
                     out[k] = copy.deepcopy(frags[u][k])
                 else:
                     out[k] = _merge(out[k], frags[u][k], k)
+    for generic in NUMBERED:
+        for i, row in enumerate(_rows(out, generic), start=1):
+            row["no"] = i
     return out
+
+
+def check_required(spec, frags, composed):
+    """合成後の必須キーの欠け。[必須] 場所: キーが無い → 差し戻し先 <そのキーを持つ単位>"""
+    problems = []
+    for generic, keys in REQUIRED.items():
+        idk = IDENTITY.get(generic)
+        for i, row in enumerate(_rows(composed, generic)):
+            for k in keys:
+                owner = owner_of(spec, f"{generic}[].{k}")
+                if k not in row and owner in frags:
+                    problems.append(f"[必須] {generic}[{row.get(idk) or '#' + str(i)}]: {k} が無い → 差し戻し先 {owner}")
+    return problems
 
 
 def _merge(dst, src, generic):
@@ -280,7 +321,8 @@ def check_refs(spec, composed):
 def check_all(spec, frags, only=None):
     """分担表・断片・合成後の参照をまとめて検査する。only を与えるとその単位に関わる行だけ返す"""
     problems = check_spec(spec) + check_fragments(spec, frags, only)
-    refs = check_refs(spec, compose(spec, frags))
+    composed = compose(spec, frags)
+    refs = check_refs(spec, composed) + check_required(spec, frags, composed)
     if only:
         refs = [p for p in refs if p.endswith(f" {only}")]
     return problems + refs

@@ -66,9 +66,16 @@ def main():
     # 1. areas[] を追加（既存があれば上書き）— v30: screen_config.json 経由
     sl["areas"] = screen_areas
 
-    # 2. items[] に area_ref を screen_no ベースで付与
+    # 2. items[] の area_ref と screen_no を揃える。area_ref が areas[] にあればそれを正とし screen_no を写す
+    #    (area → screen_no は一意。複数 area が同じ screen_no を持てるので逆は一意でない。委譲の単位 S1 は area_ref を書く)。
+    #    area_ref が無い・解決しない項目だけ、従来どおり screen_no から area_ref を付ける
+    area_no_to_screen_no = {a["area_no"]: a["screen_no"] for a in screen_areas}
     assigned = 0
     for it in items:
+        if it.get("area_ref") in area_no_to_screen_no:
+            it["screen_no"] = area_no_to_screen_no[it["area_ref"]]
+            assigned += 1
+            continue
         sn = str(it.get("screen_no", ""))
         if sn in screen_no_to_area_no:
             it["area_ref"] = screen_no_to_area_no[sn]
