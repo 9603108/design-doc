@@ -234,6 +234,13 @@ def selftest_units():
     assert any(p.startswith("[必須]") and p.endswith("差し戻し先 S2") for p in out), f"S2 の欠けを拾わない: {out}"
     assert not [p for p in _units.check_all(spec, {"H3": good["H3"]}) if p.startswith("[必須]")], "担当が未着でも [必須] を出した"
 
+    # H1 の trigger の項目名が S1 の item_name と食い違えば H1 へ戻す
+    typo = copy.deepcopy(good)
+    typo["H1"]["events"][1]["trigger"] = "受注入力画面の確認ボタンをクリックする。"
+    out = _units.check_all(spec, typo)
+    assert any(p.startswith("[項目名]") and p.endswith("差し戻し先 H1") for p in out), f"trigger の項目名の食い違いを拾わない: {out}"
+    assert not [p for p in _units.check_all(spec, {"H1": good["H1"]}) if p.startswith("[項目名]")], "S1 が未着でも [項目名] を出した"
+
     bad = copy.deepcopy(good)
     bad["H3"]["api_spec"][0]["description"] = "勝手に書いた"                    # 範囲外 + 重複
     bad["S2"]["api_spec"][0]["response_items"][0]["key"] = "results"            # 識別子の食い違い

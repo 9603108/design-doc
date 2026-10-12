@@ -81,6 +81,16 @@ def main():
             it["area_ref"] = screen_no_to_area_no[sn]
             assigned += 1
 
+    # 2b. 2026-10-13 api_spec[].response_to_screen_mapping[].screen_no を screen_item_name から写す
+    #     目的: screen_no は項目名から機械で決まるので、委譲の単位 S2 に書かせない(書いてあっても上書きする)。
+    #     意味合い: 2. で揃えた items の screen_no を正とする。引けない名前は触らない
+    #               (verify_partials.py --units の [参照] が S2 へ差し戻す。verify_intermediate.py も WARN を出す)。
+    item_screen_no = {it.get("item_name"): it.get("screen_no") for it in items if it.get("item_name")}
+    for api in data.get("api_spec", []) or []:
+        for m in api.get("response_to_screen_mapping") or []:
+            if m.get("screen_item_name") in item_screen_no:
+                m["screen_no"] = item_screen_no[m["screen_item_name"]]
+
     # 3. v32: area_pattern_subdivisions[] を screen_layout に伝播
     # 意味合い: generate_docx.js は中間JSON のみを読むため、screen_config.json の subdivision 定義を
     #          中間JSON 経由で渡す。明細グリッドのエリアをパターン別に分割表示する場合などに使われる。

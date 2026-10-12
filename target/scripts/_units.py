@@ -287,6 +287,16 @@ def check_refs(spec, composed):
             c = it.get("event_code")
             if c and c not in events:
                 problems.append(f"[参照] screen_layout.items[{it.get('item_name')}].event_code={c}: events に無い → 差し戻し先 {back('screen_layout.items[].event_code')}")
+        # trigger の項目名が S1 の item_name と食い違うと、後段の events[].location が権威語彙に無い ERROR になる。
+        # その event_code を持つ項目の名前が、どれも trigger に字面で入っていなければ H1 へ戻す
+        by_code = {}
+        for it in (composed.get("screen_layout") or {}).get("items") or []:
+            if it.get("event_code") and it.get("item_name"):
+                by_code.setdefault(it["event_code"], []).append(it["item_name"])
+        for ev in composed.get("events") or []:
+            names = by_code.get(ev.get("event_code"))
+            if names and not any(n in (ev.get("trigger") or "") for n in names):
+                problems.append(f"[項目名] events[{ev.get('event_code')}].trigger「{ev.get('trigger')}」に画面項目名「{'」か「'.join(names)}」が無い(screen_layout.items の item_name と字面を揃える) → 差し戻し先 {back('events[].trigger')}")
     for op in composed.get("db_operations") or []:
         api = op.get("api_endpoint") or {}
         if "api_spec" in composed and api.get("action") and api.get("action") not in actions:
