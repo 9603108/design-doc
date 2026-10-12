@@ -292,7 +292,7 @@ Phase 4 の後に中間 JSON へ手で書いた内容は、Phase 4（`migrate_v1
 | Wave 3 | 04_機能別処理.md | `event_processes`（Phase 1 が書く。`details` が処理ステップ）→ Phase 4 が `front_processes` を作る | 5.1 フロント処理 |
 | Wave 3 | 05_DB操作.md ＋ 12_API仕様.md（v18 で統合） | `db_operations` / `api_spec`（Phase 1 が書く）→ Phase 4 が `backend_processes` を作る | 5.2 バックエンド処理 |
 | Wave 3 | 13_共通ロジック.md（該当時のみ） | `common_logic` | 5.5 共通ロジック（有るときだけ） |
-| Wave 3.5 | 17_構成図生成.md（任意） | 図の spec — screen_config の `diagrams.{diagram_id}`（id をキーにしたオブジェクト）に書く。中間 JSON の `diagrams[]` は `add_diagrams_to_intermediate.py` が写して作るので、担当が直接書かない（図そのものは実行順序 Phase 5 の Python スクリプトが作る。diagram-design スキルは任意の代替） | 2 構成図（処理構成図 = 2.1、IPO 図 = 2.2、画面遷移図 = 2.3）/ 3.1 画面構成図 |
+| Wave 3.5 | 17_構成図生成.md（任意） | 図の spec — screen_config の `diagrams.{diagram_id}`（id をキーにしたオブジェクト）に書く。中間 JSON の `diagrams[]` は `add_diagrams_to_intermediate.py` が写して作るので、担当が直接書かない（図そのものは実行順序 Phase 5 の Python スクリプトが作る。diagram-design スキルは任意の代替） | 2 構成図（処理構成図 = 2.1、IPO 図 = 2.2、画面遷移図 = 2.3）/ 3.1 画面構成図（`screen_structure` は spec が無くても、中間JSON の `screen_layout` から自動生成される。書けばそちらが優先） |
 | Wave 4 | 14_チェックリスト.md | 整合性検証（v18 整合性ルール12-17 を含む） | 全体検証 |
 
 **docx 章構成（generate_docx.js が実際に出力する章立て）:**

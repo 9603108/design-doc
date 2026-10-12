@@ -470,20 +470,67 @@ def get_trigger_dispatch(feature_name: str = None) -> dict:
     return load_screen_config(feature_name).get("trigger_dispatch", {})
 
 
+def _auto_screen_structure(feature_name: str = None):
+    """screen_config に screen_structure が無いとき、中間JSON の screen_layout から nested spec を機械生成する。
+
+    目的: 画面構成図(§3.1)が ASCII 図に落ちるのを防ぐ。LLM が spec を書いていればそちらが優先（呼出元で先に判定）。
+    形: build_nested_svg は最上位が横割り・深さ1以降が縦積みなので、
+        [画面ルート > 「画面全体」ラッパ > エリア(note=項目名の列挙)] とし、エリアを縦に積ませる。
+    中間JSON が無い／areas が空なら None（従来どおり ASCII へ）。
+    """
+    fn = resolve_feature_name(feature_name)
+    p = INTERMEDIATE_DIR / f"{fn}.json"
+    if not p.exists():
+        return None
+    layout = (json.loads(p.read_text(encoding="utf-8")).get("screen_layout") or {})
+    areas = layout.get("areas") or []
+    if not areas:
+        return None
+    items = layout.get("items") or []
+    children = []
+    for a in areas:
+        keys = {a.get("area_no"), a.get("legacy_id")} - {None, ""}
+        names = [str(i.get("item_name")) for i in items if i.get("area_ref") in keys and i.get("item_name")]
+        note = "、".join(names)
+        if len(note) > 40:
+            note = note[:39] + "…"
+        children.append({"label": f"{a.get('area_no', '')} {a.get('area_name', '')}".strip(), "note": note})
+    root_label = layout.get("screen_name") or ""
+    try:
+        root_label = root_label or get_screen_name(fn)
+    except Exception:
+        pass
+    return {
+        "type": "nested",
+        "title": "画面構成図",
+        "doc_section": "§3.1",
+        "embed_size": {"width_px": 640, "height_px": 130 + 64 * len(children)},
+        "spec": {"structure": [{"label": root_label or fn, "children": [{"label": "画面全体", "children": children}]}]},
+    }
+
+
 def get_diagram_spec(diagram_id: str, feature_name: str = None) -> dict:
     """指定 diagram の spec（process_structure / screen_structure / ipo_flowchart）を返す。
 
     返り値の構造: {type, title, doc_section, embed_size, spec, [svg_layout]}
+    screen_structure だけは screen_config に無くても、中間JSON の screen_layout から自動生成して返す。
     """
     diagrams = load_screen_config(feature_name).get("diagrams", {})
+    if diagram_id not in diagrams and diagram_id == "screen_structure":
+        auto = _auto_screen_structure(feature_name)
+        if auto:
+            return auto
     if diagram_id not in diagrams:
         raise KeyError(f"diagram '{diagram_id}' が screen_config.json に未定義です。")
     return diagrams[diagram_id]
 
 
 def get_all_diagram_ids(feature_name: str = None) -> list:
-    """登録済み diagram_id の一覧を返す。"""
-    return list(load_screen_config(feature_name).get("diagrams", {}).keys())
+    """登録済み diagram_id の一覧を返す（screen_structure は未定義でも自動生成できれば末尾に加える）。"""
+    ids = list(load_screen_config(feature_name).get("diagrams", {}).keys())
+    if "screen_structure" not in ids and _auto_screen_structure(feature_name):
+        ids.append("screen_structure")
+    return ids
 
 
 if __name__ == "__main__":
