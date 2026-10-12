@@ -38,7 +38,7 @@ npm install -g docx@9.6.1
 ```
 
 - `~/.claude/skills/design-doc` が既にある場合は、上書きせず、退避してから clone してください。
-- 構成図を PNG にするなら、`pip install cairosvg` と日本語フォント(Ubuntu・Debian では `fonts-noto-cjk`)も入れます。cairosvg は cairo ライブラリに依存します。
+- 構成図を PNG にするなら、`python3 -m venv ~/.venvs/design-doc && ~/.venvs/design-doc/bin/pip install cairosvg`(macOS の Homebrew Python は PEP 668 で直接 pip できません。cairo が無ければ `brew install cairo`)と日本語フォント(Ubuntu・Debian では `fonts-noto-cjk`)も入れます。cairosvg は cairo ライブラリに依存します。
 - インストールのあと、Claude Code を開き直してください(新しいセッションを始めます)。`/` を入力して、候補に `design-doc` が出れば完了です。出ないときは、`~/.claude/skills/design-doc/SKILL.md` の位置と、先頭の `name:` を確かめてください。
 
 ## 動作確認

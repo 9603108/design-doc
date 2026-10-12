@@ -149,7 +149,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 | npm | `npm --version` | Node.js 同梱 |
 | `docx` パッケージ（global） | `npm list -g docx` | `npm install -g docx` を一度だけ実行（実行時は `NODE_PATH=$(npm root -g)` を付ける） |
 | Python 3 | `python3 --version` | 導入する |
-| cairosvg（構成図を付けるときだけ） | `python3 -c "import cairosvg"` | `pip install cairosvg`。無ければ PNG が作れず、処理構成図は主要な業務イベントの箇条書き、画面構成図は ASCII の図で代替される |
+| cairosvg（構成図を付けるときだけ） | `python3 -c "import cairosvg"` か `~/.venvs/design-doc/bin/python -c "import cairosvg"`(どちらかで通れば可) | `python3 -m venv ~/.venvs/design-doc && ~/.venvs/design-doc/bin/pip install cairosvg`(cairo が無ければ `brew install cairo`)。無ければ PNG が作れず、処理構成図は主要な業務イベントの箇条書き、画面構成図は ASCII の図で代替される |
 | 設定2ファイル | `target/intermediate/{機能名}_screen_config.json` / `{機能名}_project_config.json` があること | `examples/sample/` の `受注入力_screen_config.json` / `受注入力_project_config.json` を `target/intermediate/` へコピーして書き換える |
 
 **ディレクトリ走査:**

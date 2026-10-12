@@ -6,14 +6,20 @@
 # 接続情報: 入力 = 第1引数 SVG パス / 出力 = 第2引数 PNG パス / 第3引数 = 出力幅px（デフォルト1200=高DPI）
 #           呼出元 = design-doc Wave 3.5、または手動
 
+import os
 import sys
 from pathlib import Path
 
 try:
     import cairosvg
 except ImportError as e:
+    # WHY: Homebrew の python3 は PEP 668 で pip install できないため、cairosvg を入れた venv の python で自分を起こし直す
+    venv = os.path.expanduser("~/.venvs/design-doc/bin/python")
+    if os.path.exists(venv) and os.path.abspath(sys.executable) != os.path.abspath(venv):
+        os.execv(venv, [venv] + sys.argv)
     print(f"FATAL: cairosvg がインストールされていない: {e}", file=sys.stderr)
-    print("対処: pip install cairosvg", file=sys.stderr)
+    print("対処: python3 -m venv ~/.venvs/design-doc && ~/.venvs/design-doc/bin/pip install cairosvg"
+          "（cairo が無ければ brew install cairo）", file=sys.stderr)
     sys.exit(1)
 
 
