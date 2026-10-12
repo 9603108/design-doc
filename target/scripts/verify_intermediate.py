@@ -23,6 +23,7 @@ from pathlib import Path
 
 # 2026-10-05 汎用化: 機能名・中間 JSON の置き場・案件ごとの設定は _config_loader から取る
 # （このファイルに案件固有の値や絶対パスを持たないため）。使うのは main()。
+from verify_partials import DETAIL_TODO
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -658,6 +659,51 @@ def check_screen_operation_trigger_area_ref(merged: dict) -> list:
     return issues
 
 
+# 複数の項目を1行に括った表記。「等」は後ろに漢字が続くもの（等級 など）を除く
+BUNDLED_KEY_RE = re.compile(r"各列|など|…|等(?![一-鿿])")
+
+# 入力欄とみなす画面項目の種類（小文字で比べる）。check_coverage_and_details が使う
+INPUT_ITEM_TYPES = {
+    "textbox", "text", "textarea", "input", "numberbox", "number", "combobox", "select",
+    "calendar", "date", "checkbox", "radio", "radiobutton",
+}
+
+
+def check_coverage_and_details(merged: dict) -> list:
+    """2026-10-12 新設: 中身の抜けを件数・空欄で検出する。
+
+    判定ルール:
+      - validations / messages が0件 → 画面に入力欄があれば ERROR、無ければ WARN。
+        本当に無いなら トップレベルの validations_none_reason / messages_none_reason に理由を書けば通す
+      - db_operations[].dataset[].logical_column が括り表記（各列/等/など/…）→ ERROR
+      - event_processes[].details が空 → ERROR（初期表示などで本当に不要なら details_none_reason に理由を書けば通す）
+
+    接続情報: 入力 = merged / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    items = (merged.get("screen_layout") or {}).get("items") or []
+    has_input = any(str(i.get("item_type") or "").lower() in INPUT_ITEM_TYPES for i in items)
+    for key, label in (("validations", "バリデーション"), ("messages", "メッセージ")):
+        if not (merged.get(key) or []) and not merged.get(f"{key}_none_reason"):
+            lvl = "ERROR" if has_input else "WARN"
+            why = "画面に入力欄があるのに" if has_input else ""
+            issues.append((lvl, f"{key}: {why}{label}が0件（実コードから抽出する。本当に無いなら {key}_none_reason に理由を書く）"))
+    for op in merged.get("db_operations", []) or []:
+        for ds in op.get("dataset") or []:
+            col = str(ds.get("logical_column") or "")
+            if BUNDLED_KEY_RE.search(col):
+                issues.append(("ERROR", f"db_operations[{op.get('id') or '?'}].dataset: 列「{col}」が括り表記（1列1行で書く）"))
+    for ep in merged.get("event_processes", []) or []:
+        ref = ep.get("event_ref") or ep.get("event_code") or "?"
+        raw = ep.get("details") or []
+        if DETAIL_TODO in raw:
+            issues.append(("ERROR", f"event_processes[{ref}]: details に未記入の印が残っている（extract_react_draft.py の印を業務の文に置き換える）"))
+        details = [d for d in raw if str(d).strip() and d != DETAIL_TODO]
+        if not details and not ep.get("details_none_reason"):
+            issues.append(("ERROR", f"event_processes[{ref}]: details が空（処理ステップを1行1 step で書く。本当に不要なら details_none_reason に理由を書く）"))
+    return issues
+
+
 def check_backend_process_substance(merged: dict) -> list:
     """v50.5 新設: backend_processes の各エントリが「key だけ存在して値が空テンプレ」になっていないかを検証。
 
@@ -671,7 +717,9 @@ def check_backend_process_substance(merged: dict) -> list:
       - processing 内に kind in BUSINESS_KINDS の step が 0 件 → ERROR（業務固有処理が一切ない＝Agent
         がスケルトンだけ返した状態）
       - request_spec.params 空 → WARN（パラメータなし API もあり得るため WARN 止まり）
-      - error_patterns 空 → WARN（業務エラー記述なしも設計上あり得るため WARN）
+      - error_patterns 空 → ERROR（error_patterns_none_reason に理由があれば通す）
+      - name と overview が同文 → WARN
+      - response_spec.items の key が括り表記（各列/等/など/…/（）/ " / "）→ ERROR
       - response_spec.items/schema 両方空 → WARN（POST 系で何も返さない API もあるため WARN）
 
     BUSINESS_KINDS: apply_logging_steps.py の business_kinds と整合させる。logging_call / validation /
@@ -687,6 +735,8 @@ def check_backend_process_substance(merged: dict) -> list:
         "audit", "send_audit", "authorization", "auth_check",
         "external", "s3_op", "ses_op", "sqs_op", "exec_logic",
     }
+    none_reason_by_action = {a.get("action"): a.get("error_patterns_none_reason")
+                             for a in merged.get("api_spec", []) or [] if a.get("error_patterns_none_reason")}
     for bp in merged.get("backend_processes", []) or []:
         pid = bp.get("process_id") or bp.get("id") or "?"
         name = bp.get("name") or "?"
@@ -702,9 +752,20 @@ def check_backend_process_substance(merged: dict) -> list:
         rs = bp.get("request_spec", {}) or {}
         if not rs.get("params"):
             issues.append(("WARN", f"backend_processes[{pid}] {name}: request_spec.params が空（リクエストに何も受け取らない API？）"))
-        # 4. error_patterns 空 — 業務エラー記述なしも設計上あり得るが WARN として注意喚起
-        if not (bp.get("error_patterns") or []):
-            issues.append(("WARN", f"backend_processes[{pid}] {name}: error_patterns が空（業務エラー・システムエラーの記述なし）"))
+        # 4. error_patterns 空 — ERROR（2026-10-12 WARN から格上げ）。本当にエラーを返さない API は
+        #    error_patterns_none_reason（api_spec[] か backend_processes[] に書く）で理由を書けば通す。
+        #    バックエンドのソースに raise / エラー返却があるかまでは見ない（API ごとの切り分けが難しいため）
+        action = (bp.get("endpoint") or {}).get("action")
+        if not (bp.get("error_patterns") or []) and not (bp.get("error_patterns_none_reason") or none_reason_by_action.get(action)):
+            issues.append(("ERROR", f"backend_processes[{pid}] {name}: error_patterns が空（api_spec[].error_patterns に {{condition, status_code, message_id}} を書く。本当にエラーを返さないなら api_spec[].error_patterns_none_reason に理由を書く）"))
+        # 4b. name と overview が同じ文 — 見出しと概要で同じ文を2回読ませることになる
+        if str(bp.get("name") or "").strip() and str(bp.get("name") or "").strip() == str(bp.get("overview") or "").strip():
+            issues.append(("WARN", f"backend_processes[{pid}] {name}: name と overview が同じ文（api_spec[].name に短い処理名を書くか、description を2文にする）"))
+        # 4c. response_spec.items の key に括り表記 — 1行で複数のキーを括ると、出力の項目が数えられない
+        for it in (bp.get("response_spec") or {}).get("items") or []:
+            key = str(it.get("key") or "")
+            if BUNDLED_KEY_RE.search(key) or "（" in key or " / " in key:
+                issues.append(("ERROR", f"backend_processes[{pid}] {name}: response_spec.items の key「{key}」が括り表記（「各列」「等」「など」「…」や（）・/ で複数をまとめず、1キー1行で書く）"))
         # 5. response_spec.items/schema 両方空 — POST 系で何も返さない API もあるが WARN
         respspec = bp.get("response_spec", {}) or {}
         if not respspec.get("items") and not respspec.get("schema"):
@@ -1142,6 +1203,8 @@ def main():
     #          Agent 出力が「形だけ」で通ってしまう旧 verify の致命的盲点を埋める。
     all_issues.extend(check_backend_process_substance(merged))
     all_issues.extend(check_section_substance(merged))
+    # 2026-10-12: validations/messages の0件・dataset の括り表記・event_processes の空 details
+    all_issues.extend(check_coverage_and_details(merged))
     # v50.5 phase 2.5.1: 「未割当」trigger 検出（screen_operation kind の area_ref 必須）
     all_issues.extend(check_screen_operation_trigger_area_ref(merged))
     # v51 §19 記述粒度ルール (1 文 1 概念原則): 説明系フィールドの「。」連結マルチステートメント検出

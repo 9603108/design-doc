@@ -553,9 +553,9 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 | フィールド | 必須 | 説明 |
 |:---|:---:|:---|
 | `process_id` | ◯ | `B` + 3桁ゼロ埋め連番。機能内ユニーク。例: `B001`, `B002`, ... |
-| `name` | ◯ | **業務担当者語彙の短い処理名**（最大30文字、句点まで）。例: 「受注データを保存する」「編集ロックを取得する」 |
+| `name` | ◯ | **業務担当者語彙の短い処理名**（最大30文字、句点まで）。例: 「受注データを保存する」「編集ロックを取得する」。Phase 4 が `api_spec[].name`（任意）があればそれを、無ければ `api_spec[].description` の1文目を使う。`overview` と同じ文だと verify_intermediate.py が WARN |
 | `area` | ◯ | docx §5.2 配下のエリア分類。同じ area を持つ backend_process が H4 で1群にまとまる。標準語彙: 「データ取得」「データ更新」「排他制御」「マスタ参照」「帳票生成」等。業務機能カテゴリで分ける |
-| `overview` | ◯ | 処理の目的を1文で。**上限30字（超えると verify_intermediate.py が ERROR）、推奨25字**。物理名を書かない。Phase 4 が `api_spec[].description` から作るので、Phase 1 の `api_spec[].description` を30字以内で書く |
+| `overview` | ◯ | 処理の目的を1文で。**上限30字（超えると verify_intermediate.py が ERROR）、推奨25字**。物理名を書かない。Phase 4 が `api_spec[].description` から作るので、Phase 1 の `api_spec[].description` を30字以内で書く（`api_spec[].name` が無く description が2文以上なら、2文目以降が overview になる） |
 | `called_by_front` | ◯ | 呼出元フロント処理の `process_id` 配列 |
 | `endpoint` | ◯ | `{method, path, action, auth}` |
 | `request_spec.params[]` | △ | リクエストパラメータ一覧 |
@@ -567,7 +567,8 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 | `response_spec` | ◯ | `{pattern, schema, items[]}`（`response_to_screen_mapping[]` は `front_processes[].steps[]` に移動済、詳細はチェンジログ v49 参照） |
 | `response_spec.items[].source` | ◯ | `{type, source_ref, source_column}`。type は `request`（リクエスト透過）/ `db`（DB SELECT 直結）/ `calculated`（DB + バック計算）/ `merged`（複数 SELECT 統合）/ `const`（固定値）。source_ref は `②-X データセット名`、source_column は `テーブル.列名` |
 | `response_spec.items[].transform_backend` | ◯ | バック側 Python での加工内容を業務語彙で記述（例: `"date → 'YYYY/MM/DD' 書式変換"`, `"数量 × 単価 × 税率 ÷ 100（小数切り捨て）"`, `"パターン単位で辞書化、商品配列にネスト"`）。「そのまま」「DB の生値をそのまま」も明示する（不可視の加工がないことを示す） |
-| `error_patterns[]` | △ | エラー応答パターン一覧。Phase 4 の `migrate_v17_to_v18.py` が、同じ action の `api_spec[].error_patterns` をそのまま写す（無ければ空配列） |
+| `error_patterns[]` | ◯ | エラー応答パターン一覧。Phase 4 の `migrate_v17_to_v18.py` が、同じ action の `api_spec[].error_patterns` をそのまま写す（無ければ空配列）。空だと verify_intermediate.py が ERROR |
+| `error_patterns_none_reason` | △ | error_patterns を空にする理由（本当にエラーを返さない API だけ）。`api_spec[].error_patterns_none_reason` から写る。あれば空の error_patterns を ERROR にしない |
 | `notes[]` | △ | 業務担当者への注意書き。各要素は `{kind: '注意'|'補足'|'制約', text: string}`。フェーズB施策B3で新設、追加のみで既存フィールドへの影響なし |
 
 ### v18 整合性ルール（14_チェックリスト.md / verify_intermediate.py で機械検証）
@@ -861,7 +862,11 @@ INSERT/UPDATE/DELETE の場合:
 
 SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` / `response_to_screen_mapping` / `related_cache_operations` 各フィールドの追加経緯はチェンジログ参照。**現行有効**（generate_docx.js の `sectionApiSpec` で現役描画中、既存中間JSONに実データあり）。
 
-`error_patterns[]`（`{condition, status_code, message_id}` の配列）を Phase 1 で書くと、Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す。
+`error_patterns[]`（`{condition, status_code, message_id}` の配列）を Phase 1 で書くと、Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す。空なら verify_intermediate.py が ERROR。本当にエラーを返さない API は `error_patterns_none_reason`（文字列）に理由を書く（これも写る）。
+
+`name`（任意、文字列）: 処理名。あれば `backend_processes[].name` になり、`description` はそのまま `overview` になる。無ければ `description` の1文目が name、2文目以降（無ければ description 全体）が overview になる。
+
+`no` は `AP1` 形式。`response_items[].key` は1キー1行で書く（「各列」「等」「など」「…」や（）・` / ` で複数を括ると verify_intermediate.py が ERROR）。
 
 ```json
 [

@@ -39,16 +39,10 @@ import sys
 from pathlib import Path
 
 from _config_loader import INTERMEDIATE_DIR, resolve_feature_name
-from verify_partials import DETAIL_RE
+# 呼出の行の判定語(CALL_WORDS / is_call_line)は verify_partials に置き、検査と当てはめで同じ語を使う
+from verify_partials import DETAIL_RE, is_call_line
 
-# 意味合い: details の1行が「呼出の行」かの判定語。migrate_v17_to_v18 の backend_call 判定(kind 推定)と同じ語にして、
-#          ここで「呼出が n 行」と数えたものを、Phase 4 も同じ n 件の backend_call と数える。語が変わるなら両方を直す
-CALL_WORDS = ["API", "fetch", "POST", "GET ", "呼び出し", "呼出", "リクエスト"]
 INIT_EVENT = "EV00"
-
-
-def is_call_line(line):
-    return any(w in line for w in CALL_WORDS)
 
 
 def apply_partial(draft, backend, event_codes):
@@ -105,6 +99,8 @@ def apply_details(draft, merged):
         if code == INIT_EVENT or code not in want_by:
             continue
         want = want_by[code]
+        # 下書きには業務の文(LLM が書いた行)も入るので、数と並びは呼出の行だけで比べる
+        want_calls = [w for w in want if is_call_line(w)]
         have = ep.get("details") or []
         have_calls = [ln for ln in have if is_call_line(ln)]
         where = f"event_processes {code}"
@@ -112,11 +108,11 @@ def apply_details(draft, merged):
             if want:
                 ep["details"] = list(want)
                 changed += 1
-        elif len(have_calls) != len(want):
-            conflicts.append(f"[details] {where}: 既存の呼出の行 {len(have_calls)} 行が下書きの {len(want)} 行と食い違う")
+        elif len(have_calls) != len(want_calls):
+            conflicts.append(f"[details] {where}: 既存の呼出の行 {len(have_calls)} 行が下書きの {len(want_calls)} 行と食い違う")
         else:
             got = [DETAIL_RE.match(ln) for ln in have_calls]
-            if all(got) and [m.group(1) for m in got] != [DETAIL_RE.match(w).group(1) for w in want]:
+            if all(got) and [m.group(1) for m in got] != [DETAIL_RE.match(w).group(1) for w in want_calls]:
                 conflicts.append(f"[details] {where}: 呼出の並び {[m.group(1) for m in got]} が下書きと食い違う")
     return changed, conflicts
 

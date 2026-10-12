@@ -42,6 +42,8 @@ import re
 import sys
 from pathlib import Path
 
+from verify_partials import DETAIL_TODO
+
 # JSX のイベント属性 → events[].action の動作語。表に無い属性は属性名をそのまま出す(推測で訳さない)
 ACTION_WORDS = {
     "onClick": "クリック",
@@ -328,9 +330,11 @@ def build_draft(links, unresolved, screen_name):
     event_processes = []
     for ev, link in zip(events, links):
         called = set(link["actions"])
+        # EV00 以外は先頭に未記入の印を置く(details を空のまま merge させないため。verify_partials が残りを [未記入] にする)
+        todo = [] if ev["event_code"] == "EV00" else [DETAIL_TODO]
         event_processes.append({
             "event_code": ev["event_code"],
-            "details": [f"・{act} をリクエストする" for act in op_order if act in called],
+            "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called],
         })
     return {
         "events": events,
@@ -444,8 +448,8 @@ def selftest():
             {"api_endpoint": {"action": "wrapped", "trigger_events": ["EV02"]}},
         ], f"db_operations: {draft['db_operations']}"
         assert draft["event_processes"][0]["details"] == ["・load をリクエストする", "・init をリクエストする"], "EV00 の details"
-        assert draft["event_processes"][1]["details"] == ["・load をリクエストする"], "EV01 の details"
-        assert draft["event_processes"][2]["details"] == ["・wrapped をリクエストする"], "EV02 の details"
+        assert draft["event_processes"][1]["details"] == [DETAIL_TODO, "・load をリクエストする"], "EV01 の details"
+        assert draft["event_processes"][2]["details"] == [DETAIL_TODO, "・wrapped をリクエストする"], "EV02 の details"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

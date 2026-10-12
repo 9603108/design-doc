@@ -718,11 +718,21 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
             "description": "レスポンス組立"
         })
 
-        backend_processes.append({
+        # name と overview が同じ文にならないようにする（verify_intermediate.py が同文を WARN にする）。
+        # api_spec[].name（任意）があればそれを name に使い、overview は description のまま。
+        # 無ければ name は description の1文目から作るので、overview は2文目以降があればそちらを使う。
+        api_name = str(api.get("name") or "").strip()
+        desc = api.get("description", "") or ""
+        if api_name:
+            overview = desc
+        else:
+            _, sep, rest = desc.partition("。")
+            overview = rest.strip() if sep and rest.strip() else desc
+        bp_entry = {
             "process_id": process_id,
-            "name": _derive_backend_name(api),
+            "name": api_name or _derive_backend_name(api),
             "area": _derive_backend_area(api),
-            "overview": api.get("description", ""),
+            "overview": overview,
             "called_by_front": [],  # 後で front_processes から逆引き
             "endpoint": {
                 "method": api.get("method", ""),
@@ -743,7 +753,11 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
             # api_spec[].error_patterns を写す。目的: 中間JSONのエラー定義を backend_processes に届ける。
             # 接続: 呼出元は build_backend_processes。api_spec に無い案件は空配列のまま。
             "error_patterns": api.get("error_patterns", []) or []
-        })
+        }
+        # error_patterns を空にする理由（任意）。verify_intermediate.py は、空の error_patterns をこれがあるときだけ通す
+        if api.get("error_patterns_none_reason"):
+            bp_entry["error_patterns_none_reason"] = api["error_patterns_none_reason"]
+        backend_processes.append(bp_entry)
 
     return backend_processes, api_to_id
 

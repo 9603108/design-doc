@@ -36,6 +36,16 @@ from pathlib import Path
 OVERVIEW_MAX = 30
 # details の呼出の行。build_draft() の「・<action> をリクエストする」と同じ記法
 DETAIL_RE = re.compile(r"^・(.+?) をリクエストする$")
+# details の未記入の印。build_draft() が EV00 以外の各イベントの先頭に出し、LLM が業務の文に置き換える。
+# 残っていれば [未記入] にする(verify_intermediate.py も同じ印を空の details として ERROR にする)
+DETAIL_TODO = "（未記入）この行を処理ステップの業務の文に置き換える"
+# 意味合い: details の1行が「呼出の行」かの判定語。migrate_v17_to_v18 の backend_call 判定(kind 推定)と同じ語にして、
+#          ここで「呼出が n 行」と数えたものを、Phase 4 も同じ n 件の backend_call と数える。語が変わるなら両方を直す
+CALL_WORDS = ["API", "fetch", "POST", "GET ", "呼び出し", "呼出", "リクエスト"]
+
+
+def is_call_line(line):
+    return any(w in line for w in CALL_WORDS)
 
 
 def check_partial(draft, screen_name):
@@ -98,10 +108,13 @@ def check_partial(draft, screen_name):
         actual = []
         for line in lines:
             m = DETAIL_RE.match(line)
-            if m:
+            if line == DETAIL_TODO:
+                problems.append(f"[未記入] event_processes {ev}: details の未記入の印が残っている(業務の文に置き換える)")
+            elif m:
                 actual.append(m.group(1))
-            else:
+            elif is_call_line(line):
                 problems.append(f"[details] event_processes {ev}: 呼出の記法に合わない行 {line!r}")
+            # それ以外は LLM が書いた業務の文(呼出の語を含まない行)なので通す
         if actual != expected:
             problems.append(f"[details] event_processes {ev}: 呼出 {actual} が api_endpoint の並び {expected} と一致しない")
     return problems
@@ -140,6 +153,13 @@ def selftest():
         bad["event_processes"][0]["details"] = ["・save をリクエストする", "・load をリクエストする"]  # details
         kinds = {p[:p.index("]") + 1] for p in check_partial(bad, "受注入力")}
         assert {"[連番]", "[参照]", "[overview]", "[trigger]", "[details]"} <= kinds, f"検出不足: {kinds}"
+
+        # 業務の文は通し、未記入の印は [未記入] にする
+        todo = copy.deepcopy(good)
+        todo["event_processes"][1]["details"] = ["入力を確かめる", "・load をリクエストする"]
+        assert check_partial(todo, "受注入力") == [], f"業務の文で誤検出: {check_partial(todo, '受注入力')}"
+        todo["event_processes"][1]["details"] = [DETAIL_TODO, "・load をリクエストする"]
+        assert [p for p in check_partial(todo, "受注入力") if p.startswith("[未記入]")], "未記入の印を検出しない"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

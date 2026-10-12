@@ -2093,7 +2093,7 @@ function sectionFrontProcesses(frontProcesses, opts = {}) {
             extra = `→ ${respMapText} (§${prefix}.${areaIdx}.${procIdx}.${sub} 参照)`;
           } else if (s.kind === 'logging_call' && (s.logging_ref || s.call_id)) {
             // v50 Phase 2: 新名 s.logging_ref 優先、旧名 s.call_id フォールバック
-            extra = `→ [${s.logging_ref || s.call_id}] (§5.7 参照)`;
+            extra = `→ [${s.logging_ref || s.call_id}]${sec5Ref('logging')}`;
           } else if (s.kind === 'transition') {
             const m = (s.description || '').match(/[\w-]+\.html(?:\?[^\s。、]+)?/);
             extra = m ? `→ ${m[0]}（画面遷移）` : '→ （画面遷移）';
@@ -2173,10 +2173,10 @@ function sectionFrontProcesses(frontProcesses, opts = {}) {
 
       // バリデーション/計算式/共通ロジック の参照
       const refs = [];
-      // v51 憲法: 章番号を §5.3 / §5.4 / §5.5 に。「使用カタログ」→「呼出先」
-      if (fp.validation_refs && fp.validation_refs.length > 0) refs.push(`バリデーション: ${fp.validation_refs.join(', ')} (§5.3 参照)`);
-      if (fp.calculation_refs && fp.calculation_refs.length > 0) refs.push(`計算式: ${fp.calculation_refs.join(', ')} (§5.4 参照)`);
-      if (fp.common_logic_refs && fp.common_logic_refs.length > 0) refs.push(`共通ロジック: ${fp.common_logic_refs.join(', ')} (§5.5 参照)`);
+      // 章番号は sectionProcesses が出す章だけで採番した SEC5 を引く(章が出ないときは参照を付けない)。「使用カタログ」→「呼出先」
+      if (fp.validation_refs && fp.validation_refs.length > 0) refs.push(`バリデーション: ${fp.validation_refs.join(', ')}${sec5Ref('validation')}`);
+      if (fp.calculation_refs && fp.calculation_refs.length > 0) refs.push(`計算式: ${fp.calculation_refs.join(', ')}${sec5Ref('calculation')}`);
+      if (fp.common_logic_refs && fp.common_logic_refs.length > 0) refs.push(`共通ロジック: ${fp.common_logic_refs.join(', ')}${sec5Ref('common_logic')}`);
       if (refs.length > 0) blocks.push(p(`呼出先カタログ: ${refs.join(' / ')}`));
     }
   }
@@ -2298,10 +2298,11 @@ function sectionBackendProcesses(backendProcesses, maps, opts = {}) {
         } else if (s.kind === 'db_operation' && s.db_op_detail) {
           const dbo = s.db_op_detail;
           const dbRef = dbo.id ? `[${dbo.id}] ` : '';
-          ref = `→ ${dbRef}${dbo.operation_type || ''} on ${dbo.dataset_name || ''} (§5.6 参照)`;
+          // fallback-ok: 既存の表示用の空文字(任意項目が無いとき)。今回の変更は末尾の章番号参照だけ
+          ref = `→ ${dbRef}${dbo.operation_type || ''} on ${dbo.dataset_name || ''}${sec5Ref('db_operation')}`;
         } else if (s.kind === 'logging_call' && (s.logging_ref || s.call_id)) {
           // v50 Phase 2: 新名 s.logging_ref 優先、旧名 s.call_id フォールバック
-          ref = `→ [${s.logging_ref || s.call_id}] (§5.7 参照)`;
+          ref = `→ [${s.logging_ref || s.call_id}]${sec5Ref('logging')}`;
         }
         const desc = s.description || '';
         const content = (ref && !desc.includes(ref.split('\n')[0])) ? `${desc}\n${ref}` : desc;
@@ -2515,7 +2516,35 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
  * 接続情報: 入力 = data (front_processes / backend_processes / validations / calculations / common_logic / parameters)、maps
  *           v17 までの process_flows[] による業務フェーズ縦糸構造は v18 で廃止（呼ぶ側＝トリガー網羅で代替）
  */
+// 5章のカタログ小節の番号表。sectionProcesses が出す章だけで 5.3 から連番を振って入れる。
+// 意味合い: 空の章(バリデーション0件など)は見出しも番号も出さず、本文中の「(§5.x 参照)」もここを引くので
+//           指し先の無い章番号が残らない。front/backend(5.1/5.2)は常に出るので固定。
+// 接続情報: 書く = sectionProcesses 冒頭 / 読む = sec5Ref(フロント・バック処理の参照文言)と sectionProcesses の各章呼出
+let SEC5 = { front: '5.1', backend: '5.2' };
+const SEC5_CATALOGS = [
+  ['validation', 'バリデーション'],
+  ['calculation', '計算式'],
+  ['common_logic', '共通ロジック'],
+  ['db_operation', 'DB 操作'],
+  ['logging', '観測点ログ']
+];
+function sec5Ref(key) {
+  return SEC5[key] ? ` (§${SEC5[key]} 参照)` : '';
+}
+
 function sectionProcesses(data, maps) {
+  const nonEmpty = a => Array.isArray(a) && a.length > 0;
+  const db = dbOperationsSectionState(data.db_operations, data);
+  const has = {
+    validation: nonEmpty(data.validations),
+    calculation: nonEmpty(data.calculations),
+    common_logic: nonEmpty(data.common_logic),
+    db_operation: db.hasDbContent || db.hasDataFlow,
+    logging: nonEmpty(data.common_logging_processes)
+  };
+  SEC5 = { front: '5.1', backend: '5.2' };
+  let n = 3;
+  for (const [k] of SEC5_CATALOGS) if (has[k]) SEC5[k] = `5.${n++}`;
   // 導入文は、各章を組み立て終えた後に見出しの直後へ差し込む（この関数の末尾を参照）。
   const blocks = [
     h2('5. 処理詳細')
@@ -2524,37 +2553,25 @@ function sectionProcesses(data, maps) {
   blocks.push(...sectionFrontProcesses(data.front_processes, { prefix: '5.1' }));
   // §6.2 バックエンド処理
   blocks.push(...sectionBackendProcesses(data.backend_processes, maps, { prefix: '5.2' }));
-  // §6.3 バリデーション
-  blocks.push(...sectionValidations(data.validations, { prefix: '5.3', level: 'h3' }));
-  // §6.4 計算式（B1: derivation_chain 図埋め込みのため data.diagrams を opts 経由で渡す）
-  blocks.push(...sectionCalculations(data.calculations, { prefix: '5.4', level: 'h3', diagrams: data.diagrams }));
-  // §6.5 共通ビジネスロジック（B1: derivation_chain 図埋め込みのため data.diagrams を opts 経由で渡す）
-  const commonLogicBlocks = sectionCommonLogic(data.common_logic, { prefix: '5.5', level: 'h3', diagrams: data.diagrams });
-  blocks.push(...commonLogicBlocks);
-  // §5.6 DB 操作（v51 復活、SQL 構造化表で出力）
-  const dbOperationBlocks = sectionDbOperations(data.db_operations, maps, data, { prefix: '5.6', level: 'h3' });
-  blocks.push(...dbOperationBlocks);
-  // §5.7 観測点ログ処理（共通） — [LG1]-[LG8] + サブ [LG4-a]-[LG4-f]
-  const hasLogging = !!(data.common_logging_processes && data.common_logging_processes.length > 0);
-  if (hasLogging) {
-    blocks.push(...sectionCommonLoggingProcesses(data.common_logging_processes, { prefix: '5.7' }));
-  }
+  // §5.3 以降のカタログ章(VL/CA/CL/DB/LG)。採番は sectionProcesses 冒頭で SEC5 に入れたもの(出す章だけで連番)
+  if (SEC5.validation) blocks.push(...sectionValidations(data.validations, { prefix: SEC5.validation, level: 'h3' }));
+  // B1: derivation_chain 図埋め込みのため data.diagrams を opts 経由で渡す
+  if (SEC5.calculation) blocks.push(...sectionCalculations(data.calculations, { prefix: SEC5.calculation, level: 'h3', diagrams: data.diagrams }));
+  if (SEC5.common_logic) blocks.push(...sectionCommonLogic(data.common_logic, { prefix: SEC5.common_logic, level: 'h3', diagrams: data.diagrams }));
+  // DB 操作（v51 復活、SQL 構造化表で出力）
+  if (SEC5.db_operation) blocks.push(...sectionDbOperations(data.db_operations, maps, data, { prefix: SEC5.db_operation, level: 'h3' }));
+  // 観測点ログ処理（共通） — [LG1]-[LG8] + サブ [LG4-a]-[LG4-f]
+  if (SEC5.logging) blocks.push(...sectionCommonLoggingProcesses(data.common_logging_processes, { prefix: SEC5.logging }));
   // v51: §6.6 パラメータは廃止（処理の入力表に統合済）
-  // 目的: 導入文のカタログ列挙を、実際に出力した章だけにする。
-  // 意味合い: §5.5 共通ロジック / §5.6 DB 操作 / §5.7 観測点ログは、データが有るときだけ章が出る。
-  //           常に3つとも書くと、章が出ない文書で指し先の無い章番号を読者に見せてしまう。
-  //           3つとも出る文書では、従来と同じ文面になる。
-  //           各章の関数を呼ぶ順序を変えないため、組み立て後に見出しの直後へ差し込む。
-  // 接続情報: 判定の元 = 上の sectionCommonLogic / sectionDbOperations の戻り値が空かどうかと、
-  //           data.common_logging_processes の有無。差し込み先 = blocks の先頭（h2）の直後
-  const catalogs = [
-    'バリデーション §5.3',
-    '計算式 §5.4',
-    commonLogicBlocks.length > 0 && '共通ロジック §5.5',
-    dbOperationBlocks.length > 0 && 'DB 操作 §5.6',
-    hasLogging && '観測点ログ §5.7'
-  ].filter(Boolean).join(' / ');
-  blocks.splice(1, 0, p(`§4 で起動された各処理の本体です。フロント側（§5.1）とバック側（§5.2）に責務を分離し、フロント処理の backend_call ステップで両者が連結されます。処理が呼出すカタログ（${catalogs}）が続きます。`));
+  // 目的: 導入文のカタログ列挙を、実際に出力した章だけにする(章が1つも無ければ列挙の文を出さない)。
+  // 意味合い: データの無い章は見出しを出さず、番号も詰める。指し先の無い章番号を読者に見せないため。
+  // 接続情報: 判定・番号の元 = SEC5(sectionProcesses 冒頭)。差し込み先 = blocks の先頭（h2）の直後
+  const catalogs = SEC5_CATALOGS
+    .filter(([k]) => SEC5[k])
+    .map(([k, label]) => `${label} §${SEC5[k]}`)
+    .join(' / ');
+  const tail = catalogs ? `処理が呼出すカタログ（${catalogs}）が続きます。` : '';
+  blocks.splice(1, 0, p(`§4 で起動された各処理の本体です。フロント側（§5.1）とバック側（§5.2）に責務を分離し、フロント処理の backend_call ステップで両者が連結されます。${tail}`));
   return blocks;
 }
 
@@ -3266,24 +3283,29 @@ function sectionApiSpec(apiSpec, opts = {}) {
  * @param {Object} opts - { prefix, level } 章番号と見出しレベル
  * @returns {Array<Paragraph|Table>} docx ブロック配列
  */
-function sectionDbOperations(dbOps, maps, data, opts = {}) {
-  const { prefix = '5.6', level = 'h2' } = opts;
-  // B4-fix（2026-07-19、総括レビューで発見）: dbOps が空でも diagrams[].id==='data_flow'
-  // が存在する画面（top-level db_operations[] を持たない画面）では図だけ出力する必要がある。
-  // 早期 return を dataFlowDiagram 判定より後に移し、data_flow 単独でもセクション自体は生成されるようにする。
+function dbOperationsSectionState(dbOps, data) {
   const dataFlowDiagram = ((data && data.diagrams) || []).find(d => d && d.id === 'data_flow');
   const hasDataFlow = !!(dataFlowDiagram && dataFlowDiagram.png_path && fs.existsSync(dataFlowDiagram.png_path));
   // 目的: db_operations が有っても、この章の概要部が読む項目（概要 / 業務タイトル / 動作場所 / 呼出元 / 操作種別）を
   //       全件が1つも持たないときは、個別 DB# の展開を行わない（図も無ければ見出しごと章を省く）。
   // 意味合い: これらの項目を持たない形の db_operations をそのまま展開すると、全 DB# が「（未指定）」「（該当なし）」
   //           だけの空の骨組みになり、読み手に中身の無い章を見せてしまう。1件でも持てば従来どおり全件を展開する。
-  //           db_operations が空・未定義の場合も偽になる（従来の早期 return と同じ扱い）。
-  //           data_flow 図だけを出す既存の動作（上の B4-fix）は変えない。
+  //           db_operations が空・未定義の場合も偽になる。data_flow 図だけを出す既存の動作（B4-fix）は変えない。
   // 接続情報: 入力 = op.summary / op.business_title / op.runtime_location / op.used_by_api / op.operation
-  //           （下の DB# ループの「(0) H4 見出し + 概要表」が読む項目と同じ）/ 利用先 = 直下の早期 return と DB# ループ
+  //           利用先 = sectionDbOperations の早期 return / sectionProcesses の章番号採番
   const hasDbContent = Array.isArray(dbOps) && dbOps.some(op =>
     ['summary', 'business_title', 'runtime_location', 'used_by_api', 'operation']
       .some(k => (Array.isArray(op[k]) ? op[k].length > 0 : !!op[k])));
+  return { dataFlowDiagram, hasDataFlow, hasDbContent };
+}
+
+function sectionDbOperations(dbOps, maps, data, opts = {}) {
+  const { prefix = '5.6', level = 'h2' } = opts;
+  // B4-fix（2026-07-19、総括レビューで発見）: dbOps が空でも diagrams[].id==='data_flow'
+  // が存在する画面（top-level db_operations[] を持たない画面）では図だけ出力する必要がある。
+  // 早期 return を dataFlowDiagram 判定より後に移し、data_flow 単独でもセクション自体は生成されるようにする。
+  // 判定は dbOperationsSectionState にある(sectionProcesses が章番号の採番で同じ判定を使うため)
+  const { dataFlowDiagram, hasDataFlow, hasDbContent } = dbOperationsSectionState(dbOps, data);
   if (!hasDbContent && !hasDataFlow) return [];
   // B4（2026-07-19）: 図キャプション「図{章番号}-{連番}」の章番号。prefix（例: '5.6'）の先頭セグメントを
   // 使う設計は sectionCalculations/sectionCommonLogic の chapterNo 算出と同一（buildFigureCaption 呼出元）。
