@@ -115,16 +115,51 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     return "\n".join(lines) + "\n"
 
 
-def parse_sendbacks(text):
-    """検査の出力から「→ 差し戻し先 <単位>」の行を単位ごとに拾う。"""
+ERROR_LINE_RE = re.compile(r"\[ERROR\]|^\s*ERROR\b")
+KEY_PATH_RE = re.compile(r"[a-z_]+(?:\[[^\]]*\])?(?:\.[a-z_]+(?:\[[^\]]*\])?)*")
+# WHY: 合成後の中間 JSON の欄は、単位の owns と名前が違うものがある。合成・後段が写した元の欄へ読み替える。
+# backend_processes[].overview は api_spec[].description の写し(POS会計レポートの中間 JSON で一致を確認)。
+KEY_ALIAS = {
+    "backend_processes.overview": "api_spec.description",
+    "validations": "validations_frontend",
+    "messages": "messages_backend",
+}
+# WHY: 行が指す欄と直す欄が違う検査。「400 のエラーが validations に無い」は error_patterns(S2)はソースどおりで、
+# 欠けているのは validations の行なので、validations を書く単位(H4)へ戻す。
+MSG_TO_KEY = [(re.compile(r"validations に無い"), "validations_frontend")]
+
+
+def owner_of(line, units):
+    """ERROR 行の対象の欄を units の owns と照らし、書いた単位を返す。引けなければ None。"""
+    owns = [(o.replace("[]", ""), u) for u, spec in units.items() for o in spec["owns"]]
+    keys = [k for rx, k in MSG_TO_KEY if rx.search(line)]
+    keys += [re.sub(r"\[[^\]]*\]", "", m) for m in KEY_PATH_RE.findall(line)]
+    for key in keys:
+        for src, dst in KEY_ALIAS.items():
+            if key == src or key.startswith(src + "."):
+                key = dst + key[len(src):]
+        hits = [(len(o), u) for o, u in owns if key == o or key.startswith(o + ".")]
+        if hits:
+            return max(hits)[1]
+    return None
+
+
+def parse_sendbacks(text, units=None):
+    """検査の出力から「→ 差し戻し先 <単位>」の行を単位ごとに拾う。
+
+    units を渡すと、差し戻し先の無い ERROR 行も owner_of で単位を引き、引けなければ "unknown" に入れる。
+    """
     out = {}
     for line in text.splitlines():
         m = SENDBACK_RE.search(line)
-        if not m:
+        if m:
+            targets = [u for u in re.split(r"[,、/]", m.group(1)) if u]
+        elif units is not None and ERROR_LINE_RE.search(line):
+            targets = [owner_of(line, units) or "unknown"]
+        else:
             continue
-        for unit in re.split(r"[,、/]", m.group(1)):
-            if unit:
-                out.setdefault(unit, []).append(line.strip())
+        for unit in targets:
+            out.setdefault(unit, []).append(line.strip())
     return out
 
 
@@ -165,9 +200,11 @@ def run_after(feat):
         # WHY: 成功時にも「ERROR 0 件」と出力する検査があるため、出力の文字では判定せず終了コードだけで判定する。
         # 各検査は ERROR があれば exit 1 を返す(verify_call_graph.py・verify_docx_layout.py で確認)。
         if p.returncode != 0:
+            # WHY: 差し戻し先を拾えないまま止まると、メインが次に何をするか決まらない。最低でも unknown に残す。
+            sendbacks = parse_sendbacks(out, load_units()) or {"unknown": (out.strip().splitlines() or [cmd])[-1:]}
             result = {
                 "stopped_at": cmd,
-                "sendbacks": parse_sendbacks(out),
+                "sendbacks": sendbacks,
                 "tail": out[-800:],
             }
             print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -183,6 +220,17 @@ def selftest():
     assert parse_sendbacks("ERROR 差し戻しの無い行") == {}
     units = load_units()
     assert len(units) == 7, sorted(units)
+    # 差し戻し先の無い合成後の ERROR(2026-10-13 POS会計レポートの verify_intermediate)
+    s = parse_sendbacks(
+        "=== 検証結果: ERROR 3 件 ===\n--- ERROR（docx生成前に要修正） ---\n"
+        "  [ERROR] api_spec[a].error_patterns: 400 のエラー MSE00001 が validations に無い（validations に1件書き）\n"
+        "  [ERROR] v55.1 §10 補遺 概要本文に物理名残存: backend_processes[BE1].overview 検出=['UPPER:POS']\n"
+        "  [ERROR] db_operations[DB1].dataset: 列「a・b」が括り表記\n"
+        "  [ERROR] api_spec[a].response_items[k].display_name が空\n"
+        "  [ERROR] 何の欄か分からない\n"
+        "  [WARN] backend_processes[BE1].overview 長い\n", units)
+    assert {u: len(v) for u, v in s.items()} == {"H4": 1, "S2": 1, "H2": 1, "H3": 1, "unknown": 1}, s
+    assert parse_sendbacks("ERROR foo → 差し戻し先 S1", units) == {"S1": ["ERROR foo → 差し戻し先 S1"]}
     text = build_prompt(units, "テスト機能", "S1", sendbacks=["ERROR 欄 → 差し戻し先 S1"])
     assert "_unit_S1.json" in text and "ERROR 欄 → 差し戻し先 S1" in text, text
     assert "【差し戻し】" not in build_prompt(units, "テスト機能", "S1")
