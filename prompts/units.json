@@ -1,0 +1,133 @@
+{
+  "_meta": {
+    "目的": "Phase 1 で LLM が書く欄を、委譲の単位(サブエージェント1体)ごとに分ける分担表。target/scripts/_units.py が読む",
+    "書式": "owns = その単位だけが書く欄(汎用パス。'[]' は識別子つき一覧の各行)。creators = 識別子つき一覧の行を作る単位。他の単位は、作り手が作った行に欄を足すだけ",
+    "識別子": "screen_layout.items=item_name / events・events_peripheral・event_processes=event_code / db_operations=id / api_spec=action / response_items=key / request_params=name / messages_backend=message_id",
+    "変更": "欄の担当を変えるときは、このファイルと prompts/<単位>_*.md の両方を直し、verify_partials.py --selftest を流す"
+  },
+  "units": {
+    "S1": {
+      "model": "sonnet",
+      "title": "画面項目と共通ロジック",
+      "prompt": "prompts/S1_画面項目と共通ロジック.md",
+      "owns": [
+        "screen_layout",
+        "events_peripheral",
+        "common_logic",
+        "common_logic_peripheral"
+      ]
+    },
+    "S2": {
+      "model": "sonnet",
+      "title": "バック処理の業務の説明",
+      "prompt": "prompts/S2_バック処理の業務.md",
+      "owns": [
+        "api_spec[].name",
+        "api_spec[].description",
+        "api_spec[].auth",
+        "api_spec[].related_db_operations",
+        "api_spec[].related_cache_operations",
+        "api_spec[].response_items[].source",
+        "api_spec[].response_items[].transform_backend",
+        "api_spec[].response_items[].expression",
+        "api_spec[].response_items[].description",
+        "api_spec[].response_to_screen_mapping",
+        "api_spec[].error_patterns",
+        "api_spec[].error_patterns_none_reason",
+        "db_operations[].dataset_name",
+        "db_operations[].remarks",
+        "parameters_backend"
+      ]
+    },
+    "S3": {
+      "model": "sonnet",
+      "title": "フロント処理のステップ",
+      "prompt": "prompts/S3_フロント処理のステップ.md",
+      "owns": [
+        "event_processes"
+      ]
+    },
+    "H1": {
+      "model": "haiku",
+      "title": "イベントの清書",
+      "prompt": "prompts/H1_イベントの清書.md",
+      "owns": [
+        "events"
+      ]
+    },
+    "H2": {
+      "model": "haiku",
+      "title": "DB 操作と論理名の写し",
+      "prompt": "prompts/H2_DB操作と論理名.md",
+      "owns": [
+        "logical_names",
+        "db_operations[].api_endpoint",
+        "db_operations[].operation_type",
+        "db_operations[].dataset",
+        "db_operations[].joins",
+        "db_operations[].where",
+        "db_operations[].group_by",
+        "db_operations[].aggregate",
+        "db_operations[].order_by",
+        "db_operations[].insert_values",
+        "db_operations[].update_values",
+        "db_operations[].transaction",
+        "db_operations[].error_message_id"
+      ]
+    },
+    "H3": {
+      "model": "haiku",
+      "title": "API の写し",
+      "prompt": "prompts/H3_APIの写し.md",
+      "owns": [
+        "api_spec[].no",
+        "api_spec[].method",
+        "api_spec[].path",
+        "api_spec[].response_pattern",
+        "api_spec[].response_schema",
+        "api_spec[].request_params",
+        "api_spec[].response_items[].no",
+        "api_spec[].response_items[].display_name",
+        "api_spec[].response_items[].data_type",
+        "api_spec[].response_items[].type"
+      ]
+    },
+    "H4": {
+      "model": "haiku",
+      "title": "画面ルールとメッセージの写し",
+      "prompt": "prompts/H4_画面ルールとメッセージ.md",
+      "owns": [
+        "validations_frontend",
+        "calculations",
+        "messages_backend"
+      ]
+    }
+  },
+  "creators": {
+    "screen_layout.items": "S1",
+    "events_peripheral": "S1",
+    "event_processes": "S3",
+    "events": "H1",
+    "db_operations": "H2",
+    "api_spec": "H3",
+    "api_spec[].response_items": "H3",
+    "api_spec[].request_params": "H3",
+    "messages_backend": "H4"
+  },
+  "outside_fragments": {
+    "S0": {
+      "model": "sonnet",
+      "title": "画面の設定(screen_config)",
+      "prompt": "prompts/S0_画面の設定.md",
+      "writes": "target/intermediate/{機能名}_screen_config.json の areas / process_names_by_event_code / initial_processes / process_overview_overrides / trigger_dispatch",
+      "when": "screen_config が雛形のまま(または上の欄が空)のときだけ。並行の単位より先に1回"
+    },
+    "R1": {
+      "model": "haiku",
+      "title": "書式の手直し",
+      "prompt": "prompts/R1_書式の手直し.md",
+      "writes": "検査が指した断片 _unit_<単位>.json の、指された欄の値だけ(行の追加・削除はしない)",
+      "when": "検査の書式 ERROR(括り表記・物理名の混入・code の形式・location・30字超)が出たとき"
+    }
+  }
+}

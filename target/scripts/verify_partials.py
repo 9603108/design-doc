@@ -19,6 +19,10 @@ LLM が書いた語彙の文面より前に、骨格(連番・参照先・呼出
   出力: stdout に問題を '[種別] 場所: 内容' で1行1件。問題が無ければ [OK] の1行
   終了コード: 0=問題なし / 1=問題が1件以上 / 2=入力不正
   --selftest: 組込みの検査を走らせる(partial と --screen-name は不要)
+  --units [DIR]: 委譲の単位ごとの断片 DIR/_unit_<単位>.json(既定 target/intermediate)を検査する。
+      分担表 prompts/units.json に照らして [範囲外] 担当外の欄 / [重複] 2単位が同じ欄 / [参照] 行の識別子や
+      action・event_code・message_id 等が他の単位の断片と食い違う、を1行1件で出す(行末に「→ 差し戻し先 <単位>」)。
+      --unit <単位> を付けると、その単位に関わる行だけを出す(単位が自分の断片を検査するとき)
 
 【接続情報】
   - 入力の作り手: extract_react_draft.py の build_draft()(キー: events / db_operations / event_processes)
@@ -160,11 +164,79 @@ def selftest():
         assert check_partial(todo, "受注入力") == [], f"業務の文で誤検出: {check_partial(todo, '受注入力')}"
         todo["event_processes"][1]["details"] = [DETAIL_TODO, "・load をリクエストする"]
         assert [p for p in check_partial(todo, "受注入力") if p.startswith("[未記入]")], "未記入の印を検出しない"
+
+        selftest_units()
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
     print("[selftest OK] verify_partials")
     return 0
+
+
+def main_units(directory, only=None):
+    """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
+    import _units
+    if not directory:
+        from _config_loader import INTERMEDIATE_DIR
+        directory = INTERMEDIATE_DIR
+    try:
+        spec = _units.load_spec()
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[入力不正] 分担表 {_units.UNITS_SPEC_PATH}: {e}", file=sys.stderr)
+        return 2
+    frags, problems = _units.load_fragments(directory)
+    if not frags and not problems:
+        print(f"[入力不正] {directory} に _unit_*.json が無い", file=sys.stderr)
+        return 2
+    problems += _units.check_all(spec, frags, only)
+    for pr in problems:
+        print(pr)
+    if problems:
+        return 1
+    print(f"[OK] 断片 {len(frags)} 本({', '.join(sorted(frags))})の検査に問題なし")
+    return 0
+
+
+def selftest_units():
+    """分担表どおりの断片は問題 0 件、担当外・重複・識別子の食い違い・参照切れは種別が出ることを確かめる"""
+    import _units
+    spec = _units.load_spec()
+    assert _units.check_spec(spec) == [], f"分担表に重なり: {_units.check_spec(spec)}"
+    good = {
+        "H1": {"events": [{"event_code": "EV00", "trigger": "受注入力画面の初期表示時", "content": "一覧を表示する"},
+                          {"event_code": "EV01", "trigger": "受注入力画面の確定ボタンをクリックする。", "content": "保存する"}]},
+        "H2": {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save", "trigger_events": ["EV01"]},
+                                  "operation_type": "INSERT"}]},
+        "H3": {"api_spec": [{"action": "save", "method": "POST", "path": "/api/order",
+                             "response_items": [{"key": "result", "no": 1, "data_type": "string"}]}]},
+        "H4": {"messages_backend": [{"message_id": "MSE00001", "code": "MSE00001", "message": "保存に失敗しました"}]},
+        "S1": {"screen_layout": {"items": [{"item_name": "確定", "item_type": "Button", "event_code": "EV01"}]}},
+        "S2": {"api_spec": [{"action": "save", "description": "受注を保存する", "related_db_operations": ["db_op_save"],
+                             "response_items": [{"key": "result", "source": {"type": "const"}}],
+                             "response_to_screen_mapping": [{"api_field_path": "result", "screen_item_name": "確定"}],
+                             "error_patterns": [{"condition": "保存できない", "status_code": 500, "message_id": "MSE00001"}]}],
+               "db_operations": [{"id": "db_op_save", "dataset_name": "受注を登録する"}]},
+        "S3": {"event_processes": [{"event_code": "EV01", "details": ["入力を確かめる", "・save をリクエストする"]}]},
+    }
+    assert _units.check_all(spec, good) == [], f"良い断片で問題が出た: {_units.check_all(spec, good)}"
+    comp = _units.compose(spec, good)
+    assert comp["api_spec"][0]["description"] == "受注を保存する" and comp["api_spec"][0]["method"] == "POST", "合成で欄が落ちた"
+    assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "source": {"type": "const"}}, "行の合成が違う"
+    parts, unknown = _units.split_partials(comp)
+    assert "event_processes" in parts["screen_events"] and not unknown, "partial への振り分けが違う"
+
+    bad = copy.deepcopy(good)
+    bad["H3"]["api_spec"][0]["description"] = "勝手に書いた"                    # 範囲外 + 重複
+    bad["S2"]["api_spec"][0]["response_items"][0]["key"] = "results"            # 識別子の食い違い
+    bad["S2"]["api_spec"][0]["error_patterns"][0]["message_id"] = "MSE09999"   # 参照切れ
+    out = _units.check_all(spec, bad)
+    kinds = {p[:p.index("]") + 1] for p in out}
+    assert {"[範囲外]", "[重複]", "[参照]"} <= kinds, f"検出不足: {out}"
+    assert any("差し戻し先 H3" in p for p in out) and any("差し戻し先 S2" in p for p in out), f"差し戻し先が出ない: {out}"
+    assert all("S2" in p for p in _units.check_all(spec, bad, only="S2")), "--unit の絞り込みが効かない"
+    # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
+    partial_run = {"S2": good["S2"]}
+    assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
 
 
 def main(argv=None):
@@ -173,10 +245,15 @@ def main(argv=None):
     p.add_argument("partial", nargs="?", help="下書き JSON のパス")
     p.add_argument("--screen-name", help="画面名(trigger 文の先頭に来るべき語)")
     p.add_argument("--selftest", action="store_true", help="組込みの検査を走らせる")
+    p.add_argument("--units", nargs="?", const="", default=None,
+                   help="委譲の単位ごとの断片 _unit_*.json のフォルダ(省略時 target/intermediate)を検査する")
+    p.add_argument("--unit", help="--units と併用。その単位に関わる問題だけを出す")
     args = p.parse_args(argv)
 
     if args.selftest:
         return selftest()
+    if args.units is not None:
+        return main_units(args.units, args.unit)
     if not args.partial or not args.screen_name:
         print("[入力不正] partial と --screen-name が必要", file=sys.stderr)
         return 2

@@ -100,6 +100,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 ├── SKILL.md                            ← スキル説明（本ファイル）
 ├── 01_画面レイアウト.md 〜 17_構成図生成.md  ← サブスキル（汎用、案件非依存）
 ├── id_scheme.json                      ← ID 体系規約（汎用、全プロジェクト共通）
+├── prompts/                            ← 委譲の単位の分担表（units.json）と、単位ごとの短い手順書（「委譲の分担」の節）
 ├── examples/
 │   └── sample/                         ← 設定の雛形と解析対象のソース（架空の受注入力画面）
 │       ├── README.md                      ← サンプルの説明と使い方
@@ -189,13 +190,88 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 
 `--profile` オプションで手動指定も可能。
 
+### 委譲の分担（メインは指揮だけ。LLM が書く欄はサブエージェントへ）
+
+スキルを実行するメインは、スクリプトを流し、単位ごとにサブエージェントを起動し、検査の結果で差し戻すだけを行う。中間データの欄は書かない。LLM が書く欄は、下の分担表で単位(サブエージェント1体)に割り当てる。分担表の正本は `prompts/units.json`（欄の担当 `owns` と、行を作る単位 `creators`）で、`verify_partials.py --units` と `merge_partials.py --compose-units` がこれを読む。
+
+**担当の決め方:** 下書きがあり、ソースの写しで済み、検査で正誤を機械判定できる欄は haiku。業務の解釈・要約・複数ファイルをまたぐ対応付け・網羅の判断が要る欄は sonnet。共通の決まりで機械にできるものは script（未実装は「将来 script」として当面 sonnet）。根拠は POS会計レポートを Haiku で4回作った結果（Haiku は清書・転記・書式の手直しで足り、概要・共通ロジック・加工とデータ起源・画面項目マッピング・異常系・網羅で落ちた）。
+
+**分担表（欄 → 担当）:**
+
+| 欄 | 担当 | 単位 |
+|:---|:---|:---|
+| events の event_code・API との対応、db_operations の trigger_events、details の呼出の行、response_items の key の下書き、dataset の物理名、error_patterns の下書き | script（extract_react_draft / extract_backend_draft / apply_react_draft） | - |
+| events の location・action・source_kind、event_processes の骨格、trigger_groups 以降 | script（既存の Phase 2〜5.9） | - |
+| events の trigger・content・classification の清書 | haiku | H1 |
+| logical_names、db_operations の api_endpoint・operation_type・dataset・joins・where・group_by・order_by・insert/update_values・transaction | haiku | H2 |
+| api_spec の no・method・path・request_params・response_pattern・response_schema、response_items の key・no・display_name・data_type | haiku | H3 |
+| validations_frontend（ソースの写し）、calculations（式の転記）、messages_backend | haiku | H4 |
+| 検査の書式 ERROR の手直し（括り表記・物理名の混入・code の形式・location・30字超） | haiku | R1 |
+| screen_config の areas・初期処理・概要の上書き・trigger_dispatch（画面の概要と業務の中心概念） | sonnet | S0 |
+| screen_layout.items（網羅）・diagram_ascii、common_logic、events_peripheral・common_logic_peripheral | sonnet（items は将来 script で下書き） | S1 |
+| api_spec の name・description・related_db/cache_operations、response_items の source・transform_backend・expression・description、response_to_screen_mapping、error_patterns（業務の言葉の条件）、db_operations の dataset_name、parameters_backend | sonnet | S2 |
+| 500 系・認証切れの error_patterns、api_spec の auth（認証の説明） | 将来 script（当面 sonnet） | S2 |
+| event_processes の details（異常系の判断） | sonnet | S3 |
+
+**単位と順序:**
+
+| 順 | 単位 | model | 入力 | 出力 | 手順書 |
+|:---|:---|:---|:---|:---|:---|
+| 0 | （メイン） | - | screen_config / ソース | `{機能名}_react_draft.json` / `{機能名}_backend_draft.json`（React のときだけ） | 実行順序の Phase 1 |
+| 0.5 | S0 | sonnet | ソース・react_draft | screen_config（雛形のままのときだけ） | `prompts/S0_画面の設定.md` |
+| 1（並行） | S1 S2 S3 H1 H2 H3 H4 | 表のとおり | 下書き・ソース・screen_config | `target/intermediate/_unit_<単位>.json` | `prompts/<単位>_*.md` |
+| 2 | （メイン） | - | `_unit_*.json` 7本 | 問題の一覧 | `verify_partials.py --units` |
+| 3 | （メイン） | - | `_unit_*.json` | partial 4本 | `merge_partials.py "$FEATURE_NAME" --compose-units` → 実行順序の Phase 1 の残り（apply_react_draft --stage partial）→ Phase 2 以降 |
+
+- 順序の依存は S0 だけ（画面名とエリア名を全単位が読むため）。screen_config が揃っていれば S0 は飛ばし、順1の7体を1つのメッセージで同時に起動する
+- 単位どうしは互いの出力を待たない。同じ行（api_spec の action、db_operations の id など）は識別子をソースから同じ規則で導いて指す（`prompts/_共通.md`）。食い違いは順2の検査が `[参照]` で拾う
+- 断片は単位ごとに別ファイルで、同じ行の別の欄を書く。合成は `merge_partials.py --compose-units` が識別子で突き合わせて行い、partial 4本（従来と同じ形）を書く。partial に入口の無かった details は、断片の `event_processes` から `merge_partials.py` が `event_processes[].details` へ写すので、Phase 4 の前の手作業は要らない
+- 書く範囲が重ならないことは `verify_partials.py --units` が検査する（分担表の重なり・担当外の欄 `[範囲外]`・2単位が同じ欄 `[重複]`）
+- HTML の画面（下書きが無い）: 同じ単位で回し、H1〜H3 は model を sonnet にする（下書きが無いので haiku の条件を満たさない）。従来どおり1体の Agent で作る流れ（Step 3 のプロンプト）も使える。この場合 `_unit_*.json` を置かず、`--compose-units` も流さない
+
+**Agent 呼び出しの雛形（順1。7体を同じメッセージで起動する）:**
+
+```
+Agent({
+  description: "{機能名} 設計書 {単位} {単位の題}",
+  subagent_type: "general-purpose",
+  model: "haiku",            // units.json の model（S* は "sonnet"）。HTML の画面では H1〜H3 も "sonnet"
+  prompt: "design-doc スキルの委譲の単位 {単位} を行う。\n
+スキルのフォルダ: {絶対パス}（コマンドはここで流す）。機能名: {機能名}（FEATURE_NAME）。\n
+読むのは prompts/_共通.md と prompts/{単位}_*.md と、手順書が挙げた入力だけ。SKILL.md は読まない。\n
+出力: target/intermediate/_unit_{単位}.json の1ファイル。書いてよい欄は prompts/units.json の {単位} の owns だけ。\n
+終わったら python3 target/scripts/verify_partials.py --units --unit {単位} を流し、自分を指す問題を直してから3行で報告する。"
+})
+```
+
+差し戻しは同じ雛形に「直す問題: <検査の行をそのまま>」を足し、その単位だけを起動し直す。R1 は「直す断片: _unit_<単位>.json」と「検査のコマンド」を渡す。
+
+**検査が ERROR を返したときの差し戻し先:**
+
+| 検査 | 問題 | 差し戻し先 |
+|:---|:---|:---|
+| verify_partials.py --units | 行末の「→ 差し戻し先 <単位>」 | その単位（`[参照]` で2つ挙がったら、ソースを見て食い違った側。迷えば作り手） |
+| verify_partials.py（react_draft） | `[連番]` `[trigger]` `[overview]` | H1（書式だけなら R1） |
+| 同上 | `[details]` `[未記入]` | S3 |
+| apply_react_draft.py | `[trigger_events]` `[action]` | H2 |
+| 同上（--stage merge） | `[details]` 呼出の行の数・並び | S3 |
+| verify_intermediate.py | 括り表記（response_items の key / dataset の列）・物理名の混入・code の形式・location・概要の30字超 | R1（直せなければ、その欄の担当 = 下の行） |
+| 同上 | dataset の論理名が空・logical_names に未登録・テーブル名が仮表記・物理テーブル名 | H2 |
+| 同上 | path が URL でない・request_params の location が空 | H3 |
+| 同上 | response_to_screen_mapping が空・overview（description）が空・業務固有 step が無い（related_db_operations）・error_patterns が空・400 のエラーが validations に無い | S2（400 の件は H4 と両方を見る） |
+| 同上 | details が空・未記入の印 | S3 |
+| 同上 | validations / calculations / messages が空のテンプレ | H4 |
+| 同上 | common_logic が空・画面用語（area_ref・item_name）の食い違い | S1 |
+| 同上 | trigger の画面用語・events の参照 | H1 |
+| verify_call_graph.py | 呼ばれていない処理・存在しない参照 | 呼出の対応は script（下書き）なので、まず react_draft の unresolved を見る。API の並び・action は H3、details は S3 |
+
 ### Step 3: HTML 単位の並列処理
 
 **並列の単位:**
 
 - 複数HTML処理時: **HTML単位でAgent並列起動** が標準（Phase 1 の成果を固定名の partial 4本で渡す場合は、画面どうしで partial が衝突するので並列にしない。後述「Phase 1 の成果物の渡し方」）
 - 各エージェント内部の Wave 1〜4 は **順次実行**（並列にしない）
-- 単一HTMLの場合は Agent サブエージェント不要、メインセッションで順次実行
+- 単一HTMLの場合は Agent サブエージェント不要、メインセッションで順次実行（メインが中間データを書かない運用では、上の「委譲の分担」の単位へ委譲する）
 - general-purpose サブエージェントが無い環境では、複数HTMLでもメインセッションで1画面ずつ順に処理する（下のプロンプトの手順を、そのままメインセッションで実行する）
 
 **Agent 並列起動の例（複数HTMLの場合）:**
@@ -382,9 +458,10 @@ INPUT_JSON="target/intermediate/${FEATURE_NAME}.json" \
 | **外部設定読込ヘルパー（v30 で新設）** | | | |
 | `_config_loader.py` | `{機能名}_screen_config.json` 読込ヘルパー。`get_areas()` / `get_process_names_by_event_code()` / `get_diagram_spec(id)` 等のセクション別アクセサを提供 | 汎用 | **v30** |
 | **基盤スクリプト（v17 以前から）** | | | |
-| `merge_partials.py` | 4 Agent の出力（_partial_*.json）を統合し中間JSON 本体生成 | 汎用 | v1 |
+| `merge_partials.py` | 4 Agent の出力（_partial_*.json）を統合し中間JSON 本体生成。`--compose-units` は委譲の単位の断片 `_unit_*.json` を検査して partial 4本へ合成するだけで終わる。断片の `event_processes` の details は通常の実行で `event_processes[].details` へ写す | 汎用 | v1 |
 | `extract_react_draft.py` | React（TSX）の画面の source_files を静的に解析し、JSX のイベント属性 → ハンドラ → 状態の更新 → useEffect → `api_call_functions` の呼出（ラッパー経由を含む）を結んで、events（EV00 = 初期表示、以降 EV01… の連番）・`db_operations[].api_endpoint.trigger_events`・`event_processes[].details` の呼出の行・`unresolved` の下書き JSON を出す。解析できない箇所は推測で埋めず `unresolved` にだけ出す。HTML の画面では使わない | 汎用（`source_files` / `screen_name` は screen_config.json、`api_call_functions` は project_config.json 経由） | 2026-10-12 |
 | `apply_react_draft.py` | extract_react_draft.py の下書きを機械で当てはめる。`--stage partial`（merge の前）は _partial_backend.json の `api_endpoint.trigger_events` を、同じ action を持つ全 db_operations に写す。`--stage merge`（merge の後）は event_processes[].details の呼出の行の並びと数を下書きに揃える（空なら入れ、業務語彙の文は残す）。既存の値と食い違えば上書きせず一覧に出して終了コード 1。EV00 は対象外 | 汎用 | 2026-10-12 |
+| `_units.py` | 委譲の単位の断片 `_unit_<単位>.json` を分担表 `prompts/units.json` に照らして検査（担当外の欄・2単位が同じ欄・識別子と参照の食い違い）し、識別子で突き合わせて partial 4本の形へ合成する共通部品。`verify_partials.py --units` と `merge_partials.py --compose-units` が使う | 汎用 | 2026-10-12 |
 | `verify_partials.py` | merge 前に partial と details を検査（event_code の連番・trigger_events の参照先の実在・overview 30字以内・details の呼出の行の数と並びが api_endpoint と一致・trigger 文が screen_name で始まる）。問題は1行1件「[種別] 場所: 内容」、1件でもあれば終了コード 1 | 汎用 | 2026-10-12 |
 | `convert_events_location_action.py` | events[].trigger を location/action/source_kind に分解 | 汎用 | v10 |
 | `replace_hatsuka.py` | 「発火」を「呼出/実行」に置換（業務語彙統一） | 汎用 | v11 |
@@ -423,7 +500,10 @@ v52 で共通スクリプト 5 本（`_config_loader.py` / `apply_trigger_dispat
 export FEATURE_NAME="受注入力"   # 例: 受注入力 / 受注照会 / 顧客マスタ / 商品マスタ 等（既定の機能名は無い。必ず指定する）
 
 # === Phase 1: ソース解析（Agent 並列） ===
-# Agent 4本並列で _partial_*.json 生成（Step 3）。出力先: target/intermediate/_partial_*.json
+# 委譲の単位で作るとき（「委譲の分担」の節）: 下書きのスクリプト（下の2本）→ 単位7体を並行に起動 → 断片を検査・合成する
+#   python3 target/scripts/verify_partials.py --units                          # 問題の行末の「→ 差し戻し先 <単位>」へ戻す
+#   python3 target/scripts/merge_partials.py "${FEATURE_NAME}" --compose-units # _unit_*.json → partial 4本（この後、下の apply_react_draft --stage partial へ）
+# 従来の形: Agent 4本並列で _partial_*.json 生成（Step 3）。出力先: target/intermediate/_partial_*.json
 # partial 4本の名前とキーは Step 3「Phase 1 の成果物の渡し方」を参照。partial は機能名に依らない固定名なので、1画面ずつ処理する
 # Step 3 のプロンプトで {機能名}.json を直接保存した場合は、次の merge_partials.py を実行しない（実行すると空に近い中間JSON で上書きされる）
 # Phase 1 の出力では events[] に event_code（EV00 = 初期表示、以降 EV01… の連番）を付ける。event_processes は merge_partials.py が events から作る（details は空）
@@ -457,6 +537,7 @@ python3 target/scripts/add_screen_areas.py "${FEATURE_NAME}"                    
 python3 target/scripts/extract_source_files.py "${FEATURE_NAME}"                  # frontend_files / backend_files 抽出（screen_config.source_files も frontend_files へ）
 
 # === Phase 4 の前（手作業）: event_processes[].details を埋める ===
+# 委譲の単位で作ったときは不要（S3 の断片の details を merge_partials.py が写している）
 # target/intermediate/${FEATURE_NAME}.json の event_processes[].details に、処理ステップを1行1 step で書く
 # （空のままだと、概要を句点で区切っただけのステップになる。書き方は Step 3「Phase 1 の成果物の渡し方」）
 

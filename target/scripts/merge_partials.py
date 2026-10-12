@@ -9,6 +9,10 @@
 #           設定 = target/intermediate/{機能名}_screen_config.json の source_html_path /
 #                  backend_files / project_pattern / profile を main() が meta に転記する
 #           参照仕様 = .claude/skills/design-doc/15_中間JSONスキーマ.md
+# 2026-10-12 委譲の単位: --compose-units は、単位ごとの断片 _unit_<単位>.json（prompts/units.json の分担表）を
+#           検査してから partial 4本へ合成して書き、統合はせずに終わる（この後に apply_react_draft --stage partial と
+#           本スクリプトの通常の実行が続く）。断片の event_processes（details）は _partial_screen_events.json に入り、
+#           通常の実行が event_processes[].details へ写す。断片が無い画面（HTML を1体で作る従来の流れ）は何も変わらない
 
 import json
 import sys
@@ -142,12 +146,57 @@ def build_event_processes(events: list, db_operations: list) -> list:
     return processes
 
 
+def compose_units() -> int:
+    """_unit_*.json を検査し、問題が無ければ partial 4本へ合成して書く。終了コード 0=書いた / 1=問題あり（書かない）/ 2=断片なし。
+    既存の partial は .bak_units_<日時> に控えてから置き換える（合成は断片だけから作り直す。前回の partial の残りを混ぜない）"""
+    import _units
+    spec = _units.load_spec()
+    frags, problems = _units.load_fragments(INTERMEDIATE_DIR)
+    if not frags and not problems:
+        print(f"[入力不正] {INTERMEDIATE_DIR} に _unit_*.json が無い", file=sys.stderr)
+        return 2
+    problems += _units.check_all(spec, frags)
+    composed = _units.compose(spec, frags)
+    parts, unknown = _units.split_partials(composed)
+    problems += [f"[範囲外] 最上位キー {k}: partial に入口が無い" for k in unknown]
+    if problems:
+        for pr in problems:
+            print(pr)
+        print(f"[NG] 問題 {len(problems)} 件。partial は書いていない（差し戻し先の単位に直させてから再実行する）")
+        return 1
+    stamp = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d-%H%M%S")
+    for name, data in parts.items():
+        path = PARTIALS[name]
+        if path.exists():
+            path.rename(path.with_name(f"{path.name}.bak_units_{stamp}"))
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[OK] 断片 {len(frags)} 本（{', '.join(sorted(frags))}）を partial 4本へ合成した")
+    return 0
+
+
+def apply_unit_details(event_processes: list, unit_eps: list) -> None:
+    """断片由来の event_processes（_partial_screen_events.json の event_processes）の details を、event_code で写す。
+    details_none_reason も写す。断片に無いイベントは merge が作った空の details のまま"""
+    by_code = {e.get("event_code"): e for e in unit_eps or [] if isinstance(e, dict)}
+    for ep in event_processes:
+        src = by_code.get(ep.get("event_code"))
+        if not src:
+            continue
+        if src.get("details"):
+            ep["details"] = list(src["details"])
+        if src.get("details_none_reason"):
+            ep["details_none_reason"] = src["details_none_reason"]
+
+
 def main():
     # --help / -h は機能名ではなく使い方の要求。FEATURE_NAME に入ると screen_config 読込で落ちるため先に返す。
     #   接続: 第1引数の判定だけ。機能名の解決（モジュール先頭）は変えない。
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        print("usage: merge_partials.py [機能名]  (機能名省略時は環境変数 FEATURE_NAME)")
+        print("usage: merge_partials.py [機能名] [--compose-units]  (機能名省略時は環境変数 FEATURE_NAME)")
+        print("  --compose-units: _unit_*.json を検査して partial 4本へ合成するだけで終わる（委譲の単位の流れ）")
         return
+    if "--compose-units" in sys.argv[1:]:
+        sys.exit(compose_units())
     se = load_partial("screen_events")
     cs = load_partial("calc_state")
     be = load_partial("backend")
@@ -202,6 +251,7 @@ def main():
     # initialization と event_processes は本スクリプトで最小テンプレ生成
     initialization = build_initialization(events, screen_layout)
     event_processes = build_event_processes(events, db_operations)
+    apply_unit_details(event_processes, se.get("event_processes"))
 
     # 統合中間JSON
     merged = {
