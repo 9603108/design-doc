@@ -72,7 +72,7 @@ _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 
 
 # 意味合い: 失敗時・連続操作・0件の分岐を TSX の文字から機械的に拾う目印。拾えた場合だけ details の下書き行に足す。
-#          失敗時の行は「エラー表示」で埋めて出す(〈〉を残すと合成後の穴検査が止める)。0件の〈〉は LLM が埋める印。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
+#          失敗時の行は「エラー表示」で埋めて出す(〈〉を残すと合成後の穴検査が止める)。0件の行も同様に穴の無い文で出す。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
 # ponytail: 目印は文字列の一致だけ。catch や setError 等が別の用途で出ると、要らない行が1つ付く
 _FAIL_HINT = re.compile(r"\bcatch\s*\(|\bset\w*(?:Err|err)\w*\s*\(")
 _RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)  # 末尾: useRef の連番(++seq.current)
@@ -394,21 +394,21 @@ def _robust_lines(texts):
     if _RACE_HINT.search(body):
         lines.append("連続して操作したときは、最後の要求の応答だけを反映する")
     if _EMPTY_HINT.search(body):
-        lines.append("0件のときは〈該当なし表示〉を出す")
+        lines.append("0件のときは該当なしの旨を表示する")
     return lines
 
 
 def _detail_lines(link, called):
     """呼ぶ API があるイベントの details に足す描画の行。0件分岐は状態が一致した分だけ、分岐の文言つきに置き換える。
 
-    呼出元: build_draft()。意味合い: 0件の行を、JSX に書かれた表示文言で具体化する(文言が無ければ〈〉の印のまま)。
+    呼出元: build_draft()。意味合い: 0件の行を、JSX に書かれた表示文言で具体化する(文言が無ければ穴の無い一般文のまま)。
     """
     if not called:
         return []
     lines = _robust_lines(link["texts"])
     if link.get("empty"):
         lines = [ln for ln in lines if not ln.startswith("0件のとき")]
-        lines += [f"0件のときは〈該当なし表示〉を出す(画面の文言: 「{txt}」)" for _x, txt in link["empty"]]
+        lines += [f"0件のときは該当なしの旨を表示する(画面の文言: 「{txt}」)" for _x, txt in link["empty"]]
     return lines
 
 
