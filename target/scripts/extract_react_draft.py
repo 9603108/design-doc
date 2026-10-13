@@ -544,7 +544,7 @@ def _display_rows(sources):
     return rows
 
 
-def _continuous_ops(links):
+def _continuous_ops(links, sources=()):
     """データ取得を起こす操作(イベント属性・要素を問わず)ごとに、読込中の無効化・判定・取消処理の有無を判定する。
 
     呼出元: main()。意味合い: 連続操作(読込中にもう一度起こせるか、起こしたら前の要求を止めるか)を機械で出す。
@@ -569,7 +569,9 @@ def _continuous_ops(links):
         if not prevented:
             fact += "読込中の再操作の防止は防止なし(無効化・loading の判定・中断が無い)。"
         ops.append({"button": label, "disabled_while_loading": disabled, "guard": guard, "cancel": cancel,
-                    "prevention": "あり" if prevented else "防止なし", "fact": fact})
+                    "prevention": "あり" if prevented else "防止なし", "fact": fact,
+                    # 目的: 後から届く応答・読込中表示の事実(C6)。接続: S3 の details に1行ずつ写す
+                    "outcomes": _react_facts.outcomes(link, sources)})
     return ops
 
 
@@ -627,7 +629,7 @@ def main(argv=None):
         draft["events"][0]["fetch_plan"] = plan
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
-    draft["continuous_operation"] = _continuous_ops(links)
+    draft["continuous_operation"] = _continuous_ops(links, sources)
     write_draft(draft, Path(args.out))
     # api.ts から抜いた断片は下書きと同じフォルダへ、<機能名>_api_excerpt.ts として書く(機能名は config の名前から)
     if excerpt:

@@ -266,6 +266,67 @@ def fetch_plan(sources, api_names):
     return {"mode": "parallel", "groups": [calls], "basis": "同じ本体で待たずに続けて呼ぶ", "src": srcs}
 
 
+_RACE_GUARD = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)
+
+
+def outcomes(link, sources):
+    """連続操作1件(link)について、後から届く応答・読込中表示の事実を返す(案 C6)。
+
+    呼出元: extract_react_draft._continuous_ops()。意味合い:
+    - stale_overwrite: 成功側が state を書き、要求の識別(連番・AbortController)が本体に無い → 古い応答が後から上書きしうる。
+    - loading_cleared_early: 呼出の前に state=true、finally で state=false、件数を数えない → 先に返った応答で表示が消える。
+    判定は文字の一致だけ。取れない形は何も出さない(推測で足さない)。接続: extract() の failure_effects を土台にする。
+    """
+    guarded = bool(_RACE_GUARD.search("\n".join(link.get("texts", []))))
+    out = []
+    for e in extract([link], sources)["failure_effects"]:
+        if not guarded:
+            for st in e["on_success"]:
+                out.append({"kind": "stale_overwrite", "state": st,
+                            "fact": f"先に出した要求の応答が後から届くと、{st} を古い応答の内容で上書きする",
+                            "basis": "成功側が応答の順序と無関係に state を書き、要求の識別(連番・AbortController)が無い",
+                            "src": e["src"]})
+        for fin in e["in_finally"]:
+            st, _, val = fin.partition("=")
+            if val == "false" and any(x.endswith("=true") for x in e["before_call"]):
+                out.append({"kind": "loading_cleared_early", "state": st,
+                            "fact": f"最初に返った応答の finally で {st} が消え、後続の要求が処理中でも表示が戻る",
+                            "basis": f"{st}=true は要求ごとに立てるが、{st}=false は finally で件数を数えずに実行する",
+                            "src": e["src"]})
+    return out
+
+
+def selftest_outcomes():
+    """stale_overwrite と loading_cleared_early の2件が出ること、要求の識別があれば stale が消えることを assert する。"""
+    tsx = (
+        "export default function S() {\n"
+        "  const [rows, setRows] = useState([]);\n"
+        "  const [loading, setLoading] = useState(false);\n"
+        "  const load = () => {\n"
+        "    setLoading(true);\n"
+        "    fetchX().then((d) => setRows(d.rows)).catch((e) => setError(String(e))).finally(() => setLoading(false));\n"
+        "  };\n"
+        "}\n"
+    )
+    b1 = ("setLoading(true);\n"
+          "    fetchX().then((d) => setRows(d.rows)).catch((e) => setError(String(e))).finally(() => setLoading(false));")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            plain = outcomes({"file": str(p), "attr": "onChange", "actions": ["x"], "texts": [b1]}, [p])
+            guarded = outcomes({"file": str(p), "attr": "onChange", "actions": ["x"],
+                                "texts": [b1, "const ac = new AbortController();"]}, [p])
+        assert [o["kind"] for o in plain] == ["stale_overwrite", "loading_cleared_early"], f"plain: {plain}"
+        assert plain[0]["state"] == "rows" and plain[1]["state"] == "loading", f"state: {plain}"
+        assert [o["kind"] for o in guarded] == ["loading_cleared_early"], f"guarded: {guarded}"
+    except AssertionError as e:
+        print(f"[selftest NG] outcomes {e}")
+        return 1
+    print("[selftest OK] _react_facts.outcomes")
+    return 0
+
+
 def selftest_fetch_plan():
     """fetch_plan の3形(別々の useEffect / Promise.all / await の直列)を最小の TSX で assert する。終了コード 0=OK / 1=NG。"""
     tsx_a = (
@@ -353,6 +414,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
