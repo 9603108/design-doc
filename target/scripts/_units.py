@@ -23,6 +23,7 @@ target/intermediate/_unit_<単位>.json に書き、互いの出力を待たな�
 """
 import copy
 import json
+import re
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent.parent
@@ -233,6 +234,36 @@ def _align_message_ids(out, draft_msgs):
             r["message_id"] = rename[r["message_id"]]
 
 
+def _expand_message_holes(out, draft_msgs):
+    """messages_backend の型文の {key} 等を、画面項目名で展開する(verify_intermediate は未展開の穴を ERROR にするため)。
+    意味合い: 下書きは同じ ID の文面を「型文」と「展開済み(例 shop_id は…)」の両方で持つ。展開済みから {key} の実際の値(要求の項目名)を
+    取り、その項目の説明(request_params / parameters_backend の description)が画面項目名で始まるなら、その画面項目名で置き換える。
+    対応が取れない穴が1つでもあれば、その文面は触らず穴として残す(検査が差し戻す)。
+    ponytail: 対応は「説明が画面項目名で始まる」だけで取る(最長の項目名を優先)。取れなければ下書きの明示の対応が要る。"""
+    items = sorted({i["item_name"] for i in (out.get("screen_layout") or {}).get("items") or []
+                    if isinstance(i, dict) and i.get("item_name")}, key=len, reverse=True)
+    rows = [r for a in out.get("api_spec") or [] for r in a.get("request_params") or []] + list(out.get("parameters_backend") or [])
+    item_of = {}
+    for r in rows:
+        if isinstance(r, dict) and r.get("name"):
+            desc = r.get("description") or ""
+            item_of.setdefault(r["name"], next((n for n in items if desc.startswith(n)), None))
+    by_id = {}
+    for text, mid in draft_msgs.items():
+        by_id.setdefault(mid, []).append(text)
+    for m in out.get("messages_backend") or []:
+        parts = re.split(r"(\{[^{}\s]+\})", m.get("message") or "")
+        if len(parts) < 3:
+            continue
+        pat = "".join("(.+?)" if i % 2 else re.escape(p.rstrip("。") if i == len(parts) - 1 else p) for i, p in enumerate(parts))
+        for text in by_id.get(m.get("message_id"), []):
+            g = re.fullmatch(pat, text.rstrip("。"))
+            if g and all(item_of.get(v) for v in g.groups()):
+                names = iter(item_of[v] for v in g.groups())
+                m["message"] = "".join(next(names) if i % 2 else p for i, p in enumerate(parts))
+                break
+
+
 def missing_logical_names(composed):
     """dataset に出る (物理列, 論理列) のうち logical_names に論理列が無いもの。戻り: [(logical_table, logical_column, physical_table, physical_column)]
     呼出元: _fill_logical_names(合成)・verify_partials.check_h2_logical_names(H2 単位の早期 WARN)。"""
@@ -294,6 +325,7 @@ def compose(spec, frags, project_config=None):
                 if not any(c.get("status_code") == sc for c in common):
                     common.append({"status_code": sc, "condition": cond})
     _align_message_ids(out, draft_msgs)
+    _expand_message_holes(out, draft_msgs)
     if common or auth_desc:
         for api in out.get("api_spec") or []:
             if auth_desc and not api.get("auth"):

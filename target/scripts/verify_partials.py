@@ -402,6 +402,20 @@ def selftest_units():
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
+    # 型文の {key} は、下書きの展開済みの値(shop_id)の説明が画面項目名で始まるとき、その画面項目名で展開する。対応が無ければ穴のまま
+    out = {"screen_layout": {"items": [{"item_name": "店舗"}, {"item_name": "店舗名"}]},
+           "api_spec": [{"request_params": [{"name": "shop_id", "description": "店舗番号。省略時は全店"}]}],
+           "messages_backend": [{"message_id": "MSE00002", "message": "{key} は正の整数で指定してください"},
+                                {"message_id": "MSE00003", "message": "{key} は日付で指定してください"}]}
+    _units._expand_message_holes(out, {"{key} は正の整数で指定してください": "MSE00002", "shop_id は正の整数で指定してください": "MSE00002",
+                                       "{key} は日付で指定してください": "MSE00003", "from は日付で指定してください": "MSE00003"})
+    assert [m["message"] for m in out["messages_backend"]] == ["店舗 は正の整数で指定してください", "{key} は日付で指定してください"], out
+    # 英大文字だけの略語(POS)は、ソースの識別子に同じ形で無ければ物理名としない。同じ形で在れば物理名
+    import verify_intermediate as vi
+    def phys(src_idents):
+        return [m for lv, m in vi.check_description_granularity(
+            {"backend_processes": [{"process_id": "BE1", "overview": "POS会計を一覧にする"}]}, {"source_identifiers": src_idents}) if "物理名" in m]
+    assert not phys([]) and phys(["POS"]), "略語の物理名判定が違う"
 
 
 def main(argv=None):

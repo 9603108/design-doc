@@ -29,6 +29,7 @@ from _config_loader import (
     get_feature_name_from_argv,
     get_forbidden_terms_map,
     load_project_config,
+    load_screen_config,
 )
 
 # v55.2: 期待する憲法バージョン
@@ -900,6 +901,13 @@ def check_description_granularity(d, verify_overrides):
         "URL", "API", "ID", "CSV", "PDF", "HTTP", "JSON",
     } | set(verify_overrides.get("business_ok_words", []))
 
+    # 英大文字だけの短い略語(POS・CSV など)は、ソースの識別子に大小文字まで同じ形で在るときだけ物理名とみなす。
+    # 意味合い: 「POS会計…」のような業務用語を物理名と誤検出しないため。ソースの識別子は main() が source_identifiers で渡す。
+    src_idents = set(verify_overrides.get("source_identifiers", []))
+
+    def _is_abbrev(w):
+        return w.isalpha() and w.isupper() and len(w) <= 5 and w not in src_idents
+
     def _detect_phys_names(text):
         """物理名 / 関数名 / camelCase / SNAKE_CASE / data-XXX / 関数呼出 を検出。
         日本語と英字の境界では \\b が機能しないため独自境界を使う。
@@ -915,13 +923,13 @@ def check_description_granularity(d, verify_overrides):
         # PascalCase (大文字始まり、3 字以上、業務用語以外)
         for m in _re.finditer(r'(?<![A-Za-z0-9_])([A-Z][a-zA-Z]{2,})(?![A-Za-z0-9_])', text):
             w = m.group(1)
-            if w in BUSINESS_OK or BUSINESS_REF_PAT.match(w):
+            if w in BUSINESS_OK or BUSINESS_REF_PAT.match(w) or _is_abbrev(w):
                 continue
             found.append(f"PascalCase:{w}")
         # SNAKE_CASE / 大文字略語 (2 文字以上)
         for m in _re.finditer(r'(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]+)(?![A-Za-z0-9_])', text):
             w = m.group(1)
-            if w in BUSINESS_OK or BUSINESS_REF_PAT.match(w):
+            if w in BUSINESS_OK or BUSINESS_REF_PAT.match(w) or _is_abbrev(w):
                 continue
             found.append(f"UPPER:{w}")
         # data-XXX 属性
@@ -1362,7 +1370,21 @@ def main():
     # 業界用語・静的な言い回し）。project_config に無ければ空で、その分の判定は共通のものだけになる。
     # 接続情報: check_legacy_event_code_residue / check_screen_item_remarks_dynamic_behavior /
     #           check_description_granularity へ渡す。
-    verify_overrides = project_config.get("verify_overrides") or {}
+    verify_overrides = dict(project_config.get("verify_overrides") or {})
+    # ソースの識別子(英数字と _ の語)。check_description_granularity が、POS など英大文字だけの略語を
+    # 物理名と誤検出しないために使う。ソースは screen_config の source_files と project_root + backend_files。
+    try:
+        sc = load_screen_config(feature)
+    except FileNotFoundError:
+        sc = {}
+    srcs = list(sc.get("source_files") or []) + [str(Path(sc.get("project_root") or ".") / f) for f in sc.get("backend_files") or []]
+    idents = set()
+    for s in srcs:
+        try:
+            idents |= set(re.findall(r"[A-Za-z0-9_]+", Path(s).read_text(encoding="utf-8")))
+        except OSError:
+            pass
+    verify_overrides["source_identifiers"] = sorted(idents)
     # 禁止語は小文字化する: check_forbidden_words の scan が小文字化した本文と突き合わせるため
     # （大文字混じりのキーをそのまま使うと一致しなくなる）。
     forbidden_words = {w.lower() for w in get_forbidden_terms_map(feature)}
