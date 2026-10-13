@@ -19,7 +19,8 @@ Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いて�
 
 【入出力】
   入力: --screen-config <screen_config.json>(backend_files / project_root を読む。相対の backend_files は project_root 基準)
-  出力: --out <JSON>。キーは { apis: {action: {dataset, response_items, error_patterns}}, unresolved }
+  出力: --out <JSON>。キーは { apis: {action: {dataset, response_items, error_patterns, joins, where, group_by, order_by, aliases}}, unresolved, auth }
+  auth は入口が表を引く前に呼ぶ認証(identify 等)と、その 401/403 の文面。error_patterns の id は MSE + 5 桁の機械採番
   終了コード: 0=未解決なし / 1=unresolved が1件以上(下書きは書く) / 2=入力不正
   backend_files に無いモジュールを指す action は対象外(出力に入れず、unresolved にも出さない)
 
@@ -42,6 +43,15 @@ _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON"
 _SQL_HEAD = re.compile(r"^\s*(?:--[^\n]*\n\s*)*(WITH|SELECT)\b", re.IGNORECASE)
 _FROM_TBL = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)(?:\s+(?:AS\s+)?(?!(?:" + "|".join(_KW) + r")\b)([A-Za-z_]\w*))?", re.IGNORECASE)  # キーワードは別名に食わせない(FROM t JOIN u の JOIN を落とさない)
 _CTE = re.compile(r"\b([A-Za-z_]\w*)\s+AS\s*\(", re.IGNORECASE)
+# 深さ 0 の句(JOIN・WHERE・GROUP BY・ORDER BY・HAVING・LIMIT・UNION)。_clauses が使う
+_CLAUSE_KW = re.compile(r"\b(?:(?:LEFT|RIGHT|FULL)\s+(?:OUTER\s+)?JOIN|(?:INNER|CROSS)\s+JOIN|JOIN|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION)\b", re.IGNORECASE)
+_CLAUSE_KEYS = ("joins", "where", "group_by", "order_by", "aliases")
+_AND_OR = re.compile(r"\b(?:AND|OR)\b", re.IGNORECASE)
+_COMMA = re.compile(",")
+_COND = re.compile(r"^([A-Za-z_][\w.]*)\s*(NOT\s+LIKE|NOT\s+IN|IS\s+NOT|LIKE|IN|IS|BETWEEN|<>|!=|<=|>=|=|<|>)\s*(.*)$", re.IGNORECASE)
+_PARAM = re.compile(r"^(?:\?|%s|:(\w+)|%\((\w+)\)s)$")
+# 認証の呼出の名前(identify 等)。入口がディスパッチ表を引く前に呼ぶものだけを auth にする
+_AUTH_CALL = re.compile(r"identify|identity|auth|login|token|session|permission", re.IGNORECASE)
 
 
 class Module:
@@ -141,9 +151,8 @@ def _split0(m, s, e):
     return parts
 
 
-def _dataset(sql, unresolved, action):
-    """SQL 1 本から [{column, table}] を作る。最上位 SELECT だけを見る(WITH の中身・副問合せの列は含めない)。"""
-    m = _mask(sql)
+def _tables(m):
+    """マスク済み SQL の別名と CTE を実表へ解決する。(別名→表の dict, real(名前) -> 実表名) を返す。_dataset と _clauses が共有する。"""
     alias, ctes = {}, {}
     for t in _FROM_TBL.finditer(m):
         tbl, al = t.group(1), t.group(2)
@@ -167,6 +176,204 @@ def _dataset(sql, unresolved, action):
             seen.add(name)
             name = ctes[name]
         return name
+
+    return alias, real
+
+
+def _colref(text, real, main):
+    """列の書き(t.col・col)を (論理表, 列) にする。別名は real で実表へ直す。式は表を空にして列の欄へそのまま入れる。"""
+    if re.fullmatch(r"[A-Za-z_]\w*\.\w+", text):
+        q, c = text.split(".")
+        return real(q), c
+    if re.fullmatch(r"[A-Za-z_]\w*", text):
+        return main, text
+    return "", text
+
+
+def _split_top(m, depth, s, e, rx):
+    """m[s:e] を深さ 0 で rx に当たる箇所で割る。[(直前の区切りの語, 開始, 終了)] を返す(先頭の区切りは空文字)。"""
+    pieces, sep, st = [], "", s
+    for t in rx.finditer(m, s, e):
+        if depth[t.start()] == 0:
+            pieces.append((sep, st, t.start()))
+            sep, st = t.group(0), t.end()
+    pieces.append((sep, st, e))
+    return pieces
+
+
+def _conds(sql, m, depth, s, e, real, main):
+    """WHERE の区間を AND/OR で割って条件の行にする。BETWEEN の AND は割らない(ponytail: BETWEEN は語の有無だけで判定する。上限は構文の複雑さに比例して外れる)。"""
+    items = []  # [連結語, 条件の文, BETWEEN の途中か]
+    for sep, a, b in _split_top(m, depth, s, e, _AND_OR):
+        txt = " ".join(sql[a:b].split())
+        if not txt:
+            continue
+        if items and items[-1][2]:
+            items[-1][1] += " AND " + txt
+            items[-1][2] = False
+            continue
+        items.append([sep.upper(), txt, bool(re.search(r"\bBETWEEN\b", txt, re.IGNORECASE))])
+    rows, n = [], 0
+    for sep, txt, _ in items:
+        cm = _COND.match(txt)
+        if not cm:  # 形の分からない条件は列を空のまま、文だけ残す
+            rows.append({"and_or": sep, "logical_table": "", "logical_column": "", "operator": "", "param_no": "", "param_name": "", "expression": txt})
+            continue
+        tbl, col = _colref(cm.group(1), real, main)
+        pno = pname = ""
+        pm = _PARAM.match(cm.group(3).strip())
+        if pm:
+            n += 1
+            pno, pname = str(n), pm.group(1) or pm.group(2) or ""
+        rows.append({"and_or": sep, "logical_table": tbl, "logical_column": col, "operator": " ".join(cm.group(2).upper().split()), "param_no": pno, "param_name": pname})
+    return rows
+
+
+def _clauses(sql):
+    """本体 SELECT(深さ 0 の最初の SELECT)から JOIN・WHERE・GROUP BY・ORDER BY と式の別名を取る。
+    generate_docx.js が読む joins / where の形に合わせ、group_by / order_by も同じく表と列の組で置く。解けない句は行を作らない。"""
+    m = _mask(sql)
+    out = {k: [] for k in _CLAUSE_KEYS}
+    sels = _depth0_selects(m)
+    if not sels:
+        return out
+    real = _tables(m)[1]
+    s0, f0 = sels[0]
+    ft = _FROM_TBL.match(m, f0)
+    main = real(ft.group(1)) if ft else ""
+    # 本体が CTE を FROM するとき(WITH d AS (... WHERE ...) SELECT ... FROM d)、絞り込みは CTE の中にある。その WHERE も取る
+    cte = ft and re.search(r"\b" + re.escape(ft.group(1)) + r"\s+AS\s*\(", m[:s0], re.IGNORECASE)
+    if cte:
+        d, end = 1, cte.end()
+        while end < s0 and d:
+            d += (m[end] == "(") - (m[end] == ")")
+            end += 1
+        out["where"] += _clauses(sql[cte.end():end - 1])["where"]
+    depth, d = [], 0  # depth[i] = 文字 i の前の括弧の深さ
+    for c in m:
+        depth.append(d)
+        d += (c == "(") - (c == ")")
+    kws = [(t.start(), t.end(), " ".join(t.group(0).upper().split())) for t in _CLAUSE_KW.finditer(m, f0) if depth[t.start()] == 0]
+    for i, (pos, kend, kw) in enumerate(kws):
+        end = kws[i + 1][0] if i + 1 < len(kws) else len(m)
+        if kw.endswith("JOIN"):
+            jt = _FROM_TBL.search(m, pos, end)
+            on = re.search(r"\bON\b", m[pos:end], re.IGNORECASE)
+            out["joins"].append({"type": kw, "logical_table": real(jt.group(1)) if jt else "",
+                                 "condition": " ".join(sql[pos + on.end():end].split()) if on else ""})
+        elif kw == "WHERE":
+            out["where"] += _conds(sql, m, depth, kend, end, real, main)
+        elif kw == "GROUP BY":
+            for _, a, b in _split_top(m, depth, kend, end, _COMMA):
+                txt = " ".join(sql[a:b].split())
+                if txt:
+                    tbl, col = _colref(txt, real, main)
+                    out["group_by"].append({"logical_table": tbl, "logical_column": col})
+        elif kw == "ORDER BY":
+            for _, a, b in _split_top(m, depth, kend, end, _COMMA):
+                txt = " ".join(sql[a:b].split())
+                dm = re.match(r"^(.*?)\s+(ASC|DESC)$", txt, re.IGNORECASE)
+                head, direction = (dm.group(1), dm.group(2).upper()) if dm else (txt, "")
+                if head:
+                    tbl, col = _colref(head, real, main)
+                    out["order_by"].append({"logical_table": tbl, "logical_column": col, "direction": direction})
+    for a, b in _split0(m, s0, f0):  # 式の別名(COUNT(DISTINCT ...) AS days 等)。物理列の別名 p.x AS id は別名に入れない
+        item = re.sub(r"^\s*DISTINCT\s+", "", sql[a:b].strip(), flags=re.IGNORECASE)
+        am = re.search(r"\bAS\s+([^\W\d]\w*)\s*$", item, re.IGNORECASE)
+        if am:
+            src = " ".join(re.sub(r"--[^\n]*", " ", item[:am.start()]).split())  # SQL のコメントは式に入れない
+            if not re.fullmatch(r"[\w.]+", src):
+                out["aliases"].append({"alias": am.group(1), "expression": src})
+    return out
+
+
+def _local_lists(fn, env):
+    """関数の中で組む文字列の並び(where = ["a", ...]; where.append("b"))を {名前: [文字列]} にする。
+    f 文字列の {' AND '.join(where)} を評価できるようにするため。要素が表せなければ X(構造だけ保つ)。
+    ponytail: 条件付きの append も全部足す(分岐は見ない)。WHERE の候補を全部出す側に倒す。"""
+    def one(e):  # 文字列の式か、モジュール定数の名前(LIVE = "..." 等)
+        v = env.get(e.id) if isinstance(e, ast.Name) else _render(e, env, True)
+        return v if isinstance(v, str) else "X"
+
+    lists = {}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.List):
+            lists[n.targets[0].id] = [one(e) for e in n.value.elts]
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
+                and isinstance(n.func.value, ast.Name) and n.func.value.id in lists and n.args):
+            lists[n.func.value.id].append(one(n.args[0]))
+    return lists
+
+
+def _merge(acc, got):
+    """同じ API の別の SQL から取れた句の行を重ねる。同じ行は 1 つだけ残す。"""
+    for k in _CLAUSE_KEYS:
+        acc[k] += [x for x in got[k] if x not in acc[k]]
+
+
+def _call_name(c):
+    """呼出の関数名(f(...) なら f、obj.f(...) なら f)。取れなければ空。"""
+    f = c.func
+    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+
+
+def _expand(errs, fn, clo):
+    """エラー文面の {式} を、呼出側の実引数で展開して text_expanded に入れる(取れなければ空)。
+    ponytail: 呼出は関数名の一致で拾う(同名の別関数を取り違える余地あり)。実引数が定数の穴だけ展開する。"""
+    params = [a.arg for a in fn.args.args]
+    sites = [c for _, f in clo for c in ast.walk(f) if isinstance(c, ast.Call) and _call_name(c) == fn.name]
+    for e in errs:
+        holes = re.findall(r"\{([^{}]+)\}", e["message"])
+        if not holes:
+            e["text_expanded"] = e["message"]
+            continue
+        e["text_expanded"] = ""
+        for site in sites:
+            amap = {params[i]: a for i, a in enumerate(site.args) if i < len(params)}
+            amap.update({k.arg: k.value for k in site.keywords if k.arg})
+            vals = [amap.get(h) for h in holes]
+            if all(isinstance(v, ast.Constant) for v in vals):
+                text = e["message"]
+                for h, v in zip(holes, vals):
+                    text = text.replace("{" + h + "}", str(v.value))
+                e["text_expanded"] = text
+                break
+    return errs
+
+
+def _auth(mods, tables):
+    """入口の関数(ディスパッチ表の名前を参照する関数)が、表を引く前に呼ぶ認証の関数を拾い、その応答の文面を返す(status は静的に取れなければ空)。
+    ponytail: 入口は表の名前の参照で、認証は _AUTH_CALL の名前一致で近似する。外れたら推測で埋めず空のままにする。"""
+    out, seen = [], set()
+    for mod in [x for x in mods.values() if x is not None]:
+        for entry in mod.funcs.values():
+            # 入口 = ディスパッチ表の名前を参照するか、dispatch / lambda_handler を呼ぶ関数(web_app の _get は表を持たず lambda_handler を呼ぶ)
+            refs = [n.lineno for n in ast.walk(entry) if (isinstance(n, ast.Name) and n.id in tables) or (isinstance(n, ast.Call) and _call_name(n) in ("dispatch", "lambda_handler"))]
+            if not refs:
+                continue
+            for c in ast.walk(entry):
+                name = _call_name(c) if isinstance(c, ast.Call) else ""
+                if not name or name in seen or c.lineno >= min(refs) or not _AUTH_CALL.search(name):
+                    continue
+                seen.add(name)
+                for m2, f2 in _callees(entry, mod, mods):
+                    if f2.name != name:
+                        continue
+                    clo = _closure(m2, f2, mods)
+                    errs = []
+                    for m3, f3 in clo:
+                        errs += _expand(_errors(f3, m3.env()), f3, clo)  # 認証の関数の応答は全部を出す(status が取れなければ空)
+                    out.append({"function": name, "applies_to": f"全 API(入口 {entry.name} がディスパッチ表を引く前に呼ぶ)",
+                                "fact": f"{mod.path.name} の {entry.name} が {name} を呼ぶ", "error_patterns": errs})
+                    break
+    return out
+
+
+def _dataset(sql, unresolved, action):
+    """SQL 1 本から [{column, table}] を作る。最上位 SELECT だけを見る(WITH の中身・副問合せの列は含めない)。"""
+    m = _mask(sql)
+    alias, real = _tables(m)
 
     rows = []
     for s, f in _depth0_selects(m):
@@ -268,6 +475,9 @@ def _errors(fn, env):
             msg = n.args[1]
             st = n.args[2] if len(n.args) > 2 else next((k.value for k in n.keywords if k.arg == "status"), None)
             status = st.value if isinstance(st, ast.Constant) else 400
+        elif isinstance(n, ast.Call) and getattr(n.func, "id", "") == "error_envelope" and len(n.args) >= 3:
+            msg = n.args[2]  # error_envelope(status, code, message)。status が定数でなければ空のまま
+            status = n.args[0].value if isinstance(n.args[0], ast.Constant) else ""
         else:
             continue
         text = _render(msg, env, False) if msg is not None else None
@@ -279,11 +489,12 @@ def _errors(fn, env):
 def extract(files):
     """backend ファイル(Path の並び)から {apis, unresolved} を作る。"""
     mods = {p.stem: Module(p) for p in files}
-    apis, unresolved = {}, []
+    apis, unresolved, tables = {}, [], set()
     for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
         for n in mod.tree.body:
             if not (isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and n.value.keys):
                 continue
+            tables.add(ast.unparse(n.targets[0]))
             for k, v in zip(n.value.keys, n.value.values):
                 # ディスパッチ表 = 「文字列 → module.func / func」の dict。他の dict(文言表など)はここで弾かれる
                 if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
@@ -298,8 +509,10 @@ def extract(files):
                     continue  # backend_files に無いモジュール(または関数でない値)は対象外
                 action, fn = k.value, tm.funcs[name]
                 dataset, errors, seen_col = [], [], set()
-                for m2, f2 in _closure(tm, fn, mods):
-                    env = m2.env()
+                clauses = {k: [] for k in _CLAUSE_KEYS}
+                clo = _closure(tm, fn, mods)
+                for m2, f2 in clo:
+                    env = {**m2.env(), **_local_lists(f2, m2.env())}
                     parts = set()  # f 文字列・+ 連結の部品。親の _render が一括で組むので単独では拾わない
                     for s in ast.walk(f2):
                         if isinstance(s, (ast.JoinedStr, ast.BinOp)):
@@ -309,35 +522,44 @@ def extract(files):
                             continue
                         sql = _render(s, env, True) if isinstance(s, (ast.JoinedStr, ast.Constant, ast.BinOp)) else None
                         if sql and _SQL_HEAD.match(sql):
+                            _merge(clauses, _clauses(sql))
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
                                     dataset.append(r)
-                    errors += _errors(f2, env)
+                    for e in _expand(_errors(f2, env), f2, clo):
+                        if e not in errors:
+                            errors.append(e)
                 keys = list(dict.fromkeys(_returns(tm, fn, mods)))
                 if not keys:
                     unresolved.append({"action": action, "reason": "return の dict キーを静的に取れない"})
                 if not dataset:
                     unresolved.append({"action": action, "reason": "SELECT 文を取れない(SQL を持たないか、動的に組んでいる)"})
                 apis[action] = {"dataset": dataset, "response_items": [{"key": x} for x in keys],
-                                "error_patterns": errors}
-    return {"apis": apis, "unresolved": unresolved}
+                                "error_patterns": errors, **clauses}
+    auth = _auth(mods, tables)
+    ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
+    for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
+        e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
+    return {"apis": apis, "unresolved": unresolved, "auth": auth}
 
 
 def selftest():
     """最小の 2 ファイルで、ディスパッチ解決・別名/CTE/テーブル・return キー・raise を assert する。"""
     import tempfile
-    h = 'import q\nA = {"get_x": q.get_x, "get_y": q.get_y}\n'
+    h = ('import q\nfrom common import identify\nA = {"get_x": q.get_x, "get_y": q.get_y}\n'
+         'def _entry(p):\n    identify(p)\n    return A[p]\n')
     qs = (
         'from common import _req\n'  # backend_files に無い同じフォルダの補助モジュールの raise も拾う
-        'COLS = ["a", "b"]\n'
+        'COLS = ["a", "b"]\nCOND = "t.b IS NULL"\n'
         'def _sel():\n    return ", ".join(f"SUM(t.{c}) AS {c}" for c in COLS)\n'
         'def get_x(p):\n'
         '    if not p:\n        raise ValidationError("必須です")\n'
         '    _req(p)\n'
-        '    sql = f"""WITH d AS (SELECT t.* FROM real_tbl t) SELECT t.id AS x_id, {_sel()}, s.name FROM d t LEFT JOIN shops s ON s.id=t.id"""\n'
+        '    w = ["t.a = %(a)s"]\n    w.append(COND)\n'  # CTE の中で組む WHERE も where に出す(局所の並び・モジュール定数を展開)
+        '    sql = f"""WITH d AS (SELECT t.* FROM real_tbl t WHERE {\' AND \'.join(w)}) SELECT t.id AS x_id, {_sel()}, s.name FROM d t LEFT JOIN shops s ON s.id=t.id"""\n'
         '    return {"rows": sql, "n": 1}\n'
-        'def get_y(p):\n'  # CTE の連鎖(t → k → 実表)は実表へ、FROM が動的な CTE は unresolved へ
+        'def get_y(p):\n    _req("日付")\n'  # CTE の連鎖(t → k → 実表)は実表へ、FROM が動的な CTE は unresolved へ
         '    sql = f"""WITH k AS (SELECT id FROM real_tbl), t AS (SELECT k.id FROM k), u AS (SELECT 1 AS z FROM {p()})\n'
         '    SELECT t.id AS y_id, u.z AS z FROM t JOIN u ON 1=1"""\n'
         '    return {"rows": sql}\n'
@@ -345,7 +567,7 @@ def selftest():
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "h.py").write_text(h, encoding="utf-8")
         (Path(d) / "q.py").write_text(qs, encoding="utf-8")
-        (Path(d) / "common.py").write_text('def _req(p):\n    raise ValidationError(f"{p} は必須")\n', encoding="utf-8")
+        (Path(d) / "common.py").write_text('def _req(p):\n    raise ValidationError(f"{p} は必須")\ndef identify(p):\n    _err("E1", "認証に失敗", 401)\n', encoding="utf-8")
         r = extract([Path(d) / "h.py", Path(d) / "q.py"])
     a = r["apis"]["get_x"]
     cols = {(x["column"], x["table"]) for x in a["dataset"]}
@@ -355,6 +577,15 @@ def selftest():
     assert "common" not in r["apis"] and set(r["apis"]) == {"get_x", "get_y"}, "補助モジュールを API として数えた"
     ycols = {(x["column"], x["table"]) for x in r["apis"]["get_y"]["dataset"]}
     assert ycols == {("id", "real_tbl")}, ycols
+    gx = r["apis"]["get_x"]
+    assert {"type": "LEFT JOIN", "logical_table": "shops", "condition": "s.id=t.id"} in gx["joins"], gx["joins"]
+    assert {"alias": "a", "expression": "SUM(t.a)"} in gx["aliases"], gx["aliases"]
+    assert [(w["logical_table"], w["logical_column"], w["operator"]) for w in gx["where"]] == [("real_tbl", "a", "="), ("real_tbl", "b", "IS")], gx["where"]
+    assert [e["status_code"] for e in r["auth"][0]["error_patterns"]] == [401], r["auth"]
+    assert r["auth"][0]["function"] == "identify", r["auth"]
+    assert any(e["text_expanded"] == "日付 は必須" and e["message"] == "{p} は必須" for e in r["apis"]["get_y"]["error_patterns"]), r["apis"]["get_y"]["error_patterns"]
+    ids = [e["id"] for a in r["apis"].values() for e in a["error_patterns"]] + [e["id"] for a in r["auth"] for e in a["error_patterns"]]
+    assert ids and len(ids) == len(set(ids)) and all(i.startswith("MSE") for i in ids), ids
     print("[selftest OK] extract_backend_draft")
     return 0
 

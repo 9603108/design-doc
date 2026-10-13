@@ -1246,6 +1246,78 @@ def check_message_code_format(merged: dict) -> list:
     return issues
 
 
+# 2026-10-13 新設: 合成後の中身の穴を ERROR で検出する（既存の検査では通ってしまう穴の機械強制）
+# 意味合い: 名前だけで処理の中身が空の共通ロジック・DB 物理名の残存・未展開の穴・メッセージ ID の形式や
+#          同じ ID に別の文面が付く不整合・DB 操作の結合/条件/集計/並び順の英語キーの空欄を止める。
+# 接続情報: 入力 = merged（中間 JSON 全体）/ 出力 = [(level, message), ...] / 呼出元 = main()
+MESSAGE_ID_STRICT_RE = re.compile(r"^MS[EWI]\d{5}$")
+BRACE_HOLE_RE = re.compile(r"\{[^{}\s]+\}")  # 空白を含まない {名前} だけを穴とみなす（JSON 風の記述を誤検出しない）
+# DB 操作の日本語キーと、それに対応する英語キー（英語キーが空なら ERROR）
+DB_OP_JP_TO_EN = (
+    ("結合", "joins"),
+    ("抽出条件", "where"),
+    ("条件", "where"),
+    ("集計", "group_by"),
+    ("並び順", "order_by"),
+)
+
+
+def _iter_strings(node, path=""):
+    """中間 JSON の全ての文字列値を (欄の道筋, 値) で順に取り出す。check_intermediate_strict が使う。
+    道筋(api_spec[0].description 等)は run_units.py の owner_of が units.json の owns と照らして差し戻し先を引く。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _iter_strings(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _iter_strings(v, f"{path}[{i}]")
+    elif isinstance(node, str):
+        yield path, node
+
+
+def check_intermediate_strict(merged: dict) -> list:
+    """2026-10-13 新設: 中身の穴を ERROR で検出する（合成後の検査）。
+
+    判定ルール:
+      (1) common_logic の要素で processing_steps も expression も空 → ERROR
+      (2) 全文字列に 'db_op_' が残る → ERROR
+      (3) 全文字列に '〈' または波括弧の穴 '{名前}' が残る → ERROR
+      (4) messages の ID が ^MS[EWI]\\d{5}$ に合わない → ERROR / 同じ ID に別の文面が付く → ERROR
+      (5) db_operations の要素に日本語キー（結合・抽出条件・条件・集計・並び順）の値があり、
+          対応する英語キー（joins / where / group_by / order_by）が空 → ERROR
+    接続情報: 呼出元 = main() / 入力 = merged / 出力 = [(level, message), ...]
+    """
+    issues = []
+    # (1) 名前だけの共通ロジックを通さない
+    for cl in merged.get("common_logic", []) or []:
+        cl_no = cl.get("no") or cl.get("logic_id") or "?"
+        if not (cl.get("processing_steps") or []) and not str(cl.get("expression") or "").strip():
+            issues.append(("ERROR", f"common_logic[{cl_no}]: processing_steps も expression も空（処理の中身が無い。名前だけで通さない）"))
+    # (2)(3) 物理名の残存と未展開の穴
+    for path, s in _iter_strings(merged):
+        if "db_op_" in s and not path.endswith("legacy_id"):  # legacy_id は旧 ID の控え(docx に出ない)
+            issues.append(("ERROR", f"{path}: 物理名 'db_op_' が文字列に残存: '{s[:80]}'"))
+        if "〈" in s or BRACE_HOLE_RE.search(s):
+            issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
+    # (4) メッセージ ID の形式と、同じ ID の文面の一致
+    seen_msg = {}
+    for m in merged.get("messages", []) or []:
+        mid = m.get("message_id") or m.get("id") or "?"
+        text = str(m.get("message") or "")
+        if not MESSAGE_ID_STRICT_RE.match(str(mid)):
+            issues.append(("ERROR", f"messages[{mid}]: メッセージ ID が ^MS[EWI]\\d{{5}}$ に合わない（例 MSE00001）"))
+        if mid in seen_msg and seen_msg[mid] != text:
+            issues.append(("ERROR", f"messages[{mid}]: 同じ ID に別の文面が付いている（「{seen_msg[mid][:40]}」と「{text[:40]}」）"))
+        seen_msg.setdefault(mid, text)
+    # (5) DB 操作の日本語キーに対応する英語キーの空欄
+    for op in merged.get("db_operations", []) or []:
+        op_id = op.get("id") or "?"
+        for jp, en in DB_OP_JP_TO_EN:
+            if str(op.get(jp) or "").strip() and not str(op.get(en) or "").strip():
+                issues.append(("ERROR", f"db_operations[{op_id}]: 日本語キー「{jp}」に値があるのに英語キー「{en}」が空（対応する英語キーに書く）"))
+    return issues
+
+
 def main():
     # 目的: 引数で指定された機能名の中間 JSON を検証する。引数なしなら環境変数 FEATURE_NAME、
     #       どちらも無ければ _config_loader 側が「feature_name 未指定」で止める（既定の機能名は持たない）。
@@ -1313,6 +1385,9 @@ def main():
     all_issues.extend(check_table_name_placeholders(merged))
     all_issues.extend(check_file_descriptions(merged))
     all_issues.extend(check_message_code_format(merged))
+
+    # 2026-10-13: 中身の穴（名前だけの共通ロジック・物理名残存・未展開の穴・メッセージ ID・DB 操作の英語キー空欄）
+    all_issues.extend(check_intermediate_strict(merged))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]

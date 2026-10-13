@@ -210,6 +210,24 @@ def main():
     # common_logic をマージ（Agent B + Agent D）
     common_logic = (cs.get("common_logic", []) or []) + (pe.get("common_logic_peripheral", []) or [])
     common_logic = renumber_common_logic(common_logic)
+    # 手順書の欄名（name/expression/used_in/zero_division/null_handling）を generate_docx.js の読み先へ読み替える。
+    #   意味合い: sectionCommonLogic（generate_docx.js 3767 付近）は description/used_by_processes/processing_steps を読むため、
+    #             欄名が違うと 5.5 章が空になる。既にある欄は上書きしない。
+    #   接続: 読み替えの入力は cs/pe の common_logic。出力は merged["common_logic"]（下の merged 組立）。
+    for item in common_logic:
+        if not item.get("description") and item.get("expression"):
+            item["description"] = item["expression"]
+        if not item.get("used_by_processes") and item.get("used_in"):
+            used = item["used_in"]
+            item["used_by_processes"] = [used] if isinstance(used, str) else list(used)
+        if not item.get("processing_steps"):
+            # sectionCommonLogic は processing_steps[] を {no, kind, description} で読む(文字列だと空セルになる)
+            vals = [(kind, item[key]) for key, kind in
+                    (("expression", "演算"), ("zero_division", "0除算"), ("null_handling", "NULL"))
+                    if item.get(key)]
+            if vals:
+                item["processing_steps"] = [{"no": i, "kind": k, "description": v}
+                                            for i, (k, v) in enumerate(vals, 1)]
 
     # validations は Agent B のフロント側のみ採用（バック側は messages_backend に含まれるためここでは別建てしない）
     validations = cs.get("validations_frontend", []) or []

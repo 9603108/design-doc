@@ -173,6 +173,55 @@ def selftest():
     return 0
 
 
+# 穴あき文の印: 〈 と {…}(省略記号入りの波括弧)。{key} のような下書きの置換語は穴ではないので拾わない
+HOLE_RE = re.compile(r"〈|\{\s*(?:…|\.\.\.)[^{}]*\}")
+
+
+def _strings(node):
+    """断片の中の文字列を (値) で順に返す"""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings(v)
+
+
+def check_unit_extras(frags, directory):
+    """--units の追加検査(ERROR)。(a) S1 の画面項目に react 下書きの display_rows の行名が全部ある /
+    (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない。
+    問題は「[種別] 場所: 内容 → 差し戻し先 <単位>」。呼出元: main_units。"""
+    problems = []
+    s1 = frags.get("S1")
+    if s1 is not None:
+        for p in sorted(Path(directory).glob("*_react_draft.json")):
+            try:
+                rows = json.loads(p.read_text(encoding="utf-8")).get("display_rows") or []
+            except (OSError, json.JSONDecodeError):
+                continue
+            have = {it.get("item_name") for it in (s1.get("screen_layout") or {}).get("items") or [] if isinstance(it, dict)}
+            lack = [lb for r in rows for lb in r.get("labels") or [] if lb not in have]
+            if lack:
+                problems.append(f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1")
+    for op in (frags.get("H2") or {}).get("db_operations") or []:
+        for fld in ("joins", "where"):
+            bad = list(dict.fromkeys(k for row in op.get(fld) or [] if isinstance(row, dict) for k in row if not k.isascii()))
+            if bad:
+                problems.append(f"[英語キー] db_operations[{op.get('id')}].{fld}: 日本語のキー {', '.join(bad)}(英語のキー名で書く) → 差し戻し先 H2")
+    h4 = {m.get("message_id"): m.get("message") for m in (frags.get("H4") or {}).get("messages_backend") or [] if isinstance(m, dict)}
+    for api in (frags.get("S2") or {}).get("api_spec") or []:
+        for e in api.get("error_patterns") or []:
+            mid, txt = e.get("message_id"), e.get("message")
+            if mid in h4 and txt and h4[mid] and txt != h4[mid]:
+                problems.append(f"[文面] api_spec[{api.get('action')}].error_patterns: {mid} の文面が S2 と H4 で違う → 差し戻し先 S2 か H4")
+    for unit, frag in frags.items():
+        if any(HOLE_RE.search(s) for s in _strings(frag)):
+            problems.append(f"[穴あき] _unit_{unit}.json: 〈 または {{…}} の穴が残っている → 差し戻し先 {unit}")
+    return problems
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -189,6 +238,8 @@ def main_units(directory, only=None):
         print(f"[入力不正] {directory} に _unit_*.json が無い", file=sys.stderr)
         return 2
     problems += _units.check_all(spec, frags, only)
+    extra = check_unit_extras(frags, directory)
+    problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
     for pr in problems:
         print(pr)
     if problems:

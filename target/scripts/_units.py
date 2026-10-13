@@ -194,6 +194,45 @@ def check_fragments(spec, frags, only=None):
     return problems
 
 
+def _backend_draft_facts():
+    """backend 下書き(<画面>_backend_draft.json)から (認証の fact, {文面: メッセージ ID}) を取る。
+    呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。下書きが無ければ ("", {})。"""
+    from _config_loader import INTERMEDIATE_DIR
+    fact, msgs = "", {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        auths = d.get("auth") or []
+        fact = fact or next((a["fact"] for a in auths if a.get("fact")), "")
+        pats = [e for a in (d.get("apis") or {}).values() for e in a.get("error_patterns") or []]
+        pats += [e for a in auths for e in a.get("error_patterns") or []]
+        for e in pats:
+            for key in ("message", "text_expanded"):  # H4 は型文のままか展開済みの文面のどちらかで書く
+                if e.get("id") and e.get(key):
+                    msgs[e[key]] = e["id"]
+    return fact, msgs
+
+
+def _align_message_ids(out, draft_msgs):
+    """H4 の messages_backend が下書きと同じ文面で別の ID を書いていたら、下書きの ID へ寄せる。
+    参照している error_patterns・validations_frontend の message_id も同じ置換にする(参照切れを作らない)。"""
+    rename = {}
+    for m in out.get("messages_backend") or []:
+        want = draft_msgs.get(m.get("message"))
+        if want and m.get("message_id") != want:
+            rename[m["message_id"]] = want
+            m["message_id"] = m["code"] = want
+    if not rename:
+        return
+    refs = [e for a in out.get("api_spec") or [] for e in a.get("error_patterns") or []]
+    refs += [v for v in out.get("validations_frontend") or []]
+    for r in refs:
+        if isinstance(r, dict) and r.get("message_id") in rename:
+            r["message_id"] = rename[r["message_id"]]
+
+
 def compose(spec, frags, project_config=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
@@ -217,8 +256,19 @@ def compose(spec, frags, project_config=None):
     # 同じ status_code が既にあれば足さず、認証の欄が埋まっていれば触らない。設定が無ければ何もしない。
     # 接続情報: 呼出元 = merge_partials.py --compose-units が _config_loader.load_project_config() の値を渡す。
     # 足した message_id は messages_backend にも入れ、check_refs の参照検査で実在を確かめる。
-    common = (project_config or {}).get("common_errors") or []
+    common = list((project_config or {}).get("common_errors") or [])
     auth_desc = (project_config or {}).get("auth_description") or ""
+    draft_msgs = {}
+    if project_config is not None:
+        # backend 下書きの auth.fact(認証の掛かり方の事実)と、メッセージの ID・文面を正として使う
+        auth_fact, draft_msgs = _backend_draft_facts()
+        if not auth_desc and auth_fact:
+            auth_desc = auth_fact
+            # 認証が掛かるなら 401/403 は全 API 共通のエラー。設定に同じ status_code があれば足さない
+            for sc, cond in ((401, "認証情報が無い、または無効"), (403, "操作の権限が無い")):
+                if not any(c.get("status_code") == sc for c in common):
+                    common.append({"status_code": sc, "condition": cond})
+    _align_message_ids(out, draft_msgs)
     if common or auth_desc:
         for api in out.get("api_spec") or []:
             if auth_desc and not api.get("auth"):

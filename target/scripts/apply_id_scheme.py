@@ -269,6 +269,9 @@ def update_cross_references(data: dict, flat_map: dict):
         "common_logic_refs",     # front_processes[].common_logic_refs[]: CL#
         "message_ref",           # process_flows[].steps[].message_ref: MS#
         "trigger_events",        # process_flows[].trigger_events[]: EV#
+        # データ起源の source_ref は db_op_ の内部名を持つため、表示用 ID への置換対象に加える（generate_docx.js 2349 の srcRef を読む）
+        "source_ref",
+        "related_db_operations",  # api_spec[].related_db_operations[]: db_op_ の内部名 → DB#
         # 注: v50 で event_code は廃止（events[].legacy_event_code に保存）、参照は全て event_ref に統一済。
         #     REF_FIELDS から event_code を削除（migrate_v49_event_unify.py で全 rename 済）
     }

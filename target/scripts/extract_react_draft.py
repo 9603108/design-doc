@@ -332,6 +332,8 @@ def analyze_sources(source_files, api_call_functions):
                 "element": tags[-1].group(1) if tags else "",
                 "attr": m.group(1), "handler": expr, "actions": acc["actions"], "texts": acc["texts"],
                 "ui_label": _ui_label(t, tags, m, be),
+                # 目的: 開きタグの文字(disabled の有無)を連続操作の判定に渡す。接続: _continuous_ops()
+                "tag": t[(tags[-1].start() if tags else m.start()):max(be, t.find(">", be))],
                 "empty": [(x, branches[x]) for x in sorted(acc["states"]) if x in branches],
             })
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
@@ -466,6 +468,44 @@ def build_draft(links, unresolved, screen_name):
     }
 
 
+def _display_rows(sources):
+    """TSX の モジュール直下の定数配列(const X = [ {label: '...'}, ... ])から、表示行の名前を集める。
+
+    呼出元: main()。意味合い: 画面の表示行(左右の欄など)を下書きに残すため、配列の名前と label/header/title の文言を出す。
+    接続: 出力は draft["display_rows"]。配列の中身は文字列リテラルの label/header/title だけを拾う(推測で足さない)。
+    """
+    rows = []
+    for p in sources:
+        if p.suffix not in (".tsx", ".jsx"):
+            continue
+        t = p.read_text(encoding="utf-8")
+        for m in re.finditer(r"^const\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*\[", t, re.M):
+            end = _close(t, m.end() - 1)
+            labels = [x.group(1) for x in re.finditer(r"\b(?:label|header|title)\s*:\s*['\"]([^'\"]+)['\"]", t[m.end():end])]
+            if labels:
+                rows.append({"array": m.group(1), "labels": labels})
+    return rows
+
+
+def _continuous_ops(links):
+    """onClick の button ごとに、読込中の無効化と取消処理の有無を判定する。
+
+    呼出元: main()。意味合い: 連続操作(読込中にもう一度押せるか、押したら前の要求を止めるか)を機械で出す。
+    接続: links の tag(開きタグ)と texts(辿った本体)を見る。判定は文字の一致だけ(推測で足さない)。
+    """
+    ops = []
+    for link in links:
+        if link["attr"] != "onClick" or link["element"] != "button":
+            continue
+        label = link.get("ui_label") or link["handler"]
+        disabled = bool(re.search(r"disabled=\{[^}]*(?:loading|busy|pending|fetch)", link.get("tag", ""), re.I))
+        cancel = bool(re.search(r"AbortController|\.abort\(", "\n".join(link["texts"])))
+        fact = (f"ボタン「{label}」は読込中に{'無効化される' if disabled else '無効化されない'}。"
+                f"取消処理は{'ある' if cancel else '無い'}。")
+        ops.append({"button": label, "disabled_while_loading": disabled, "cancel": cancel, "fact": fact})
+    return ops
+
+
 def write_draft(draft, out_path):
     """下書きを UTF-8 の JSON で書く(親フォルダは作る)。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +552,9 @@ def main(argv=None):
 
     links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
     draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
+    # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
+    draft["display_rows"] = _display_rows(sources)
+    draft["continuous_operation"] = _continuous_ops(links)
     write_draft(draft, Path(args.out))
     # api.ts から抜いた断片は下書きと同じフォルダへ、<機能名>_api_excerpt.ts として書く(機能名は config の名前から)
     if excerpt:

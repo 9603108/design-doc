@@ -123,6 +123,8 @@ KEY_ALIAS = {
     "backend_processes.overview": "api_spec.description",
     "validations": "validations_frontend",
     "messages": "messages_backend",
+    # front_processes[].steps[] は migrate_v17_to_v18.py が event_processes[].details から作る
+    "front_processes.steps.description": "event_processes.details",
 }
 # WHY: 行が指す欄と直す欄が違う検査。「400 のエラーが validations に無い」は error_patterns(S2)はソースどおりで、
 # 欠けているのは validations の行なので、validations を書く単位(H4)へ戻す。
