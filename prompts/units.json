@@ -33,6 +33,7 @@
         "api_spec[].response_items[].expression",
         "api_spec[].response_items[].description",
         "api_spec[].response_to_screen_mapping",
+        "api_spec[].response_to_screen_mapping_none_reason",
         "api_spec[].error_patterns",
         "api_spec[].error_patterns_none_reason",
         "db_operations[].dataset_name",

@@ -362,7 +362,8 @@ def check_response_to_screen_mapping(merged: dict) -> list:
         # 2026-10-12: 返す項目があるのに画面への写しが無いと、migrate_v48_to_v49 が response_mapping の step を作れず
         #             5.1 の「画面表示変換」と「レスポンス→画面項目マッピング」表が丸ごと消える
         if api.get("response_items") and not mapping and not api.get("response_to_screen_mapping_none_reason"):
-            issues.append(("ERROR", f"api_spec[{i}]({api.get('action', '')}): response_items があるのに response_to_screen_mapping が空"
+            # 欄の道筋を api_spec[i].response_to_screen_mapping の形で先頭に置く(run_units.owner_of が書いた単位 S2 を引けるように。action は括弧で後ろ)
+            issues.append(("ERROR", f"api_spec[{i}].response_to_screen_mapping({api.get('action', '')}): response_items があるのに response_to_screen_mapping が空"
                                     "（{api_field_path, screen_area_no, screen_item_name, transform} を書く。画面に出さない API なら response_to_screen_mapping_none_reason に理由を書く）"))
         # 2026-10-12: パスに「api.ts の apiConfig.salesPath」のようなソース上の在り処を書くと、エンドポイント欄が URL にならない
         path = str(api.get("path") or "")
@@ -434,7 +435,8 @@ def check_screen_terminology(merged: dict) -> list:
                 # external/internal の2階層目以降は自由（特殊トリガーの function 名等）
                 continue
             issues.append(("WARN" if not is_strict else "ERROR",
-                          f"events[{e.get('event_code','?')}].location[{i}]='{elem}' が screen_layout の権威語彙にない"))
+                          f"events[{e.get('event_code') or e.get('legacy_event_code') or e.get('no') or '?'}].location[{i}]='{elem}' が screen_layout の権威語彙にない"
+                          "（H1 の trigger の項目名を S1 の item_name の字面のまま書く。種別の語を付けない）"))
 
     # ルール18: trigger_groups[].triggers[].location 厳密一致
     for g in merged.get("trigger_groups", []) or []:
@@ -447,7 +449,8 @@ def check_screen_terminology(merged: dict) -> list:
                 if not is_strict and i >= 1:
                     continue
                 issues.append(("WARN" if not is_strict else "ERROR",
-                              f"trigger_groups[kind={kind}].triggers[no={t.get('trigger_no')}].location[{i}]='{elem}' が screen_layout の権威語彙にない"))
+                              f"trigger_groups[kind={kind}].triggers[no={t.get('trigger_no')}].location[{i}]='{elem}' が screen_layout の権威語彙にない"
+                              + ("（画面操作の trigger は events の trigger から作る。H1 の trigger の項目名を直す）" if is_strict else "")))
 
     # ルール20: response_to_screen_mapping.screen_item_name 厳密一致
     for bp in merged.get("backend_processes", []) or []:
@@ -718,7 +721,7 @@ def check_coverage_and_details(merged: dict) -> list:
             mid = e.get("message_id")
             if str(e.get("status_code")) == "400" and mid and mid not in vl_msgs:
                 issues.append(("ERROR", f"api_spec[{api.get('action', '')}].error_patterns: 400 のエラー {mid} が validations に無い"
-                                        "（入力の検査として validations に1件書き、message_id で結ぶ）"))
+                                        "（バック側の入力検査も validations に1件書き、message_id で結ぶ。画面に検査が無ければ kind を「API検査」にする）"))
     for ep in merged.get("event_processes", []) or []:
         ref = ep.get("event_ref") or ep.get("event_code") or "?"
         raw = ep.get("details") or []
@@ -1260,6 +1263,9 @@ def check_message_code_format(merged: dict) -> list:
 # 接続情報: 入力 = merged（中間 JSON 全体）/ 出力 = [(level, message), ...] / 呼出元 = main()
 MESSAGE_ID_STRICT_RE = re.compile(r"^MS[EWI]\d{5}$")
 BRACE_HOLE_RE = re.compile(r"\{[^{}\s]+\}")  # 空白を含まない {名前} だけを穴とみなす（JSON 風の記述を誤検出しない）
+# 2026-10-13: 画面項目の例示値は、実行時に決まる値(金額・件数・日付など)を {金額} 円 のように書式の例として書く(S1 手順書)。
+# 具体的な値はソースに無く verify_vs_source が止めるため。この道筋の {名前} は未展開の穴とみなさない
+EXAMPLE_PATH_RE = re.compile(r"^screen_layout\.items\[\d+\]\.example$")
 # DB 操作の日本語キーと、それに対応する英語キー（英語キーが空なら ERROR）
 DB_OP_JP_TO_EN = (
     ("結合", "joins"),
@@ -1305,7 +1311,8 @@ def check_intermediate_strict(merged: dict) -> list:
     for path, s in _iter_strings(merged):
         if "db_op_" in s and not path.endswith("legacy_id"):  # legacy_id は旧 ID の控え(docx に出ない)
             issues.append(("ERROR", f"{path}: 物理名 'db_op_' が文字列に残存: '{s[:80]}'"))
-        if "〈" in s or BRACE_HOLE_RE.search(s):
+        # 画面項目の例示値(screen_layout.items[].example)の {名前} は、実行時に決まる値の書式の例として書く正式な書き方(S1 手順書)。穴とみなさない。〈 は従来どおり ERROR
+        if "〈" in s or (BRACE_HOLE_RE.search(s) and not EXAMPLE_PATH_RE.match(path)):
             issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
     # (4) メッセージ ID の形式と、同じ ID の文面の一致
     seen_msg = {}

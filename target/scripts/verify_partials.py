@@ -355,6 +355,31 @@ def check_src_warn(frags):
     return [f"[WARN] [出典] 行 {len(lack)} 件の src が空(ソースの根拠が不明): {sample} → 差し戻し先 {', '.join(sorted(units))}"]
 
 
+def check_composed_gaps(composed, frags):
+    """合成した形の穴を、verify_intermediate(最後の検査)より前の単位の検査で拾う(ERROR)。呼出元: main_units。
+    (a) [検査の漏れ] 400 の error_patterns(S2)の message_id が validations_frontend(H4)に無い。バック側の入力検査も validations に1件書く
+        決まり(画面に検査が無ければ kind=API検査)。最後の検査と同じ判定を、S2・H4 の断片が揃った時点で出す → 差し戻し先 H4。
+    (b) [画面への写し] S2 が書いた API に response_items があるのに response_to_screen_mapping も response_to_screen_mapping_none_reason も無い
+        → 差し戻し先 S2。どちらも相手の断片が無い(並行の途中)ときは見ない。"""
+    problems = []
+    s2_actions = {a.get("action") for a in (frags.get("S2") or {}).get("api_spec") or [] if isinstance(a, dict)}
+    if frags.get("S2") is not None:
+        for a in composed.get("api_spec") or []:
+            if a.get("action") in s2_actions and a.get("response_items") and not a.get("response_to_screen_mapping") \
+                    and not a.get("response_to_screen_mapping_none_reason"):
+                problems.append(f"[画面への写し] api_spec[{a.get('action')}].response_to_screen_mapping: response_items があるのに空。"
+                                "画面のどの項目に出すかを書く(画面に出さない API だけ response_to_screen_mapping_none_reason に理由) → 差し戻し先 S2")
+    if frags.get("S2") is not None and frags.get("H4") is not None:
+        have = {v.get("message_id") for v in composed.get("validations_frontend") or [] if isinstance(v, dict)}
+        for a in composed.get("api_spec") or []:
+            for e in a.get("error_patterns") or []:
+                mid = e.get("message_id") if isinstance(e, dict) else None
+                if mid and str(e.get("status_code")) == "400" and mid not in have:
+                    problems.append(f"[検査の漏れ] api_spec[{a.get('action')}].error_patterns: 400 のエラー {mid} が validations_frontend に無い。"
+                                    "バック側の入力検査も1件書き message_id で結ぶ(画面に検査が無ければ kind は「API検査」) → 差し戻し先 H4")
+    return problems
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -372,6 +397,8 @@ def main_units(directory, only=None):
         return 2
     problems += _units.check_all(spec, frags, only)
     extra = check_unit_extras(frags, directory)
+    # 合成後の穴(画面への写しの欠け・400 の検査の漏れ)。project_config を渡して下書きの展開済み ID へ寄せた形で見る
+    extra += check_composed_gaps(_units.compose(spec, frags, {}), frags)
     problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
     for pr in problems:
         print(pr)
@@ -414,6 +441,18 @@ def selftest_units():
         "S3": {"event_processes": [{"event_code": "EV01", "details": ["入力を確かめる", "・save をリクエストする"]}]},
     }
     assert _units.check_all(spec, good) == [], f"良い断片で問題が出た: {_units.check_all(spec, good)}"
+    # 合成後の穴: 画面への写しが空・400 の検査が validations に無いと、断片の段階で S2・H4 へ戻す(最後の検査 verify_intermediate を待たない)
+    assert check_composed_gaps(_units.compose(spec, good), good) == [], check_composed_gaps(_units.compose(spec, good), good)
+    gap = copy.deepcopy(good)
+    gap["S2"]["api_spec"][0]["response_to_screen_mapping"] = []
+    gap["S2"]["api_spec"][0]["error_patterns"].append({"condition": "形式が違う", "status_code": 400, "message_id": "MSE00001"})
+    out = check_composed_gaps(_units.compose(spec, gap), gap)
+    assert [p.split(" ")[0] for p in out] == ["[画面への写し]", "[検査の漏れ]"] and out[0].endswith("差し戻し先 S2") and out[1].endswith("差し戻し先 H4"), out
+    assert not check_composed_gaps(_units.compose(spec, {"S2": gap["S2"]}), {"S2": gap["S2"]})[1:], "H4 が未着でも [検査の漏れ] を出した"
+    gap["S2"]["api_spec"][0]["response_to_screen_mapping_none_reason"] = "画面に出さない"
+    gap["H4"]["validations_frontend"] = [{"field": "確定", "rule": "形式", "applied_when": "API が受けたとき", "kind": "API検査", "message_id": "MSE00001"}]
+    assert check_composed_gaps(_units.compose(spec, gap), gap) == [], check_composed_gaps(_units.compose(spec, gap), gap)
+    assert _units.check_all(spec, gap) == [], "none_reason・kind=API検査 が分担表・検査で通らない: " + str(_units.check_all(spec, gap))
     comp = _units.compose(spec, good)
     assert comp["api_spec"][0]["description"] == "受注を保存する" and comp["api_spec"][0]["method"] == "POST", "合成で欄が落ちた"
     assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "source": {"type": "const"}}, "行の合成が違う"
@@ -523,6 +562,12 @@ def selftest_units():
         return [m for lv, m in vi.check_description_granularity(
             {"backend_processes": [{"process_id": "BE1", "overview": "POS会計を一覧にする"}]}, {"source_identifiers": src_idents}) if "物理名" in m]
     assert not phys([]) and phys(["POS"]), "略語の物理名判定が違う"
+    # 画面項目の例示値は、実行時に決まる値の {名前} の穴を正式に認める(未展開の穴の ERROR にしない)。他の欄の {名前} と 〈 は従来どおり ERROR
+    holes = {"screen_layout": {"items": [{"item_name": "総売上", "example": "{金額} 円"}, {"item_name": "件数", "example": "{件数} 点 {金額} 円"}]},
+             "events": [{"content": "{金額} を出す"}], "notes": ["〈例〉"]}
+    got = [m for lv, m in vi.check_intermediate_strict(holes) if "未展開の穴" in m]
+    assert len(got) == 2 and all("screen_layout" not in m for m in got), got
+    assert [m for lv, m in vi.check_intermediate_strict({"screen_layout": {"items": [{"example": "〈金額〉 円"}]}}) if "未展開の穴" in m], "example の 〈 は ERROR のまま"
     # src が空の行は件数を1行の [WARN] にまとめる。src が全部ある断片、EV00 だけの断片は出さない
     src_ok = {"H1": {"events": [{"event_code": "EV01", "src": [{"file": "x", "line_start": 1, "line_end": 2}]}]}}
     assert check_src_warn(src_ok) == [], "src が揃った断片で WARN を出した"

@@ -390,6 +390,8 @@ def selftest():
     got = check_kinds(vs, [], beh)
     assert len(got) == 1 and "VL1" in got[0] and "入力検査" in got[0], got
     assert check_kinds([{"no": "VL3", "field": "合計", "kind": "絞り込み"}], [], beh) and not check_kinds(vs, [], [])
+    # kind=API検査(バック側の入力検査。H4 手順書)は、画面に input_check が無くても [種別] にしない(画面の検査だけを見る照合の対象外)
+    assert check_kinds([{"no": "VL9", "field": "集計開始日", "rule": "YYYY-MM-DD の形式", "kind": "API検査"}], [], beh) == []
     jsx = [{"tag": "select", "label": "店舗", "item_type_hint": "ComboBox"}, {"tag": "input", "label": "開始", "item_type_hint": "Calendar"}]
     assert check_items([{"item_name": "店舗", "item_type": "ComboBox"}, {"item_name": "開始", "item_type": "Calendar"}], jsx) == []
     got = check_items([{"item_name": "店舗", "item_type": "ComboBox"}, {"item_name": "開始", "item_type": "Input"}, {"item_name": "幻", "item_type": "Button"}], jsx)

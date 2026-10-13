@@ -233,7 +233,7 @@
 - `items[].area_ref`: その項目が属する `areas[].area_no` への参照
 - `items[].item_type`: `Label` / `Input` / `Calendar` / `TimePicker` / `Checkbox` / `RadioButton` / `FileUpload` / `TextArea` / `ComboBox` / `Button` / `Grid` / `Link`
 - `items[].event_code`: イベントが紐づく場合のみ。`events[].event_code` と一致すること
-- `items[].example`（string、任意。フェーズB施策B3で新設）: 画面項目の入力例・表示例（例: 「2026/07」「山田太郎」）。追加のみで既存フィールドへの影響なし
+- `items[].example`（string、任意。フェーズB施策B3で新設）: 画面項目の入力例・表示例（例: 「2026/07」「山田太郎」）。追加のみで既存フィールドへの影響なし。固定文言はソースの文字列そのまま、実行時に決まる値は具体値を書かず書式を `{名前}` の穴で書く（例: `{金額} 円`、`{件数} 点 {金額} 円`）。example の `{名前}` は正式な書き方で、verify_intermediate の「未展開の穴」ERROR の対象外（他の欄の `{名前}`・`〈` は従来どおり ERROR）。docx の例示値列にはそのまま出る
 
 **画面用語の権威ソース:**
 

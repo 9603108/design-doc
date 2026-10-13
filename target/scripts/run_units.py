@@ -110,12 +110,15 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     ]
     # WHY: S1 と S2 は並行に書くため、S2 が画面項目名を推測して S1 と食い違い差し戻しになる(run3 で52件)。
     # S2 にだけ、下書き(extract_react_draft の出力)にある画面の文言を渡し、screen_item_name をそれに揃えさせる。
-    # 出所: events[].ui_label(操作の表示名)と display_rows[].labels(表示行の名前)。下書きが無ければ何も足さない。
+    # 出所: events[].ui_label(操作の表示名)・display_rows[].labels(表示行の名前)・jsx_elements[].label(入力欄・選択欄の名前)。
+    # jsx_elements を入れないと、イベントに表示名の無い選択欄(店舗の選択欄など。ui_label が空)が一覧から落ち、
+    # 選択肢に使う API(店舗一覧)の response_to_screen_mapping が空になる(2026-10-13 POS会計レポート)。下書きが無ければ何も足さない。
     if u == "S2":
         draft = INTER / f"{feat}_react_draft.json"
         if draft.exists():
             d = json.loads(draft.read_text(encoding="utf-8"))
             labels = [e["ui_label"] for e in d.get("events", []) if e.get("ui_label")]
+            labels += [j["label"] for j in d.get("jsx_elements", []) if j.get("label")]
             labels += [x for r in d.get("display_rows", []) for x in r.get("labels", [])]
             labels = list(dict.fromkeys(labels))
             if labels:
@@ -140,10 +143,15 @@ KEY_ALIAS = {
     "messages": "messages_backend",
     # front_processes[].steps[] は migrate_v17_to_v18.py が event_processes[].details から作る
     "front_processes.steps.description": "event_processes.details",
+    # 画面操作の trigger(trigger_groups[].triggers[])は events[].trigger から migrate_v17_to_v18.py が作る。location の語彙違反は H1 の trigger の書き方
+    # (検査の文中の「screen_layout の権威語彙」に引かれて S1 へ誤って振られていた)
+    "trigger_groups.triggers": "events",
 }
 # WHY: 行が指す欄と直す欄が違う検査。「400 のエラーが validations に無い」は error_patterns(S2)はソースどおりで、
 # 欠けているのは validations の行なので、validations を書く単位(H4)へ戻す。
-MSG_TO_KEY = [(re.compile(r"validations に無い"), "validations_frontend")]
+MSG_TO_KEY = [(re.compile(r"validations に無い"), "validations_frontend"),
+              # 画面への写しの欠けは S2 の欄(行の道筋が api_spec[0](action) の形で欄名を持たない古い文面も同じ単位へ)
+              (re.compile(r"response_to_screen_mapping が空"), "api_spec.response_to_screen_mapping")]
 
 
 def owner_of(line, units):
@@ -251,7 +259,29 @@ def selftest():
         "  [ERROR] 何の欄か分からない\n"
         "  [WARN] backend_processes[BE1].overview 長い\n", units)
     assert {u: len(v) for u, v in s.items()} == {"H4": 1, "S2": 1, "H2": 1, "H3": 1, "unknown": 1}, s
+    # 2026-10-13: 画面への写しの欠けは S2。画面操作 trigger の location の語彙違反は H1(文中の「screen_layout の権威語彙」で S1 に誤振りしない)
+    s = parse_sendbacks(
+        "  [ERROR] api_spec[0].response_to_screen_mapping(list_pos_shops): response_items があるのに response_to_screen_mapping が空（x）\n"
+        "  [ERROR] api_spec[0](list_pos_shops): response_items があるのに response_to_screen_mapping が空（古い文面）\n"
+        "  [ERROR] events[EV7].location[2]='空欄項目も表示チェックボックス' が screen_layout の権威語彙にない\n"
+        "  [ERROR] trigger_groups[kind=screen_operation].triggers[no=TR6].location[2]='空欄項目も表示チェックボックス' が screen_layout の権威語彙にない\n"
+        "  [ERROR] screen_layout.items[2].example: 何か\n", units)
+    assert {u: len(v) for u, v in s.items()} == {"S2": 2, "H1": 2, "S1": 1}, s
     assert parse_sendbacks("ERROR foo → 差し戻し先 S1", units) == {"S1": ["ERROR foo → 差し戻し先 S1"]}
+    # S2 の依頼文の画面項目名の一覧に、イベントに表示名の無い選択欄(jsx_elements の label)も入る
+    import tempfile
+    global INTER
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "テスト機能_react_draft.json").write_text(json.dumps({
+            "events": [{"event_code": "EV02", "ui_label": ""}, {"event_code": "EV01", "ui_label": "表示"}],
+            "jsx_elements": [{"tag": "select", "label": "店舗"}, {"tag": "span", "label": ""}],
+            "display_rows": [{"labels": ["総売上"]}]}, ensure_ascii=False), encoding="utf-8")
+        old, INTER = INTER, Path(td)
+        try:
+            p = build_prompt(units, "テスト機能", "S2")
+        finally:
+            INTER = old
+    assert "- 店舗\n" in p and "- 表示\n" in p and "- 総売上\n" in p, p
     # units 表に無い差し戻し先(S0 など)は unknown に入れる。units を渡さなければ従来どおり名前のまま
     assert parse_sendbacks("[WARN] x → 差し戻し先 S0", units) == {"unknown": ["[WARN] x → 差し戻し先 S0"]}
     assert sorted(parse_sendbacks("x → 差し戻し先 S0,S1,H9", units)) == ["S1", "unknown"]
