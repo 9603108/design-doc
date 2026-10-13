@@ -705,6 +705,11 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
                     "dataset": db_op.get("dataset", []),
                     "joins": db_op.get("joins", []),
                     "where": db_op.get("where", []),
+                    # E3: GROUP BY・集計(関数・対象・FILTER・OVER・別名・範囲)・HAVING・別名の式も落とさず届ける(generate_docx.js の renderDbOperationDetail が描く)
+                    "group_by": db_op.get("group_by", []),
+                    "aggregate": db_op.get("aggregate", []),
+                    "having": db_op.get("having", []),
+                    "aliases": db_op.get("aliases", []),
                     "order_by": db_op.get("order_by", []),
                     "insert_values": db_op.get("insert_values", []),
                     "update_values": db_op.get("update_values", []),

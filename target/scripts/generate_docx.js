@@ -2496,6 +2496,41 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
       [1, 3, 3, 1, 3, 1, 3]
     ));
   }
+  // E3: グルーピング・集計・並び順。where の後・登録値の前。空の表は出さない。
+  // 接続: 入力 = migrate_v17_to_v18.build_backend_processes が db_op_detail へ写す group_by / aggregate / order_by(H2 が書き、下書きの features・group_by が元)
+  // 任意の欄(when・filter・over・scope・alias・target)は無いのが通常の形なので空欄で描く(値の欠落を隠すものではない)
+  const subTitle = text => blocks.push(new Paragraph({
+    children: [new TextRun({ text, font: FONT_BODY, size: SIZE_BODY, bold: true })],
+    spacing: { before: 40, after: 30 }
+  }));
+  if (dbOp.group_by && dbOp.group_by.length > 0) {
+    subTitle('  ▸ グルーピング');
+    blocks.push(buildTable(['テーブル', '列', '適用'], dbOp.group_by.map(g => [
+      withPhysical(g.logical_table, 'table', maps),
+      withPhysical(g.logical_column, 'column', maps, g.logical_table),
+      g.when || '常に' // fallback-ok: when は分岐で変わるときだけ書く任意の欄。無ければ常に適用
+    ]), [4, 5, 3]));
+  }
+  if (dbOp.aggregate && dbOp.aggregate.length > 0) {
+    subTitle('  ▸ 集計');
+    // 範囲: 本体 / CTE。ウィンドウ関数は「ウィンドウ(PARTITION BY …)」を足す
+    // fallback-ok: over・scope は任意の欄(ウィンドウ関数・CTE のときだけ書く)。無ければ範囲の語を足さない
+    const range = a => [a.scope || '', a.over ? `ウィンドウ(PARTITION BY ${(a.over.partition_by || []).join(', ')}${(a.over.order_by || []).length ? ' ORDER BY ' + a.over.order_by.join(', ') : ''})` : ''].filter(Boolean).join(' ');
+    // fallback-ok: target・filter・alias は関数ごとに有無が違う任意の欄(count(*) は対象を持たない等)。空欄で描く
+    blocks.push(buildTable(['関数', '対象', '絞り込み', '結果の名前', '範囲'], dbOp.aggregate.map(a => [
+      a.function || '', a.target || '', a.filter || '', a.alias || '', range(a)
+    ]), [2, 3, 3, 2, 2]));
+  }
+  if (dbOp.order_by && dbOp.order_by.length > 0) {
+    subTitle('  ▸ 並び順');
+    blocks.push(buildTable(['順', 'テーブル', '列', '方向', '適用'], dbOp.order_by.map((o, i) => [
+      String(o.priority || o.no || i + 1),
+      withPhysical(o.logical_table, 'table', maps),
+      withPhysical(o.logical_column, 'column', maps, o.logical_table),
+      o.direction || '', // fallback-ok: 方向は旧版の中間 JSON に無いので空欄で描く(where の value と同じ扱い)
+      o.when || '常に' // fallback-ok: when は分岐で変わるときだけ書く任意の欄。無ければ常に適用
+    ]), [1, 4, 4, 1, 2]));
+  }
   // insert_values
   if (dbOp.insert_values && dbOp.insert_values.length > 0) {
     const rows = dbOp.insert_values.map(v => [

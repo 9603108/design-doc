@@ -729,6 +729,12 @@ INSERT/UPDATE/DELETE の場合:
 ```
 
 - `id`: 内部参照キー。`event_processes[].db_operations_ref` から参照
+- `group_by[]`(任意): `{ logical_table, logical_column, when? }`。`when` は分岐で変わるときの条件(例: `group = register`)。docx の DB 問合せに「グルーピング」の表で出る
+- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)
+- `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
+- `group_by[]`(任意): `{ logical_table, logical_column, when? }`。`when` は分岐で変わるときの条件(例: `group = register`)。docx の DB 問合せに「グルーピング」の表で出る
+- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)
+- `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
 - `transaction`: INSERT/UPDATE/DELETE は必ず `true`
 - `operation_type` ごとに必要なフィールドが変わる（上記の通り）
 - `api_endpoint.trigger_event`: この API を呼ぶ Phase 1 の event_code（`events[].event_code` と同じ語彙。例 `EV01`）。1件に1つ
