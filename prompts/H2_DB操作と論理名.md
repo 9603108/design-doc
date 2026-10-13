@@ -19,6 +19,7 @@
 - `db_operations[]`: {id, api_endpoint, operation_type, dataset[], joins[], where[], group_by[], aggregate, order_by[], insert_values[], update_values[], transaction, error_message_id}
   - id は `db_op_<action>`(1つの action に SQL が複数なら `db_op_<action>_<n>`、実行順)
   - api_endpoint は {action}。trigger_events は書かない(apply_react_draft.py が下書きから写す。HTML の画面だけ event_code を書く)
+    - 必ず辞書で書く。例: `"api_endpoint": {"action": "list_pos_account_report"}`(文字列 `"list_pos_account_report"` は不可。検査が [形] の ERROR にする)
   - dataset は1列1行: {no, logical_table, logical_column, physical_table, physical_column}。論理名は logical_names と同じ字面
   - joins・where・order_by は SQL を構造化表へ写す(生の SQL 文字列は書かない)。並び順の方向は 昇順 / 降順
   - INSERT / UPDATE / DELETE は transaction を true

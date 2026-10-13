@@ -397,7 +397,16 @@ def check_refs(spec, composed):
             if names and not any(n in (ev.get("trigger") or "") for n in names):
                 problems.append(f"[項目名] events[{ev.get('event_code')}].trigger「{ev.get('trigger')}」に画面項目名「{'」か「'.join(names)}」が無い(screen_layout.items の item_name と字面を揃える) → 差し戻し先 {back('events[].trigger')}")
     for op in composed.get("db_operations") or []:
+        if not isinstance(op, dict):
+            problems.append(f"[形] db_operations の要素が辞書でない({type(op).__name__}): {{id, api_endpoint: {{action, trigger_events}}, ...}} の辞書で書く → 差し戻し先 {back('db_operations[].api_endpoint')}")
+            continue
         api = op.get("api_endpoint") or {}
+        if not isinstance(api, dict):
+            problems.append(f"[形] db_operations[{op.get('id')}].api_endpoint が辞書でない({type(api).__name__}「{api}」): {{\"action\": \"<api_spec の action>\", \"trigger_events\": [\"<event_code>\"]}} の辞書で書く → 差し戻し先 {back('db_operations[].api_endpoint')}")
+            continue
+        if not isinstance(api.get("trigger_events") or [], list):
+            problems.append(f"[形] db_operations[{op.get('id')}].api_endpoint.trigger_events がリストでない: [\"<event_code>\"] で書く → 差し戻し先 {back('db_operations[].api_endpoint')}")
+            continue
         if "api_spec" in composed and api.get("action") and api.get("action") not in actions:
             problems.append(f"[参照] db_operations[{op.get('id')}].api_endpoint.action={api.get('action')}: api_spec に無い → 差し戻し先 {back('db_operations[].api_endpoint')}")
         if "events" in composed:
