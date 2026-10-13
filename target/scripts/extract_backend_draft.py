@@ -318,6 +318,13 @@ def _merge(acc, got):
         acc[k] += [x for x in got[k] if x not in acc[k]]
 
 
+def _src(mod, node):
+    """AST のノードを出典の {file, line_start, line_end}(1始まり・両端を含む)にする。
+    呼出元: extract()・_errors()・_returns()・_auth()。意味合い: 下書きの要素が指すソースの行を機械で付ける(数字は LLM に書かせない)。
+    接続: react 側の _span と同じ形。合成側(_units の _fill_src、A3)が同じ形で読む。"""
+    return {"file": str(mod.path), "line_start": node.lineno, "line_end": node.end_lineno}
+
+
 def _call_name(c):
     """呼出の関数名(f(...) なら f、obj.f(...) なら f)。取れなければ空。"""
     f = c.func
@@ -369,9 +376,9 @@ def _auth(mods, tables):
                     clo = _closure(m2, f2, mods)
                     errs = []
                     for m3, f3 in clo:
-                        errs += _expand(_errors(f3, m3.env()), f3, clo)  # 認証の関数の応答は全部を出す(status が取れなければ空)
+                        errs += _expand(_errors(f3, m3.env(), m3), f3, clo)  # 認証の関数の応答は全部を出す(status が取れなければ空)
                     out.append({"function": name, "applies_to": "全 API(各 API の処理に入る前に認証する)",
-                                "fact": "全 API で、各 API の処理に入る前に認証を行う", "error_patterns": errs})  # 関数名は function の欄にだけ残す
+                                "fact": "全 API で、各 API の処理に入る前に認証を行う", "error_patterns": errs, "src": [_src(mod, c)]})  # 関数名は function の欄にだけ残す
                     break
     return out
 
@@ -679,14 +686,14 @@ def _returns(mod, fn, mods, seen=None):
             continue
         v = n.value
         if isinstance(v, ast.Dict):
-            keys += [k.value for k in v.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+            keys += [(k.value, [_src(mod, k)]) for k in v.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
         elif isinstance(v, ast.Call):
             for m2, f2 in _callees(ast.Module(body=[ast.Expr(v)], type_ignores=[]), mod, mods):
                 keys += _returns(m2, f2, mods, seen)
     return keys
 
 
-def _errors(fn, env):
+def _errors(fn, env, mod):
     """fn の raise X("msg") と _err(code, "msg", status) を {condition, status_code, message} にする。"""
     out = []
     for n in ast.walk(fn):
@@ -707,7 +714,7 @@ def _errors(fn, env):
             continue
         text = _render(msg, env, False) if msg is not None else None
         if text is not None:
-            out.append({"condition": "", "status_code": status, "message": text})
+            out.append({"condition": "", "status_code": status, "message": text, "src": [_src(mod, n)]})
     return out
 
 
@@ -765,15 +772,21 @@ def extract(files, hints=None):
                         if sql and _SQL_HEAD.match(sql):
                             _merge(clauses, _clauses(sql))
                             frm, cols = _columns(sql, hints.get("ddl") or {}, unresolved, action)
-                            ops.append({"from": frm, "columns": _candidates(cols, hints)})
+                            ops.append({"from": frm, "columns": _candidates(cols, hints), "src": [_src(m2, s)]})
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
                                     dataset.append(r)
-                    for e in _expand(_errors(f2, env), f2, clo):
-                        if e not in errors:
+                    for e in _expand(_errors(f2, env, m2), f2, clo):
+                        same = [x for x in errors if (x["message"], x["status_code"], x["text_expanded"]) == (e["message"], e["status_code"], e["text_expanded"])]
+                        # 同じ文面・status・展開後の文は1件にまとめ、出典(src)だけ足す(同じ文が別の行にあっても行を落とさない)
+                        if same:
+                            same[0]["src"] += [s for s in e["src"] if s not in same[0]["src"]]
+                        if not same:
                             errors.append(e)
-                keys = list(dict.fromkeys(_returns(tm, fn, mods)))
+                keys = {}  # 同じキーは最初の return の出典を持つ(キーの並びは return の出現順)
+                for key, s in _returns(tm, fn, mods):
+                    keys.setdefault(key, s)
                 if not keys:
                     unresolved.append({"action": action, "reason": "return の dict キーを静的に取れない"})
                 if not dataset:
@@ -782,9 +795,10 @@ def extract(files, hints=None):
                     op["id"] = f"db_op_{action}" + (f"_{i}" if len(ops) > 1 else "")
                     for no, c in enumerate(op["columns"], 1):
                         c["no"] = no
-                apis[action] = {"dataset": dataset, "response_items": [{"key": x} for x in keys],
+                apis[action] = {"dataset": dataset, "src": [_src(tm, fn)],
+                                "response_items": [{"key": key, "src": s} for key, s in keys.items()],
                                 "error_patterns": errors, **clauses,
-                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"]} for o in ops]}
+                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "src": o["src"]} for o in ops]}
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
