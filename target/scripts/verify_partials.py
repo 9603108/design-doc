@@ -204,7 +204,8 @@ def check_h2_columns(h2, draft):
             continue
         for c in cols:
             keys.setdefault((c.get("table"), c.get("alias") or c.get("column") or c.get("expression")), c)
-        mine = [o for o in ops if (o.get("api_endpoint") or {}).get("action") == action]
+        # api_endpoint が辞書でない行は _units.check_refs が [形] で報告する。ここでは数えない
+        mine = [o for o in ops if isinstance(o.get("api_endpoint"), dict) and o["api_endpoint"].get("action") == action]
         rows = [r for o in mine for r in o.get("dataset") or [] if isinstance(r, dict)]
         have = {r.get("physical_column") for r in rows}
         lack = [c.get("alias") or c.get("column") or c.get("expression") for c in cols
@@ -248,6 +249,8 @@ def check_unit_extras(frags, directory):
             if lack:
                 problems.append(f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1")
     for op in (frags.get("H2") or {}).get("db_operations") or []:
+        if not isinstance(op, dict):
+            continue
         for fld in ("joins", "where"):
             bad = list(dict.fromkeys(k for row in op.get(fld) or [] if isinstance(row, dict) for k in row if not k.isascii()))
             if bad:
