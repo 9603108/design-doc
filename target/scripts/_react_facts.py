@@ -296,6 +296,145 @@ def outcomes(link, sources):
     return out
 
 
+_CSV_FN = re.compile(r"const\s+(\w+)\s*=\s*\(\)\s*=>\s*\{")
+
+
+def _split_top(s):
+    """s を深さ0のカンマで割る(文字列の中のカンマは数えない)。空の部分は捨てる。"""
+    parts, depth, quote, cur = [], 0, None, []
+    for c in s:
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            continue
+        if c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
+    last = "".join(cur).strip()
+    if last:
+        parts.append(last)
+    return parts
+
+
+def _csv_one(p, text, name_idx_body, codes):
+    """exportCsv 形の関数1件(本体 body)から CSV の書式の事実を読む。拾えない欄は空・None のまま出す。"""
+    name, body, src = name_idx_body
+    fn = {"function": name, "trigger_events": codes}
+    fm = re.search(r"\.download\s*=\s*`([^`]*)`", body)
+    fn["file_name_template"] = fm.group(1) if fm else None
+    mm = re.search(r'type:\s*"([^"]+)"', body)
+    fn["mime"] = mm.group(1) if mm else None
+    fn["bom"] = "﻿" in body
+    seps = re.findall(r'header\.join\("([^"]*)"\)', body)
+    fn["separator"] = seps[0] if seps else None
+    fn["line_break"] = "CRLF" if "\\r\\n" in body else None
+    qm = re.search(r"const\s+(\w+)\s*=\s*\(v", body)
+    if qm:
+        qn = qm.group(1)
+        fn["quote"] = {"fn": qn, "escape": '"→""' if 'replaceAll(\'"\', \'""\')' in body else None,
+                       "uses_count": len(re.findall(rf"\b{re.escape(qn)}\(", body)) - 1}
+    else:
+        fn["quote"] = None
+    hs = body.find("const header = [")
+    fixed, spread = [], []
+    if hs >= 0:
+        ho = hs + len("const header = ")
+        for item in _split_top(body[ho + 1:_end(body, ho)]):
+            if item.startswith("..."):
+                spread.append({"raw": item[:160], "cnt_suffixes": _uniq(re.findall(r"\(点数\)|\(金額\)", item))})
+            elif item[:1] in "\"`":
+                fixed.append(item[1:-1])
+    fn["header"] = {"fixed": fixed, "spread": spread}
+    tm = re.search(r"if\s*\(([^\n]*?)\)\s*lines\.push\(", body)
+    fn["total_row"] = {"when": tm.group(1).strip()} if tm else None
+    fn["src"] = [src] if src else []
+    return fn
+
+
+def csv_exports(links, sources):
+    """画面の TSX から CSV 出力の書式を {"csv_exports": [...]} で返す(案 C1)。
+
+    呼出元: extract_react_draft.main()。new Blob( を含む関数を対象にする。
+    trigger_events は、その関数の名前が本体に出るイベントの event_code(build_draft と同じ振り方)。
+    取れない欄は None・空配列で出す(推測で埋めない)。接続: S3 の EV の details が BOM・CRLF・合計行を書く元。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        if "new Blob(" not in text:
+            continue
+        b = text.find("new Blob(")
+        cands = [m for m in _CSV_FN.finditer(text) if m.start() < b]
+        if not cands:
+            continue
+        m = cands[-1]
+        bo = m.end() - 1
+        body = text[bo:_end(text, bo) + 1]
+        src = _line_span(p, text, body)
+        codes = []
+        n = 0
+        for link in links:
+            code = "EV00" if link["attr"] == "mount" else f"EV{n + 1:02d}"
+            if link["attr"] != "mount":
+                n += 1
+            if any(re.search(rf"\b{re.escape(m.group(1))}\b", t) for t in link.get("texts", [])):
+                codes.append(code)
+        out.append(_csv_one(p, text, (m.group(1), body, src), codes))
+    return {"csv_exports": out}
+
+
+def selftest_csv():
+    """exportCsv 形の最小 TSX で BOM・区切り・改行・固定見出し・合計行・ファイル名・トリガーを assert する。"""
+    tsx = (
+        "export default function S() {\n"
+        "  const exportCsv = () => {\n"
+        "    const q = (v: unknown) => `\"${String(v ?? \"\").replaceAll('\"', '\"\"')}\"`;\n"
+        "    const header = [\"開始日\", \"店舗\", ...CSV_SPECS.flatMap((s) => [s.label])];\n"
+        "    const lines = rows.map((r) => q(r.shop_name));\n"
+        "    if (rows.length > 1) lines.push(\"x\");\n"
+        "    const blob = new Blob([\"﻿\" + [header.join(\",\"), ...lines].join(\"\\r\\n\")], {\n"
+        "      type: \"text/csv;charset=utf-8\",\n"
+        "    });\n"
+        "    a.download = `pos_${applied.from}.csv`;\n"
+        "  };\n"
+        "  return <button onClick={exportCsv}>CSV出力</button>;\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            links = [{"file": str(p), "attr": "mount", "texts": []},
+                     {"file": str(p), "attr": "onClick", "texts": ["exportCsv"]}]
+            got = csv_exports(links, [p])["csv_exports"]
+        assert len(got) == 1, f"件数: {got}"
+        c = got[0]
+        assert c["function"] == "exportCsv" and c["trigger_events"] == ["EV01"], f"fn/trigger: {c}"
+        assert c["bom"] is True and c["separator"] == "," and c["line_break"] == "CRLF", f"bom/sep/crlf: {c}"
+        assert c["mime"] == "text/csv;charset=utf-8", f"mime: {c['mime']}"
+        assert c["header"]["fixed"] == ["開始日", "店舗"] and len(c["header"]["spread"]) == 1, f"header: {c['header']}"
+        assert c["total_row"] == {"when": "rows.length > 1"}, f"total: {c['total_row']}"
+        assert c["file_name_template"] == "pos_${applied.from}.csv", f"file: {c['file_name_template']}"
+        assert c["quote"]["fn"] == "q" and c["quote"]["escape"] is not None, f"quote: {c['quote']}"
+        assert c["src"][0]["line_start"] == 2, f"src: {c['src']}"
+    except AssertionError as e:
+        print(f"[selftest NG] csv_exports {e}")
+        return 1
+    print("[selftest OK] _react_facts.csv_exports")
+    return 0
+
+
 def selftest_outcomes():
     """stale_overwrite と loading_cleared_early の2件が出ること、要求の識別があれば stale が消えることを assert する。"""
     tsx = (
@@ -414,6 +553,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)

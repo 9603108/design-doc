@@ -623,6 +623,8 @@ def main(argv=None):
     draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
     # 目的: 取得失敗時に変える state・残る state を下書きに足す(既存キーは変えない)。接続: _react_facts.extract
     draft.update(_react_facts.extract(links, sources))
+    # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
+    draft.update(_react_facts.csv_exports(links, sources))
     # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
     plan = _react_facts.fetch_plan(sources, pcfg.get("api_call_functions", []))
     if plan:
