@@ -160,16 +160,26 @@ def check_calcs(calcs, candidates):
 
 
 _OPERATION_TYPES = {"ComboBox", "Calendar", "Checkbox", "Input", "Button", "TextArea"}
+# jsx_elements のうち表示専用の要素(_react_facts._DISPLAY_HINT の tag と同じ)。check_items の (1)〜(3) の対象外
+_DISPLAY_TAGS = {"span", "strong", "h1", "h2", "a", "table"}
 
 
-def check_items(items, jsx):
+def check_items(items, jsx, display_rows=None):
     """S1 の screen_layout.items[] を react 下書きの jsx_elements と突き合わせる(B2。WARN)。
     (1) ラベルを持つ JSX 要素に同じ字面の item_name が無い [画面項目] 欠け / (2) 入力・操作系の item に対の JSX 要素が無い
-    [画面項目] ソースに無い項目 / (3) item_type と item_type_hint が違う [種別]。"""
+    [画面項目] ソースに無い項目 / (3) item_type と item_type_hint が違う [種別]。
+    (4) display_rows(定数配列の行名)が item_name に全部ある(無ければ ERROR。WARN の接頭辞を付けない)。
+    表示専用の要素(Label・Grid・Link。label は空)は (1)〜(3) の対象外。jsx が None なら (4) だけ見る。
+    呼出元: main(最終)・verify_partials.check_unit_extras(S1 の単位)。"""
     by_name = {i.get("item_name"): i for i in items if isinstance(i, dict)}
+    lack = [lb for r in display_rows or [] for lb in r.get("labels") or [] if lb not in by_name]
+    disp = ([f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1"]
+            if lack else [])
+    if jsx is None:
+        return disp
     by_label = {norm(j["label"]): j for j in jsx or [] if j.get("label")}
-    problems = [f"[WARN] [画面項目] screen_layout.items: ソースの {j['tag']}「{lb}」({j['item_type_hint']})に対応する item_name が無い(欠け) → 差し戻し先 S1"
-                for lb, j in by_label.items() if lb not in by_name]
+    problems = disp + [f"[WARN] [画面項目] screen_layout.items: ソースの {j['tag']}「{lb}」({j['item_type_hint']})に対応する item_name が無い(欠け) → 差し戻し先 S1"
+                       for lb, j in by_label.items() if lb not in by_name]
     for name, it in by_name.items():
         if it.get("item_type") not in _OPERATION_TYPES:
             continue
@@ -282,6 +292,11 @@ def selftest():
     got = check_items([{"item_name": "店舗", "item_type": "ComboBox"}, {"item_name": "開始", "item_type": "Input"}, {"item_name": "幻", "item_type": "Button"}], jsx)
     assert [g.split(" ")[1] for g in got] == ["[種別]", "[画面項目]"], got
     assert [g for g in check_items([{"item_name": "店舗", "item_type": "ComboBox"}], jsx) if "欠け" in g]
+    # B2 残り: 表示専用要素(label 無し)は (1)〜(3) の対象外。display_rows の欠けは ERROR(接頭辞 [WARN] 無し)
+    disp = [{"tag": "span", "label": "", "text": "読込中…", "item_type_hint": "Label"}]
+    assert check_items([], disp) == []
+    got = check_items([{"item_name": "総売上"}], None, [{"labels": ["総売上", "返品"]}])
+    assert len(got) == 1 and "返品" in got[0] and not got[0].startswith("[WARN]"), got
     cands = [{"id": "CC01", "label": "差", "expr": "r.s3 - r.n", "operands": ["s3", "n"], "funcs": [], "literals": [],
               "operand_labels": {"s3": ["小計", "小計3(税込)"], "n": ["点数"]}},
              {"id": "CC02", "label": "平均", "expr": "r.n ? Math.floor(r.s3 / r.n) : 0", "operands": ["n", "s3"],
@@ -335,18 +350,22 @@ def main(argv=None):
         print("[WARN] [文言] ソースの文字列が1つも取れない(source_files と src の file を確認)")
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
-    cands, jsx, beh = [], [], []
+    cands, jsx, beh, disp_rows = [], [], [], []
     type_problems = []
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
         type_problems = check_types(data.get("api_spec"), json.loads(p.read_text(encoding="utf-8")).get("apis"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
         rd = json.loads(p.read_text(encoding="utf-8"))
         cands, jsx, beh = rd.get("calc_candidates") or [], rd.get("jsx_elements") or [], rd.get("behaviors") or []
+        disp_rows = rd.get("display_rows") or []
     items = (data.get("screen_layout") or {}).get("items") or []
-    item_problems = check_items(items, jsx) if jsx else []
+    item_problems = check_items(items, jsx, disp_rows) if jsx else []
     problems += item_problems
     ops = [i for i in items if i.get("item_type") in _OPERATION_TYPES]
-    print(f"[INFO] 画面項目の照合: ソースの入力・操作系 {len(jsx)} 件・S1 の入力・操作系 {len(ops)} 件・WARN {len(item_problems)} 件")
+    shown = [j for j in jsx if j.get("tag") in _DISPLAY_TAGS]
+    names = {norm(i.get("item_name") or "") for i in items}
+    print(f"[INFO] 画面項目の照合: ソースの入力・操作系 {len(jsx) - len(shown)} 件・S1 の入力・操作系 {len(ops)} 件・WARN {len(item_problems)} 件")
+    print(f"[INFO] 表示専用要素の照合: ソースの表示専用要素 {len(shown)} 件(visible_if あり {sum(1 for j in shown if j.get('visible_if'))} 件)・S1 に同じ字面の項目あり {sum(1 for j in shown if norm(j.get('text') or '') in names)} 件")
     calc_problems = check_calcs(data.get("calculations") or [], cands) if cands else []
     problems += calc_problems
     kind_problems = check_kinds(data.get("validations") or data.get("validations_frontend"), data.get("front_processes"), beh)

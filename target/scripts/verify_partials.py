@@ -285,10 +285,10 @@ def check_unit_extras(frags, directory):
                 rows = json.loads(p.read_text(encoding="utf-8")).get("display_rows") or []
             except (OSError, json.JSONDecodeError):
                 continue
-            have = {it.get("item_name") for it in (s1.get("screen_layout") or {}).get("items") or [] if isinstance(it, dict)}
-            lack = [lb for r in rows for lb in r.get("labels") or [] if lb not in have]
-            if lack:
-                problems.append(f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1")
+            # 目的: display_rows の照合は verify_vs_source.check_items に畳んだ(B2)。ここは jsx 無しで display_rows の分だけ呼ぶ
+            import verify_vs_source
+            problems += verify_vs_source.check_items(
+                [it for it in (s1.get("screen_layout") or {}).get("items") or [] if isinstance(it, dict)], None, rows)
     s1_items = [it for it in ((s1 or {}).get("screen_layout") or {}).get("items") or [] if isinstance(it, dict)]
     no_example = [it.get("item_name") for it in s1_items if not it.get("example")]
     if s1_items and len(no_example) * 2 > len(s1_items):

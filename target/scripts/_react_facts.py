@@ -464,7 +464,10 @@ def calc_candidates(sources):
     return {"calc_candidates": out}
 
 
-_JSX_OPEN = re.compile(r"<(input|select|textarea|button)\b")
+_JSX_OPEN = re.compile(r"<(input|select|textarea|button|span|strong|h1|h2|a|table)\b")
+# 表示専用の要素 → item_type_hint(案 B2)。text を持ち、label は持たない。verify_vs_source._DISPLAY_TAGS と同じ組
+_DISPLAY_HINT = {"span": "Label", "strong": "Label", "h1": "Label", "h2": "Label", "a": "Link", "table": "Grid"}
+_VISIBLE_IF = re.compile(r"\{\s*([^{}?]+?)\s*(?:&&|\?(?!\.))\s*\(?\s*$")
 # 入力・操作系の要素 → 画面項目の item_type(案 B2 の表)。input は type で決まる
 _HINT = {"select": "ComboBox", "textarea": "TextArea", "button": "Button"}
 _INPUT_HINT = {"date": "Calendar", "checkbox": "Checkbox", "submit": "Button", "button": "Button"}
@@ -492,7 +495,8 @@ def jsx_elements(sources):
 
     呼出元: extract_react_draft.main()。意味合い: 画面項目(S1)がソースの画面部品と過不足なく対応するかを verify_vs_source.check_items が見る元。
     label: button は中の文言、checkbox は包む <label> の文言、それ以外は直前の <label>…</label>。item_type_hint は上の表。
-    ponytail: table・span 等の表示専用の要素と visible_if は拾わない(入力・操作系だけ)。要れば _JSX_OPEN に足す。
+    表示専用の要素(span・strong・h1・h2・a・table。文言が空のものは table 以外出さない)は text・visible_if(直前の `{cond && (`・三項)を持つ。
+    ponytail: visible_if は直前の1段だけ(入れ子の外側の cond は見ない)。div・ul は拾わない。要れば _DISPLAY_HINT に足す。
     """
     out = []
     for p in sources:
@@ -502,6 +506,17 @@ def jsx_elements(sources):
         for m in _JSX_OPEN.finditer(text):
             tag, e = m.group(1), _tag_end(text, m.start())
             attrs = text[m.end():e]
+            if tag in _DISPLAY_HINT:
+                # 表示専用: 中の文言(自分の閉じタグまで。{…}・タグは除く)と、直前の `{cond && (` の cond(visible_if)
+                close = text.find(f"</{tag}>", e)
+                inner = "" if text[e - 1] == "/" or close < 0 else re.sub(r"<[^>]*>|\{[^{}]*\}", "", text[e + 1:close]).strip()
+                if inner or tag == "table":
+                    vm = _VISIBLE_IF.search(text[max(0, m.start() - 200):m.start()])
+                    out.append({
+                        "id": f"JX{len(out) + 1:02d}", "tag": tag, "type": None, "label": "", "text": inner,
+                        "visible_if": vm.group(1) if vm else None, "item_type_hint": _DISPLAY_HINT[tag],
+                        "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, e) + 1}]})
+                continue
             ty = re.search(r"\btype=\"(\w+)\"", attrs)
             ty = ty.group(1) if ty else None
             if tag == "input":
@@ -797,6 +812,7 @@ def selftest_jsx():
         "  <button type=\"button\" onClick={x} disabled={!rows.length}>\n"
         "    CSV出力\n"
         "  </button>\n"
+        "  {loading && <span className=\"l\">読込中…</span>}\n"
         "</div>\n"
     )
     try:
@@ -805,7 +821,8 @@ def selftest_jsx():
             p.write_text(tsx, encoding="utf-8")
             got = jsx_elements([p])["jsx_elements"]
         assert [(g["label"], g["item_type_hint"]) for g in got] == [
-            ("店舗", "ComboBox"), ("開始", "Calendar"), ("空欄も表示", "Checkbox"), ("CSV出力", "Button")], got
+            ("店舗", "ComboBox"), ("開始", "Calendar"), ("空欄も表示", "Checkbox"), ("CSV出力", "Button"), ("", "Label")], got
+        assert got[4]["text"] == "読込中…" and got[4]["visible_if"] == "loading", got[4]
         assert got[0]["bind"] == "s" and got[0]["on"] == ["onChange"] and got[3]["disabled"] == "!rows.length", got
         assert got[1]["src"][0]["line_start"] == 7, got[1]
     except AssertionError as e:
