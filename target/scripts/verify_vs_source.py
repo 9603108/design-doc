@@ -346,6 +346,12 @@ def main(argv=None):
         print(f"[入力不正] {jp}: {e}", file=sys.stderr)
         return 2
     strings = source_strings(feat)
+    # 目的: react 下書きの ui_strings(画面の文言。B4)も照合の文字列に足す。{…} で途切れた文言や、source_files の外の画面を拾う
+    n_ui = 0
+    for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
+        ui = json.loads(p.read_text(encoding="utf-8")).get("ui_strings") or []
+        n_ui += len(ui)
+        strings |= {norm(u["text"]) for u in ui if u.get("text")}
     if not strings:
         print("[WARN] [文言] ソースの文字列が1つも取れない(source_files と src の file を確認)")
         return 0
@@ -376,7 +382,7 @@ def main(argv=None):
     n = len(data.get("calculations") or [])
     print(f"[INFO] 計算式の照合: ソースの式 {len(cands)} 件・calculations {n} 件・WARN {len(calc_problems)} 件")
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
-    print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件に対し WARN {len(problems)} 件")
+    print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件(うち下書きの ui_strings {n_ui} 件)に対し WARN {len(problems)} 件")
     return 1 if kind_problems or null_problems else 0
 
 

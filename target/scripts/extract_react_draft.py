@@ -658,6 +658,8 @@ def main(argv=None):
     draft.update(_react_facts.behaviors(sources))
     # 目的: 画面部品の中で使う応答項目(r.shop_name 等)の出どころを下書きに足し、S2 の response_to_screen_mapping の土台にする(C5)。接続: _react_facts.field_usage
     draft.update(_react_facts.field_usage(sources))
+    # 目的: 画面の文言(JSX の文言・日本語の文字列リテラル)を下書きに足し、verify_vs_source.main の文言の照合に使う(B4)。接続: _react_facts.ui_strings
+    draft.update(_react_facts.ui_strings(sources))
     # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
     # 不具合の修正: api_call_functions は共通ラッパー(call)だけで、画面の useEffect が呼ぶ fetchXxx を含まない。
     #   画面が使う API 関数は excerpt(api.ts から抜いた断片)の定義名なので、その名前も渡す。

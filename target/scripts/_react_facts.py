@@ -543,6 +543,65 @@ def jsx_elements(sources):
     return {"jsx_elements": out}
 
 
+_UI_JSX_TEXT = re.compile(r"(?<!=)>([^<>{}]*[^\s<>{}][^<>{}]*)<")
+_UI_LITERAL = re.compile(r"\"((?:[^\"\\\n]|\\.)*[぀-ヿ一-鿿](?:[^\"\\\n]|\\.)*)\"|`([^`$\n]*[぀-ヿ一-鿿][^`$\n]*)`")
+
+
+def ui_strings(sources):
+    """TSX の画面の文言を {"ui_strings": [...]} で返す(案 B4)。
+
+    呼出元: extract_react_draft.main()。意味合い: H4・S3 の「画面にこの文言を出す」が作り話でないかを verify_vs_source.main が見る元
+    (照合の文字列の集合に足す)。kind=jsx_text は `>…<` の間の文言(visible_if は囲む要素の直前の `{cond && (`・三項)、
+    kind=literal は日本語を含む引用符・テンプレートの文字列。空白は1つにまとめる。
+    ponytail: `${…}` を含むテンプレートは拾わない・visible_if は直前の1段だけ。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _UI_JSX_TEXT.finditer(text):
+            tg = text.rfind("<", 0, m.start())
+            vm = _VISIBLE_IF.search(text[max(0, tg - 200):tg]) if tg >= 0 else None
+            out.append({"text": re.sub(r"\s+", " ", m.group(1)).strip(), "kind": "jsx_text",
+                        "visible_if": vm.group(1) if vm else None,
+                        "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start(1)) + 1,
+                                 "line_end": text.count("\n", 0, m.end(1)) + 1}]})
+        for m in _UI_LITERAL.finditer(text):
+            out.append({"text": m.group(1) or m.group(2), "kind": "literal", "visible_if": None,
+                        "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1,
+                                 "line_end": text.count("\n", 0, m.end()) + 1}]})
+    return {"ui_strings": out}
+
+
+def selftest_ui_strings():
+    """jsx_text(visible_if つき・複数行)と literal(日本語のみ)を最小の TSX で assert する。"""
+    tsx = (
+        "const a = \"abc\";\n"
+        "const m = \"取込欠損\";\n"
+        "const f = () => <div>\n"
+        "  {!rows.length && (\n"
+        "    <div className=\"n\">この期間の\n"
+        "      データはありません。</div>\n"
+        "  )}\n"
+        "</div>;\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = ui_strings([p])["ui_strings"]
+        j = [g for g in got if g["kind"] == "jsx_text"]
+        assert [g["text"] for g in j] == ["この期間の データはありません。"], got
+        assert j[0]["visible_if"] == "!rows.length" and j[0]["src"][0]["line_start"] == 5, j
+        assert [g["text"] for g in got if g["kind"] == "literal"] == ["取込欠損"], got
+    except AssertionError as e:
+        print(f"[selftest NG] ui_strings {e}")
+        return 1
+    print("[selftest OK] _react_facts.ui_strings")
+    return 0
+
+
 _TOGGLE = re.compile(r"\{\s*([^{}?]+?)\s*(?:&&|\?(?!\.))\s*\(?\s*<(\w+)")
 _DISABLED = re.compile(r"\bdisabled=\{([^{}]*)\}")
 _FILTER = re.compile(r"\.filter\(\s*\(?\w+\)?\s*=>\s*")
@@ -1019,6 +1078,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
