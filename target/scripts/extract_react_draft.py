@@ -334,6 +334,8 @@ def analyze_sources(source_files, api_call_functions):
                 "element": tags[-1].group(1) if tags else "",
                 "attr": m.group(1), "handler": expr, "actions": acc["actions"], "texts": acc["texts"],
                 "ui_label": _ui_label(t, tags, m, be),
+                # 目的: ui_label が取れない要素(select 等)の連続操作の表示名を、隣の label・操作対象の state から引く。接続: _continuous_ops()
+                "op_label": _op_label(t, tags[-1].start() if tags else m.start(), acc["states"]),
                 # 目的: 開きタグの文字(disabled の有無)を連続操作の判定に渡す。接続: _continuous_ops()
                 "tag": t[(tags[-1].start() if tags else m.start()):max(be, t.find(">", be))],
                 "empty": [(x, branches[x]) for x in sorted(acc["states"]) if x in branches],
@@ -383,6 +385,22 @@ def _ui_label(t, tags, m, be):
         end = t.find("</form>", be)
         sm = re.search(r"type=\"submit\"[^>]*>\s*([^<{}]+?)\s*<", t[be:end if end >= 0 else len(t)])
         return sm.group(1) if sm else ""
+    return ""
+
+
+def _op_label(t, start, states):
+    """連続操作の表示名の候補。要素の直前の <label>文言</label>、無ければ value/checked が操作対象の state の要素の直前の label。
+
+    呼出元: analyze_sources()。意味合い: 画面項目の名前(ソースの label 文言)をそのまま使う。取れなければ空文字。
+    """
+    lab = r"<label\b[^>]*>\s*([^<{}]+?)\s*</label>\s*"
+    m = re.search(lab + r"\Z", t[max(0, start - 300):start])
+    if m:
+        return m.group(1)
+    for s in sorted(states):
+        sm = re.search(lab + r"<(?:select|input|textarea)\b[^>]*?(?:value|checked)=\{" + re.escape(s) + r"\}", t)
+        if sm:
+            return sm.group(1)
     return ""
 
 
@@ -504,7 +522,8 @@ def _continuous_ops(links):
         # 目的: mount(初期表示)は利用者の操作ではないので外す。接続: actions が空の属性は取得を起こさない
         if link["attr"] == "mount" or not (link["actions"] or link.get("fetch")):
             continue
-        label = link.get("ui_label") or link["handler"]
+        # 目的: 表示名にコード片・HTML 実体参照(&gt; など)を入れない。ui_label → 隣の label/state の画面項目名 → 「<要素>の変更」の順
+        label = link.get("ui_label") or link.get("op_label") or f"{link['element'] or '要素'}の変更"
         body = "\n".join(link["texts"])
         disabled = bool(re.search(r"disabled=\{[^}]*(?:loading|busy|pending|fetch)", link.get("tag", ""), re.I))
         guard = bool(re.search(r"\bif\s*\(\s*!?\s*\w*(?:loading|busy|pending|fetching)\w*\s*\)", body, re.I))
