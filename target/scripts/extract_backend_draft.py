@@ -43,6 +43,9 @@ import re
 import sys
 from pathlib import Path
 
+# 集計・ウィンドウ関数の下書き(C4)。同じフォルダの _backend_facts.py を読む(実行時の sys.path は scripts/)
+from _backend_facts import features as _features, merge_features as _merge_features
+
 # FROM / JOIN の直後の別名として読んではいけない語
 _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON", "GROUP", "ORDER", "LIMIT",
        "UNION", "USING", "SET", "HAVING", "WINDOW", "OFFSET", "FOR", "RETURNING", "AS", "WITH"}
@@ -226,12 +229,24 @@ def _conds(sql, m, depth, s, e, real, main):
             rows.append({"and_or": sep, "logical_table": "", "logical_column": "", "operator": "", "param_no": "", "param_name": "", "expression": txt})
             continue
         tbl, col = _colref(cm.group(1), real, main)
-        pno = pname = ""
-        pm = _PARAM.match(cm.group(3).strip())
-        if pm:
-            n += 1
-            pno, pname = str(n), pm.group(1) or pm.group(2) or ""
-        rows.append({"and_or": sep, "logical_table": tbl, "logical_column": col, "operator": " ".join(cm.group(2).upper().split()), "param_no": pno, "param_name": pname})
+        # BETWEEN の右辺は「A AND B」の2つの値。それ以外は右辺の1つの値。プレースホルダは param# と名前にする
+        op = " ".join(cm.group(2).upper().split())
+        rhs = " ".join(cm.group(3).split())
+        parts = re.split(r"\s+AND\s+", rhs, flags=re.IGNORECASE) if op == "BETWEEN" else [rhs]
+        pnos, pnames, vals = [], [], []
+        for p in parts:
+            pm = _PARAM.match(p.strip())
+            if pm:
+                n += 1
+                nm = pm.group(1) or pm.group(2) or ""
+                pnos.append(str(n))
+                pnames.append(nm)
+                vals.append(nm or "?")
+            else:
+                vals.append(p.strip())
+        rows.append({"and_or": sep, "logical_table": tbl, "logical_column": col, "operator": op,
+                     "param_no": ",".join(pnos), "param_name": ", ".join(pnames),
+                     "value": " AND ".join(vals) if op == "BETWEEN" else (vals[0] if vals else "")})
     return rows
 
 
@@ -316,6 +331,66 @@ def _merge(acc, got):
     """同じ API の別の SQL から取れた句の行を重ねる。同じ行は 1 つだけ残す。"""
     for k in _CLAUSE_KEYS:
         acc[k] += [x for x in got[k] if x not in acc[k]]
+
+
+def _scenarios(fn, env):
+    """関数内の分岐で値が変わる変数を、引数の値ごとの env に展開する(C4)。[(ラベル, env)] を返す。
+    対象は「名前 = 定数辞書[引数]」と「名前 = A if 引数 == 値 else B」。どちらも無ければ [("", env)] だけ。
+    なぜ要るか: GROUP BY {', '.join(keys)} や ORDER BY {reji_col if ...} は単一の env では評価できず X になる。
+    呼出元: extract()(SQL の組み直しと句の重ね合わせ)。最大 4 通り(ponytail: 超えた分は捨てる。分岐が増えたら絞り方を決める)。"""
+    cands = {}  # 変数名 -> [(引数名, 値, 否定か, 評価値)]
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)):
+            continue
+        v, name = n.value, n.targets[0].id
+        if isinstance(v, ast.Subscript) and isinstance(v.value, ast.Name) and isinstance(env.get(v.value.id), dict) \
+                and isinstance(v.slice, ast.Name):
+            cands[name] = [(v.slice.id, k, False, val) for k, val in env[v.value.id].items()]
+        elif isinstance(v, ast.IfExp) and isinstance(v.test, ast.Compare) and isinstance(v.test.left, ast.Name) \
+                and len(v.test.ops) == 1 and isinstance(v.test.ops[0], ast.Eq) \
+                and isinstance(v.test.comparators[0], ast.Constant):
+            a, b = _render(v.body, env, True), _render(v.orelse, env, True)
+            if a is not None and b is not None:
+                var, k = v.test.left.id, v.test.comparators[0].value
+                cands[name] = [(var, k, False, a), (var, k, True, b)]
+    vals, from_dict = {}, set()  # 引数名 -> 取りうる値。辞書のキーが全候補、条件だけの引数には「それ以外」(None)を足す
+    for c in cands.values():
+        for var, k, neg, _ in c:
+            vals.setdefault(var, [])
+            if k not in vals[var] and not neg:
+                vals[var].append(k)
+            if not (len(c) == 2 and c[0][1] == c[1][1] and c[1][2]):  # 否定の候補を伴う = A if 引数 == 値 else B
+                from_dict.add(var)
+    for var in vals:
+        if var not in from_dict:
+            vals[var].append(None)
+    out = [({}, {})]
+    for var, ks in vals.items():
+        out = [({**sc, var: k}, {}) for sc, _ in out for k in ks]
+    res = []
+    for sc, _ in out[:4]:
+        e2 = {**env, **{v: k for v, k in sc.items() if k is not None}}  # f 文字列の中の {A if group == 'x' else B} も評価できるよう引数の値も入れる
+        for name, c in cands.items():
+            for var, k, neg, val in c:
+                if (sc.get(var) == k) != neg:
+                    e2[name] = val
+                    break
+        res.append((" かつ ".join(f"{v} = {k}" if k is not None else f"{v} がそれ以外" for v, k in sc.items()), e2))
+    return res or [("", env)]
+
+
+def _merge_scenarios(acc, per, labels):
+    """通りごとの句(per)を重ねる。全ての通りにある行はそのまま、一部にしか無い行には when(その通りのラベル)を付ける。
+    呼出元: extract()。接続: generate_docx.js 側は when を知らなくても行は出る(E1 が適用欄を足す)。"""
+    if len(per) == 1:
+        return _merge(acc, per[0])
+    for k in _CLAUSE_KEYS:
+        rows = [r for p in per for r in p[k]]
+        for r in rows:
+            where = [labels[i] for i, p in enumerate(per) if r in p[k]]
+            row = r if len(where) == len(per) else {**r, "when": " / ".join(where)}
+            if row not in acc[k]:
+                acc[k].append(row)
 
 
 def _src(mod, node):
@@ -760,7 +835,8 @@ def extract(files, hints=None):
                 clauses = {k: [] for k in _CLAUSE_KEYS}
                 clo = _closure(tm, fn, mods)
                 for m2, f2 in clo:
-                    env = {**m2.env(), **_local_lists(f2, m2.env())}
+                    scens = _scenarios(f2, {**m2.env(), **_local_lists(f2, m2.env())})
+                    env = scens[0][1]  # 句以外(列・出典・エラー)は最初の通りで組む。句だけ全部の通りで取る
                     parts = set()  # f 文字列・+ 連結の部品。親の _render が一括で組むので単独では拾わない
                     for s in ast.walk(f2):
                         if isinstance(s, (ast.JoinedStr, ast.BinOp)):
@@ -770,9 +846,9 @@ def extract(files, hints=None):
                             continue
                         sql = _render(s, env, True) if isinstance(s, (ast.JoinedStr, ast.Constant, ast.BinOp)) else None
                         if sql and _SQL_HEAD.match(sql):
-                            _merge(clauses, _clauses(sql))
+                            _merge_scenarios(clauses, [_clauses(_render(s, e, True)) for _, e in scens], [l for l, _ in scens])
                             frm, cols = _columns(sql, hints.get("ddl") or {}, unresolved, action)
-                            ops.append({"from": frm, "columns": _candidates(cols, hints), "src": [_src(m2, s)]})
+                            ops.append({"from": frm, "columns": _candidates(cols, hints), "features": _features(sql, _mask(sql)), "src": [_src(m2, s)]})
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
@@ -798,7 +874,8 @@ def extract(files, hints=None):
                 apis[action] = {"dataset": dataset, "src": [_src(tm, fn)],
                                 "response_items": [{"key": key, "src": s} for key, s in keys.items()],
                                 "error_patterns": errors, **clauses,
-                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "src": o["src"]} for o in ops]}
+                                "features": _merge_features([o["features"] for o in ops]),
+                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "src": o["src"]} for o in ops]}
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
@@ -857,6 +934,20 @@ def selftest():
     assert {"type": "LEFT JOIN", "logical_table": "shops", "condition": "s.id=t.id"} in gx["joins"], gx["joins"]
     assert {"alias": "a", "expression": "SUM(t.a)"} in gx["aliases"], gx["aliases"]
     assert [(w["logical_table"], w["logical_column"], w["operator"]) for w in gx["where"]] == [("real_tbl", "a", "="), ("real_tbl", "b", "IS")], gx["where"]
+    # 集計・ウィンドウ(C4): FILTER と OVER と ::型 と CTE の範囲を、本体と CTE の両方で取る
+    fsql = "WITH d AS (SELECT count(*) FILTER (WHERE t.x <> 0) OVER (PARTITION BY t.m, t.r) AS nz FROM real_tbl t) SELECT SUM(d.nz)::bigint AS total FROM d"
+    ff = _features(fsql, _mask(fsql))
+    assert ff["windows"] == [{"func": "count", "arg": "*", "filter": "t.x <> 0", "alias": "nz", "scope": "cte d", "cast": None,
+                              "over": {"partition_by": ["t.m", "t.r"], "order_by": []}}], ff["windows"]
+    assert ff["aggregates"] == [{"func": "SUM", "arg": "d.nz", "filter": None, "alias": "total", "scope": "main", "cast": "bigint"}], ff["aggregates"]
+    assert {"func": "SUM", "arg": "t.a", "filter": None, "alias": "a", "scope": "main", "cast": None} in gx["features"]["aggregates"], gx["features"]
+    # 分岐で変わる GROUP BY / ORDER BY(C4): 辞書[引数] と IfExp を通りごとに展開し、一部の通りにしか無い行に when を付ける
+    sfn = ast.parse("def f(group):\n    keys = G[group]\n    rc = 'p.r' if group == 'reg' else 'NULL'\n").body[0]
+    sc = _scenarios(sfn, {"G": {"reg": ["p.m", "p.r"], "shop": ["p.m"]}})
+    assert [l for l, _ in sc] == ["group = reg", "group = shop"] and sc[1][1]["keys"] == ["p.m"] and sc[1][1]["rc"] == "NULL", sc
+    acc = {k: [] for k in _CLAUSE_KEYS}
+    _merge_scenarios(acc, [_clauses("SELECT 1 FROM real_tbl p GROUP BY " + ", ".join(e["keys"])) for _, e in sc], [l for l, _ in sc])
+    assert [(g["logical_column"], g.get("when")) for g in acc["group_by"]] == [("m", None), ("r", "group = reg")], acc["group_by"]
     assert [e["status_code"] for e in r["auth"][0]["error_patterns"]] == [401], r["auth"]
     assert r["auth"][0]["function"] == "identify", r["auth"]
     assert not any(n in r["auth"][0][k] for n in ("identify", "lambda_handler", "h.py") for k in ("fact", "applies_to")), r["auth"]  # 物理名は function の欄にだけ

@@ -248,6 +248,27 @@ def check_h2_logical_names(h2):
             for _lt, lc, _pt, pc in _units.missing_logical_names(h2)]
 
 
+def check_h2_features(h2, draft):
+    """下書きの集計・ウィンドウ(apis[].features の aggregates・windows)の別名が、H2 の db_operations[].aggregate に全部あるか(C4)。
+    別名のある項目だけ名前で比べる(別名の無い集計は照合の手掛かりが無い)。無ければ ERROR にして H2 へ差し戻す。
+    呼出元: check_unit_extras。意味合い: 店舗別の日数が count(*) でレジ単位に数えている等の事実を、H2 が落とさないため。"""
+    ops = [o for o in (h2.get("db_operations") or []) if isinstance(o, dict)]
+    problems = []
+    for action, api in (draft.get("apis") or {}).items():
+        f = api.get("features") or {}
+        want = [x["alias"] for k in ("aggregates", "windows") for x in f.get(k) or [] if x.get("alias")]
+        if not want:
+            continue
+        mine = [o for o in ops if isinstance(o.get("api_endpoint"), dict) and o["api_endpoint"].get("action") == action]
+        have = {a.get("alias") for o in mine for a in (o.get("aggregate") if isinstance(o.get("aggregate"), list) else []) if isinstance(a, dict)}
+        lack = [a for a in want if a not in have]
+        if lack:
+            where = ",".join(o.get("id") or "?" for o in mine) or f"action={action} の行が無い"
+            problems.append(f"[集計の省略] db_operations[{where}].aggregate: 下書きの集計・ウィンドウ {len(want)} 件のうち H2 に無い別名: "
+                            f"{', '.join(lack)} → 差し戻し先 H2")
+    return problems
+
+
 def check_unit_extras(frags, directory):
     """--units の追加検査(ERROR)。(a) S1 の画面項目に react 下書きの display_rows の行名が全部ある /
     (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない /
@@ -280,7 +301,8 @@ def check_unit_extras(frags, directory):
     if frags.get("H2") is not None:
         for p in sorted(Path(directory).glob("*_backend_draft.json")):
             try:
-                problems += check_h2_columns(frags["H2"], json.loads(p.read_text(encoding="utf-8")))
+                draft = json.loads(p.read_text(encoding="utf-8"))
+                problems += check_h2_columns(frags["H2"], draft) + check_h2_features(frags["H2"], draft)
             except (OSError, json.JSONDecodeError):
                 continue
     h4 = {m.get("message_id"): m.get("message") for m in (frags.get("H4") or {}).get("messages_backend") or [] if isinstance(m, dict)}
@@ -439,6 +461,13 @@ def selftest_units():
     assert len(out) == 1 and "H2 に無い: last_date " in out[0], f"まとめた別名を拾わない: {out}"
     h2b["db_operations"][0]["dataset"].append({"physical_column": "kai_date"})
     assert check_h2_columns(h2b, draft2) == [], check_h2_columns(h2b, draft2)
+    # 下書きの集計・ウィンドウの別名が H2 の aggregate に無ければ ERROR(C4)
+    draft3 = {"apis": {"save": {"features": {"aggregates": [{"alias": "total"}], "windows": [{"alias": "nz"}]}}}}
+    h2f = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"}, "aggregate": [{"alias": "total"}]}]}
+    out = check_h2_features(h2f, draft3)
+    assert len(out) == 1 and "H2 に無い別名: nz" in out[0] and out[0].endswith("差し戻し先 H2"), out
+    h2f["db_operations"][0]["aggregate"].append({"alias": "nz"})
+    assert check_h2_features(h2f, draft3) == [], check_h2_features(h2f, draft3)
     # dataset の論理列が logical_names に無ければ WARN、合成で補う
     h2w = {"db_operations": [{"dataset": [{"logical_column": "店番号", "physical_column": "mise_no"}]}], "logical_names": []}
     assert len(check_h2_logical_names(h2w)) == 1, "logical_names の欠けを WARN にしない"
