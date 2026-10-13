@@ -72,7 +72,7 @@ _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 
 
 # 意味合い: 失敗時・連続操作・0件の分岐を TSX の文字から機械的に拾う目印。拾えた場合だけ details の下書き行に足す。
-#          文言の〈〉は LLM が埋める印。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
+#          失敗時の行は「エラー表示」で埋めて出す(〈〉を残すと合成後の穴検査が止める)。0件の〈〉は LLM が埋める印。接続: _robust_lines() が使う。推測では足さない(拾えない形は何も出さない)。
 # ponytail: 目印は文字列の一致だけ。catch や setError 等が別の用途で出ると、要らない行が1つ付く
 _FAIL_HINT = re.compile(r"\bcatch\s*\(|\bset\w*(?:Err|err)\w*\s*\(")
 _RACE_HINT = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)  # 末尾: useRef の連番(++seq.current)
@@ -390,7 +390,7 @@ def _robust_lines(texts):
     body = "\n".join(texts)
     lines = []
     if _FAIL_HINT.search(body):
-        lines.append("取得に失敗したときは〈エラー表示の項目〉にメッセージを表示する")
+        lines.append("取得に失敗したときはエラー表示にメッセージを表示する")
     if _RACE_HINT.search(body):
         lines.append("連続して操作したときは、最後の要求の応答だけを反映する")
     if _EMPTY_HINT.search(body):
