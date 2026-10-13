@@ -91,6 +91,7 @@
         "api_spec[].response_items[].no",
         "api_spec[].response_items[].display_name",
         "api_spec[].response_items[].data_type",
+        "api_spec[].response_items[].nullable",
         "api_spec[].response_items[].type",
         "api_spec[].src",
         "api_spec[].response_items[].src"

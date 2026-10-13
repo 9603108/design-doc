@@ -5,7 +5,7 @@ verify_vs_source.py — 中間 JSON の記述を、ソースの実物と機械�
 
 【目的】
 LLM が書いた文言・例示値が、ソース(Python / TSX)の文字列に実在するかを照合し、作り話を止める。
-今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)。B3・F の照合は同じファイルへ足す(改良案 0.2)。
+今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)・B3(応答項目の型と null 可。null 可の違いは ERROR)。F の照合は同じファイルへ足す(改良案 0.2)。
 
 【意味合い】
 - 戻りは verify_partials と同じ「[種別] 場所: 内容 → 差し戻し先 <単位>」。先頭に [WARN] を付けた行は終了コードに影響しない。
@@ -223,7 +223,48 @@ def check_kinds(validations, front_processes, behaviors):
     return problems
 
 
+def _cls(t):
+    """型の語(TS の型・H3 の data_type のどちらも)を string / number / boolean / array / object に分類する。分からなければ None。"""
+    s = re.sub(r"\s*\|\s*(null|undefined)\b", "", str(t or "")).strip().lower()
+    if s.endswith("[]") or s.startswith(("array", "配列")):
+        return "array"
+    for k, words in (("string", ("string", "date", "文字列", "日付")), ("number", ("number", "int", "numeric", "float", "数値", "整数")),
+                     ("boolean", ("boolean", "bool", "真偽")), ("object", ("object", "オブジェクト"))):
+        if s.startswith(words):
+            return k
+    return None
+
+
+def check_types(api_spec, apis):
+    """H3 の response_items の型と null 可を、backend 下書きの apis[action].response_fields(api.ts の型)と突き合わせる(B3)。
+    [型]: 型の分類が違う(WARN)。[null可]: nullable が違う(ERROR)。nullable が無い行は data_type の「| null」で見る。
+    呼出元: main。response_fields が無い API・下書きに無い key は見ない。"""
+    problems = []
+    for a in api_spec or []:
+        fields = {f["path"]: f for f in ((apis or {}).get(a.get("action")) or {}).get("response_fields") or []}
+        for r in a.get("response_items") or []:
+            f = fields.get(r.get("key"))
+            if f is None:
+                continue
+            where = f"api_spec[{a.get('action')}].response_items[{r['key']}]"
+            if _cls(r.get("data_type")) and _cls(f["ts_base"]) and _cls(r.get("data_type")) != _cls(f["ts_base"]):
+                problems.append(f"[WARN] [型] {where}: data_type={r.get('data_type')} だが api.ts の型は {f['ts_type']} → 差し戻し先 H3")
+            got = r["nullable"] if "nullable" in r else "null" in str(r.get("data_type")).lower()
+            if bool(got) != f["nullable"]:
+                problems.append(f"[null可] {where}: nullable={bool(got)} だが api.ts の型は {f['ts_type']}(null 可={f['nullable']}) → 差し戻し先 H3")
+    return problems
+
+
 def selftest():
+    # B3: reji_no は string | null。nullable を反転すると [null可] ERROR、型の分類違いは WARN
+    apis = {"act": {"response_fields": [{"path": "rows[].reji_no", "ts_type": "string | null", "ts_base": "string", "nullable": True},
+                                         {"path": "rows[].days", "ts_type": "number", "ts_base": "number", "nullable": False},
+                                         {"path": "dead_cols", "ts_type": "string[]", "ts_base": "string[]", "nullable": False}]}}
+    spec = lambda *rs: [{"action": "act", "response_items": [dict(zip(("key", "data_type", "nullable"), r)) for r in rs]}]
+    assert check_types(spec(("rows[].reji_no", "string", True), ("rows[].days", "integer", False), ("dead_cols", "string[]", False)), apis) == []
+    assert check_types([{"action": "act", "response_items": [{"key": "rows[].reji_no", "data_type": "string | null"}]}], apis) == [], "nullable 無しは data_type の | null で見る"
+    got = check_types(spec(("rows[].reji_no", "string", False), ("rows[].days", "string", False), ("x.unknown", "string", True)), apis)
+    assert [g.split(" ")[0] for g in got] == ["[null可]", "[WARN]"] and "rows[].reji_no" in got[0], got
     sp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
     beh = [{"id": "BH01", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)},
            {"id": "BH02", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(305), "control_src": []}]
@@ -295,6 +336,9 @@ def main(argv=None):
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
     cands, jsx, beh = [], [], []
+    type_problems = []
+    for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
+        type_problems = check_types(data.get("api_spec"), json.loads(p.read_text(encoding="utf-8")).get("apis"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
         rd = json.loads(p.read_text(encoding="utf-8"))
         cands, jsx, beh = rd.get("calc_candidates") or [], rd.get("jsx_elements") or [], rd.get("behaviors") or []
@@ -306,13 +350,15 @@ def main(argv=None):
     calc_problems = check_calcs(data.get("calculations") or [], cands) if cands else []
     problems += calc_problems
     kind_problems = check_kinds(data.get("validations") or data.get("validations_frontend"), data.get("front_processes"), beh)
-    for p in problems + kind_problems:
+    for p in problems + kind_problems + type_problems:
         print(p)
+    null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
+    print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件")
     n = len(data.get("calculations") or [])
     print(f"[INFO] 計算式の照合: ソースの式 {len(cands)} 件・calculations {n} 件・WARN {len(calc_problems)} 件")
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
     print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件に対し WARN {len(problems)} 件")
-    return 1 if kind_problems else 0
+    return 1 if kind_problems or null_problems else 0
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 
 # 集計・ウィンドウ関数の下書き(C4)。同じフォルダの _backend_facts.py を読む(実行時の sys.path は scripts/)
-from _backend_facts import features as _features, merge_features as _merge_features
+from _backend_facts import features as _features, merge_features as _merge_features, response_fields as _response_fields
 
 # FROM / JOIN の直後の別名として読んではいけない語
 _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON", "GROUP", "ORDER", "LIMIT",
@@ -880,6 +880,10 @@ def extract(files, hints=None):
                                 "error_patterns": errors, **clauses,
                                 "features": _merge_features([o["features"] for o in ops]),
                                 "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "src": o["src"]} for o in ops]}
+    # B3: 応答項目の型(api.ts)。action ごとに response_fields を足す(型が取れない API は空)
+    rf = _response_fields(hints.get("ts_files") or [])
+    for action, a in apis.items():
+        a["response_fields"] = rf.get(action, [])
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
@@ -915,7 +919,10 @@ def selftest():
                                        "ALTER TABLE real_tbl ADD COLUMN b integer;\nCOMMENT ON COLUMN public.real_tbl.a IS '金額A';\n", encoding="utf-8")
         (Path(d) / "V.tsx").write_text('const ROWS: X[] = [\n  { label: "名前", k: "name" },\n  { label: "対象外", k: "zzz" },\n];\n', encoding="utf-8")
         (Path(d) / "api.ts").write_text("export interface R {\n  x_id: number;\n  /** 合計B（参考値） */\n  b: number;\n  name: string;\n}\n", encoding="utf-8")
-        hints = {"ddl": _ddl(d), "ui": _ui_specs([Path(d) / "V.tsx"]), "types": _type_blocks([Path(d) / "api.ts"])}
+        hints = {"ddl": _ddl(d), "ui": _ui_specs([Path(d) / "V.tsx"]), "types": _type_blocks([Path(d) / "api.ts"]),
+                 "ts_files": [Path(d) / "api.ts"]}
+        (Path(d) / "api.ts").write_text("export interface R {\n  x_id: number;\n  /** 合計B */\n  b: number | null;\n  name: string;\n  [col: string]: number | string | null;\n}\n"
+                                        "export function g() {\n  return call<{\n    rows: R[];\n    n: number;\n    tags: string[];\n  }>(\"get_x\", {});\n}\n", encoding="utf-8")
         r = extract([Path(d) / "h.py", Path(d) / "q.py"], hints)
     # 骨組み: 最上位 SELECT の全列(別名・元の式・元の表と列)と FROM の行。論理名の候補は出所つき
     op = r["apis"]["get_x"]["db_operations"][0]
@@ -931,6 +938,11 @@ def selftest():
     assert {("id", "real_tbl"), ("a", "real_tbl"), ("b", "real_tbl"), ("name", "shops")} <= cols, cols
     assert [x["key"] for x in a["response_items"]] == ["rows", "n"], a["response_items"]
     assert {e["message"] for e in a["error_patterns"]} == {"必須です", "{p} は必須"}, a["error_patterns"]
+    # B3: api.ts の型。| null は nullable、interface の欄は rows[].x に展開、index signature は別持ち、型の無い API は空
+    rf = {f["path"]: f for f in a["response_fields"]}
+    assert rf["rows[].b"]["nullable"] is True and rf["rows[].b"]["ts_base"] == "number", rf
+    assert rf["rows[].name"]["nullable"] is False and rf["tags"]["ts_base"] == "string[]" and rf["n"]["ts_base"] == "number", rf
+    assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
     assert "common" not in r["apis"] and set(r["apis"]) == {"get_x", "get_y"}, "補助モジュールを API として数えた"
     ycols = {(x["column"], x["table"]) for x in r["apis"]["get_y"]["dataset"]}
     assert ycols == {("id", "real_tbl")}, ycols
@@ -1009,7 +1021,8 @@ def main(argv=None):
         if s:
             q = Path(os.path.expanduser(os.path.expandvars(s)))
             srcs.append(q if q.is_absolute() else root / q)
-    hints = {"ddl": _ddl(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs)}
+    hints = {"ddl": _ddl(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs),
+             "ts_files": [p for p in srcs if p.suffix in (".ts", ".tsx") and p.is_file()]}
     try:
         draft = extract(files, hints)
     except SyntaxError as e:

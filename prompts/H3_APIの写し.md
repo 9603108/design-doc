@@ -11,6 +11,9 @@
   - request_params は全件: {name, type, required, location(body / query / path / header), default, validation, description}
   - response_items は return する JSON の全 key を1キー1行: {key, no, display_name, data_type}
     - key は `rows[].shop_id` の形。「各列」「等」や（）でまとめない。display_name は業務の名前
+    - 応答の型を api.ts の型と照合する: 下書きの `apis[action].response_fields`(path・ts_base・nullable)に同じ path があれば、
+      data_type は ts_base の語(string / number / boolean / `string[]` など。日付は date(YYYY-MM-DD) でもよい)に合わせ、
+      `nullable`(true / false)は下書きの値をそのまま書く。型に `| null` がある項目は必ず `nullable: true`。下書きに無い key は nullable を書かない
 - action・key・name の字面は S2 も使う。ソースどおりに書く
 
 ## 書かない欄

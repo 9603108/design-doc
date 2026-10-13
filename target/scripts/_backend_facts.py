@@ -17,11 +17,14 @@ extract_backend_draft.py の下書きに、SQL の集計(SUM/COUNT/MIN/MAX/AVG/a
 【接続情報】
   - 呼出元: extract_backend_draft.extract()(SQL 1 本ごとに db_operations[].features、API ごとに apis[].features)
   - 呼出元: extract_backend_draft.selftest()(形の検査)
+  - B3: response_fields(ts_paths) は api.ts の型から apis[action].response_fields(path・ts_base・nullable・ts_src)を作る。
+    呼出元は extract_backend_draft.extract()。照合は verify_vs_source.check_types
   - 呼出先: merge_features() は同じ extract() が API 単位の重ね合わせに使う。ほかに呼出先は無い(標準ライブラリの re のみ)
 
 ponytail: 括弧は位置で閉じを探すだけ。文字列の中の括弧は _mask で消してある前提。HAVING と ORDER BY の中の集計は見ない。
 """
 import re
+from pathlib import Path
 
 # 集計の関数名。count(*) のような引数も括弧の中をそのまま arg に入れる
 _AGG = re.compile(r"\b(SUM|COUNT|MIN|MAX|AVG|array_agg|string_agg)\s*\(", re.IGNORECASE)
@@ -106,6 +109,107 @@ def features(sql, m):
             item["over"] = over
             win.append(item)
     return {"aggregates": agg, "windows": win}
+
+
+# ---- B3: 応答項目の型(api.ts の interface と call<{…}>("action") の型引数) ----
+_TS_IFACE = re.compile(r"\binterface\s+(\w+)[^{\n]*\{")
+_TS_CALL = re.compile(r"\bcall\s*<\s*\{")
+_TS_MEMBER = re.compile(r"^(?:\[\s*\w+\s*:\s*\w+\s*\]|(\w+)(\?)?)\s*:\s*(.+)$", re.S)
+
+
+def _end(t, i):
+    """t[i] の開き括弧({ [ ( のどれか)に対応する閉じの位置(無ければ末尾)。"""
+    depth = 0
+    for j in range(i, len(t)):
+        depth += (t[j] in "({[") - (t[j] in ")}]")
+        if depth == 0:
+            return j
+    return len(t)
+
+
+def _members(t, b, e):
+    """t[b:e](interface や型引数の本体)の欄を [(欄の文字列, 先頭の位置)] で返す。深さ 0 の ; と改行で割り、
+    欄の形(名前: 型)でない行は直前の欄の続き(複数行の型)として足す。コメントは呼出元が空白に置換済み。"""
+    segs, depth, st = [], 0, b
+    for i in range(b, e):
+        depth += (t[i] in "({[") - (t[i] in ")}]")
+        if t[i] in ";\n" and depth == 0:
+            segs.append((st, i))
+            st = i + 1
+    segs.append((st, e))
+    out = []
+    for s, f in segs:
+        raw = t[s:f]
+        txt = raw.strip()
+        if not txt:
+            continue
+        if not _TS_MEMBER.match(txt) and out:
+            out[-1][0] += " " + txt
+        else:
+            out.append([txt, s + len(raw) - len(raw.lstrip())])
+    return out
+
+
+def _union(typ):
+    """型を深さ 0 の | で割り、(null を除いた型, null を含むか)を返す。undefined は欄の任意(?)と同じ扱いで除く。"""
+    parts, depth, st = [], 0, 0
+    for i, c in enumerate(typ + "|"):
+        depth += (c in "({[") - (c in ")}]")
+        if c == "|" and depth == 0:
+            parts.append(typ[st:i].strip())
+            st = i + 1
+    rest = [p for p in parts if p not in ("null", "undefined")]
+    return " | ".join(rest), "null" in parts
+
+
+def _fields(t, file, members, prefix, path_of):
+    """欄のリスト(本文 t・ファイル file の中)を response_fields の要素にする。path_of(名前)が欄の path。
+    index signature([col: string]: …)は index_signature: true で path は prefix + "[*]"。"""
+    out = []
+    for txt, off in members:
+        m = _TS_MEMBER.match(txt)
+        typ = m.group(3).strip().rstrip(",")
+        base, nullable = _union(typ)
+        f = {"path": path_of(m.group(1)) if m.group(1) else prefix + "[*]", "ts_type": typ, "ts_base": base,
+             "nullable": nullable, "optional": bool(m.group(2)),
+             "ts_src": [{"file": file, "line_start": t.count("\n", 0, off) + 1, "line_end": t.count("\n", 0, off) + 1}]}
+        if not m.group(1):
+            f["index_signature"] = True
+        out.append(f)
+    return out
+
+
+def response_fields(ts_paths):
+    """TS ファイル群から {action: [response_fields]} を作る。fetch 関数の call<{ rows: Row[]; … }>("action") の
+    トップのキーと、その型が interface なら中の欄(`rows[].reji_no` の形)を、null 可・任意・行番号つきで返す。
+    ponytail: コメントは // 以降を行末まで空白にする(文字列内の // があると欄が欠ける)。型エイリアス・交差型 (A & {…})[] は展開しない。
+    呼出元: extract_backend_draft.extract(hints["ts_files"])。"""
+    texts, ifaces = {}, {}
+    for p in ts_paths:
+        try:
+            raw = Path(p).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        t = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: re.sub(r"[^\n]", " ", m.group()), raw, flags=re.S)
+        texts[str(p)] = t
+        for m in _TS_IFACE.finditer(t):
+            ifaces[m.group(1)] = (str(p), _members(t, m.end(), _end(t, m.end() - 1)))
+    out = {}
+    for p, t in texts.items():
+        for m in _TS_CALL.finditer(t):
+            e = _end(t, m.end() - 1)
+            am = re.match(r"\s*>\s*\(\s*[\"'](\w+)[\"']", t[e + 1:])
+            if not am:
+                continue
+            fields = _fields(t, p, _members(t, m.end(), e), "", lambda n: n)
+            for f in list(fields):
+                im = re.fullmatch(r"(\w+)(\[\])?", f["ts_base"])
+                if not f.get("index_signature") and im and im.group(1) in ifaces:
+                    ip, mem = ifaces[im.group(1)]
+                    pre = f["path"] + ("[]" if im.group(2) else "")
+                    fields += _fields(texts[ip], ip, mem, pre, lambda n, k=pre + ".": k + n)
+            out[am.group(1)] = fields
+    return out
 
 
 def merge_features(feats):

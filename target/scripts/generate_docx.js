@@ -2383,7 +2383,8 @@ function sectionBackendProcesses(backendProcesses, maps, opts = {}) {
           String(r.no || ''),
           r.key || '',
           r.display_name || '',
-          r.data_type || '',
+          // B3: 値なしがありうる項目(api.ts で | null)は型の後ろに「（値なしあり）」を付ける
+          (r.data_type || '') + (r.nullable ? '（値なしあり）' : ''), // fallback-ok: 型の空欄は従来どおり空表示(既存行と同じ)
           srcText,
           transformBackend
         ];
