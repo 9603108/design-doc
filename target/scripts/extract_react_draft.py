@@ -656,6 +656,8 @@ def main(argv=None):
     draft.update(_react_facts.jsx_elements(sources))
     # 目的: 処理の種別(表示切替・活性切替・絞り込み・入力検査)を下書きに足し、verify_vs_source.check_kinds が H4/S3 の書き方と突き合わせる(B5)。接続: _react_facts.behaviors
     draft.update(_react_facts.behaviors(sources))
+    # 目的: 画面部品の中で使う応答項目(r.shop_name 等)の出どころを下書きに足し、S2 の response_to_screen_mapping の土台にする(C5)。接続: _react_facts.field_usage
+    draft.update(_react_facts.field_usage(sources))
     # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
     # 不具合の修正: api_call_functions は共通ラッパー(call)だけで、画面の useEffect が呼ぶ fetchXxx を含まない。
     #   画面が使う API 関数は excerpt(api.ts から抜いた断片)の定義名なので、その名前も渡す。

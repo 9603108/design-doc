@@ -586,6 +586,163 @@ def behaviors(sources):
     return {"behaviors": out}
 
 
+_ROWS_STATE = re.compile(
+    r"\bconst\s*\[\s*(\w+)\s*,\s*\w+\s*\]\s*=\s*useState<([^\n]*?)\[\]>\(\s*\[\s*\]\s*\)")
+_DERIVED = re.compile(r"\bconst\s+(\w+)\s*=\s*useMemo\(\s*\(\)\s*=>\s*(\w+)\.(?:filter|slice|sort)\b")
+_ITER = r"\.(?:map|filter|forEach|find|reduce|some|every)\("
+_SPEC_COL = re.compile(r"\b(?:kin|cnt)\s*:\s*\"(\w+)\"")
+_NEAR_TAG = re.compile(r"<([A-Za-z]\w*)")
+_FUNC_NAME = re.compile(r"\b(?:const|function)\s+(\w+)\s*(?:=|\()")
+
+
+def _scope_after_params(text, po):
+    """text[po] の `(` で始まる仮引数の直後の本体(`=> {…}`・`=> 式`・`{…}`)の範囲 (s, e) を返す。無ければ None。"""
+    pe = _end(text, po)
+    sm = re.match(r"\s*(?::\s*[\w<>\[\]|, ]+?)?\s*(=>|\{)\s*", text[pe + 1:pe + 200])
+    if not sm:
+        return None
+    if sm.group(1) == "{":
+        s = pe + 1 + sm.end(1) - 1
+        return s, _end(text, s)
+    s = pe + 1 + sm.end()
+    e = _expr_end(text, s)
+    semi = text.find(";", s)
+    return s, (min(e, semi) if semi >= 0 else e)
+
+
+def _element_scopes(text, base, types, typed_root):
+    """行の配列(base: state名・派生名 → 元の state 名)の要素変数が使える範囲を [(変数名, 開始, 終了, 元の state 名)] で返す。
+
+    要素変数は、`配列.map((x…` などの引数、`for (const x of 配列)`、型 types の仮引数(`(r: PosReportRow …)`。元は typed_root)。
+    ponytail: 変数の入れ子・同名の遮蔽は見ない。
+    """
+    out = []
+    for v, owner in base.items():
+        for m in re.finditer(rf"\b{re.escape(v)}{_ITER}", text):
+            po = m.end() - 1
+            pm = re.match(r"\s*\(?\s*(\w+)\s*(?:,\s*(\w+))?", text[po + 1:])
+            if pm:
+                name = pm.group(2) if m.group(0).endswith(".reduce(") and pm.group(2) else pm.group(1)
+                out.append((name, po, _end(text, po), owner))
+        for m in re.finditer(rf"\bfor\s*\(\s*const\s+(\w+)\s+of\s+{re.escape(v)}\s*\)", text):
+            s = m.end()
+            nxt = re.match(r"\s*", text[s:]).end() + s
+            e = _end(text, nxt) if text[nxt:nxt + 1] == "{" else max(text.find(";", nxt), nxt)
+            out.append((m.group(1), s, e, owner))
+    for t in types:
+        for m in re.finditer(rf"\(\s*(\w+)\s*:\s*{re.escape(t)}\b", text):
+            sc = _scope_after_params(text, m.start())
+            if sc:
+                out.append((m.group(1), sc[0], sc[1], typed_root))
+    return out
+
+
+def _use_element(text, s, pos):
+    """範囲の開始 s から pos までの最寄りの開きタグ(属性の中なら「タグ の 属性」)、無ければ囲む関数名を返す。"""
+    tags = list(_NEAR_TAG.finditer(text, s, pos))
+    if tags:
+        t = tags[-1]
+        if _tag_end(text, t.start()) >= pos:
+            am = list(re.finditer(r"\b(\w+)=\{", text[t.start():pos]))
+            if am:
+                return f"{t.group(1)} の {am[-1].group(1)}"
+        return t.group(1)
+    fm = list(_FUNC_NAME.finditer(text, 0, pos))
+    return f"関数 {fm[-1].group(1)}" if fm else ""
+
+
+def field_usage(sources):
+    """画面部品の中の応答項目の使われ方を {"field_usage": [...]} で返す(案 C5)。
+
+    呼出元: extract_react_draft.main()。意味合い: S2 の response_to_screen_mapping が「どの項目が画面のどこに出るか」を、
+    推測でなくソースの `x.項目` から書く土台。path は「state名[].項目」(例 rows[].shop_name)。
+    how: member(`x.項目`)/ spec_array(定数配列の `kin: "項目"`・`cnt: "項目"`)/ dynamic(Object.entries(x) の全項目走査)。
+    null_guard は `x.項目` の直後に `?`・`&&` が続くとき true(`??`・`?.` も含む)。
+    ponytail: 応答の型は読まないので、どの画面部品でも参照されない項目(unused)は出さない。要れば api.ts の型と突き合わせる。
+    """
+    paths = {}
+
+    def add(path, how, use, guard=False):
+        e = paths.setdefault(path, {"path": path, "how": how, "null_guard": False, "uses": []})
+        e["null_guard"] = e["null_guard"] or guard
+        if use not in e["uses"]:
+            e["uses"].append(use)
+
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        states = _ROWS_STATE.findall(text)
+        if not states:
+            continue
+        base = {n: n for n, _ in states}
+        for m in _DERIVED.finditer(text):
+            if m.group(2) in base:
+                base[m.group(1)] = base[m.group(2)]
+        types = [t for _, t in states if re.fullmatch(r"\w+", t)]
+        # 型付き仮引数の要素は、型名で宣言した state(最初の1つ)に結ぶ
+        typed_root = next((n for n, t in states if re.fullmatch(r"\w+", t)), states[0][0])
+
+        def span(s, e):
+            return [{"file": str(p), "line_start": text.count("\n", 0, s) + 1, "line_end": text.count("\n", 0, e) + 1}]
+
+        for v, s, e, owner in _element_scopes(text, base, types, typed_root):
+            for fm in re.finditer(rf"\b{re.escape(v)}\.(\w+)((?:\.\w+\([^()]*\))?)", text[s:e + 1]):
+                pos = s + fm.start()
+                guard = bool(re.match(r"\s*(?:\?|&&)", text[s + fm.end():s + fm.end() + 6]))
+                use = {"expr": fm.group(0), "element": _use_element(text, s, pos), "null_guard": guard,
+                       "src": span(pos, s + fm.end())}
+                add(f"{owner}[].{fm.group(1)}", "member", use, guard)
+            for dm in re.finditer(rf"Object\.entries\(\s*{re.escape(v)}\s*\)", text[s:e + 1]):
+                pos = s + dm.start()
+                add(f"{owner}[].*", "dynamic", {"expr": dm.group(0), "element": _use_element(text, s, pos),
+                                                "note": "全項目を走査する", "src": span(pos, s + dm.end())})
+        for m in _SPEC_COL.finditer(text):
+            head = text[text.rfind("{", 0, m.start()):m.start()]
+            lm = re.search(r"label:\s*\"([^\"]*)\"", head)
+            add(f"{typed_root}[].{m.group(1)}", "spec_array",
+                {"expr": m.group(0), "element": f"行「{lm.group(1)}」" if lm else "", "src": span(m.start(), m.end())})
+    return {"field_usage": list(paths.values())}
+
+
+def selftest_field_usage():
+    """member(null_guard・要素)・spec_array・dynamic を最小の TSX で assert する。"""
+    tsx = (
+        "const S = [{ label: \"総\", kin: \"sou\" }];\n"
+        "function toAgg(r: Row) {\n"
+        "  for (const [k, v] of Object.entries(r)) a[k] = v;\n"
+        "}\n"
+        "export default function P() {\n"
+        "  const [rows, setRows] = useState<Row[]>([]);\n"
+        "  const w = useMemo(() => rows.filter((r) => r.days > 0), [rows]);\n"
+        "  const csv = () => rows.map((r) => q(r.name));\n"
+        "  return (\n"
+        "    <ul>\n"
+        "      {w.map((r) => (\n"
+        "        <li>\n"
+        "          {r.name}{r.no ? r.no : \"\"}\n"
+        "        </li>\n"
+        "      ))}\n"
+        "    </ul>\n"
+        "  );\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = {g["path"]: g for g in field_usage([p])["field_usage"]}
+        assert got["rows[].name"]["how"] == "member" and len(got["rows[].name"]["uses"]) == 2, got["rows[].name"]
+        assert {u["element"] for u in got["rows[].name"]["uses"]} == {"li", "関数 csv"}, got["rows[].name"]
+        assert got["rows[].no"]["null_guard"] is True and got["rows[].days"]["null_guard"] is False, got
+        assert got["rows[].sou"]["how"] == "spec_array" and got["rows[].*"]["how"] == "dynamic", got
+    except AssertionError as e:
+        print(f"[selftest NG] field_usage {e}")
+        return 1
+    print("[selftest OK] _react_facts.field_usage")
+    return 0
+
+
 def selftest_behaviors():
     """display_toggle・enable_toggle・data_filter・input_check と control_src を最小の TSX で assert する。"""
     tsx = (
@@ -845,6 +1002,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
