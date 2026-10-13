@@ -502,14 +502,21 @@ def selftest_units():
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
-    # 型文の {key} は、下書きの展開済みの値(shop_id)の説明が画面項目名で始まるとき、その画面項目名で展開する。対応が無ければ穴のまま
-    out = {"screen_layout": {"items": [{"item_name": "店舗"}, {"item_name": "店舗名"}]},
-           "api_spec": [{"request_params": [{"name": "shop_id", "description": "店舗番号。省略時は全店"}]}],
-           "messages_backend": [{"message_id": "MSE00002", "message": "{key} は正の整数で指定してください"},
-                                {"message_id": "MSE00003", "message": "{key} は日付で指定してください"}]}
-    _units._expand_message_holes(out, {"{key} は正の整数で指定してください": "MSE00002", "shop_id は正の整数で指定してください": "MSE00002",
-                                       "{key} は日付で指定してください": "MSE00003", "from は日付で指定してください": "MSE00003"})
-    assert [m["message"] for m in out["messages_backend"]] == ["店舗 は正の整数で指定してください", "{key} は日付で指定してください"], out
+    # 型文の {key} は、下書きの呼出ごとの展開済みの文面(from・to・shop_id)へ、1呼出1件で置き換える(画面項目名への言い換えはしない)。
+    # 展開が取れない型文は穴のまま。参照(error_patterns・validations_frontend・request_params.validation)の ID も付け替える
+    out = {"api_spec": [{"request_params": [{"name": "from", "description": "集計開始日", "validation": "日付(MSE00003)"},
+                                            {"name": "to", "description": "集計終了日", "validation": "日付(MSE00003)"}],
+                         "error_patterns": [{"condition": "集計開始日が不正", "message_id": "MSE00003"},
+                                            {"condition": "集計終了日が不正", "message_id": "MSE00003"}]}],
+           "validations_frontend": [{"field": "集計終了日", "message_id": "MSE00003"}],
+           "messages_backend": [{"message_id": "MSE00003", "message": "{key} は日付で指定してください", "severity": "error"},
+                                {"message_id": "MSE00009", "message": "{x} は取れない", "severity": "error"}]}
+    _units._expand_messages(out, {"{key} は日付で指定してください": [("MSE00003", "from は日付で指定してください", "from"),
+                                                                 ("MSE00004", "to は日付で指定してください", "to")]})
+    assert [(m["message_id"], m["message"]) for m in out["messages_backend"]] == [
+        ("MSE00003", "from は日付で指定してください"), ("MSE00004", "to は日付で指定してください"), ("MSE00009", "{x} は取れない")], out
+    assert [e["message_id"] for e in out["api_spec"][0]["error_patterns"]] == ["MSE00003", "MSE00004"], out
+    assert [v["message_id"] for v in out["validations_frontend"]] == ["MSE00004"] and [q["validation"] for q in out["api_spec"][0]["request_params"]] == ["日付(MSE00003)", "日付(MSE00004)"], out
     # 英大文字だけの略語(POS)は、ソースの識別子に同じ形で無ければ物理名としない。同じ形で在れば物理名
     import verify_intermediate as vi
     def phys(src_idents):

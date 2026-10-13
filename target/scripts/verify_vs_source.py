@@ -52,6 +52,9 @@ def collect_source_strings(files):
                 for n in ast.walk(ast.parse(text)):
                     if isinstance(n, ast.Constant) and isinstance(n.value, str):
                         out.add(norm(n.value))
+                    elif isinstance(n, ast.JoinedStr):
+                        # f-string は穴を {_} にした型文も入れる(呼出の実引数で展開した文言が、この型文に当てはまるかを _in_source が見る)
+                        out.add(norm("".join(v.value if isinstance(v, ast.Constant) else "{_}" for v in n.values)))
             except SyntaxError:
                 continue
         else:
@@ -95,7 +98,10 @@ def _in_source(text, strings):
     """text(正規化済み)がソースのどれかの文字列に含まれるか。{key} などの穴は、穴の間の定数部がどれかの文字列に
     全部含まれるかで見る(穴の中身は実行時に決まるため)。"""
     chunks = [c.strip() for c in _HOLE.split(text) if len(c.strip()) >= 2]
-    return not chunks or any(all(c in s for c in chunks) for s in strings)
+    if not chunks or any(all(c in s for c in chunks) for s in strings):
+        return True
+    # 展開済みの文言(例 shop_id は正の整数で指定してください)は、穴({_})を持つソースの f-string の型文に当てはまれば実在とみなす
+    return any("{_}" in s and len("".join(s.split("{_}")).strip()) >= 2 and re.search("(?:.+?)".join(re.escape(p) for p in s.split("{_}")), text) for s in strings)
 
 
 def check_messages(data, strings):
@@ -414,6 +420,11 @@ def selftest():
         ok = {"messages": [{"message_id": "M1", "message": "from は YYYY-MM-DD 形式で指定してください"},
                            {"message_id": "M2", "message": "{key} は正の整数で指定してください。"}]}
         assert check_messages(ok, s) == [], check_messages(ok, s)
+        # 型文({key})を呼出の実引数で展開した文言は、ソースの f-string の型文に当てはまれば実在。当てはまらない文言は WARN
+        ex = {"messages_backend": [{"message_id": "M3", "message": "shop_id は正の整数で指定してください"},
+                                   {"message_id": "M4", "message": "shop_id は日付で指定してください"}]}
+        got = check_messages(ex, s)
+        assert len(got) == 1 and "M4" in got[0], got
         # 受け入れ条件: 「from」を「集計開始日」に書き換えた文言は WARN
         bad = {"messages": [{"message_id": "M1", "message": "集計開始日 は YYYY-MM-DD 形式で指定してください"}]}
         assert len(check_messages(bad, s)) == 1 and check_messages(bad, s)[0].startswith("[WARN] [文言]")

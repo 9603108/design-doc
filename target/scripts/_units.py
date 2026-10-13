@@ -196,10 +196,12 @@ def check_fragments(spec, frags, only=None):
 
 
 def _backend_draft_facts():
-    """backend 下書き(<画面>_backend_draft.json)から (認証の fact, {文面: メッセージ ID}, 認証の error_patterns) を取る。
-    呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。auth の error_patterns(ソースに拒否の処理があったものだけ)も返す。下書きが無ければ ("", {}, [])。"""
+    """backend 下書き(<画面>_backend_draft.json)から (認証の fact, {文面: メッセージ ID}, 認証の error_patterns, 展開) を取る。
+    呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。auth の error_patterns(ソースに拒否の処理があったものだけ)も返す。
+    展開 = {型文: [(ID, 呼出ごとの展開済みの文面, 検査の対象 param)]}。型文は {key} などの穴を持つソースの文面で、展開済みは呼出箇所の実引数で埋めたもの
+    (下書きの text_expanded。取れなかった型文は入らない)。下書きが無ければ ("", {}, [], {})。"""
     from _config_loader import INTERMEDIATE_DIR
-    fact, msgs, auth_errs = "", {}, []
+    fact, msgs, auth_errs, expansions = "", {}, [], {}
     for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
@@ -214,7 +216,12 @@ def _backend_draft_facts():
             for key in ("message", "text_expanded"):  # H4 は型文のままか展開済みの文面のどちらかで書く
                 if e.get("id") and e.get(key):
                     msgs[e[key]] = e["id"]
-    return fact, msgs, auth_errs
+            t, x = (e.get("message") or "").rstrip("。"), e.get("text_expanded") or ""
+            if e.get("id") and x and x != e.get("message") and re.search(r"\{[^{}]+\}", t):
+                lst = expansions.setdefault(t, [])
+                if e["id"] not in [i for i, _, _ in lst]:  # 同じ展開済みの文は同じ ID(下書きが1件にまとめている)
+                    lst.append((e["id"], x, e.get("param") or ""))
+    return fact, msgs, auth_errs, expansions
 
 
 def _draft_common_errors():
@@ -261,35 +268,44 @@ def _align_message_ids(out, draft_msgs):
             r["message_id"] = rename[r["message_id"]]
 
 
-def _expand_message_holes(out, draft_msgs):
-    """【compose からは呼ばない(F1)。verify_partials の selftest だけが使う】
-    messages_backend の型文の {key} 等を、画面項目名で展開する(verify_intermediate は未展開の穴を ERROR にするため)。
-    意味合い: 下書きは同じ ID の文面を「型文」と「展開済み(例 shop_id は…)」の両方で持つ。展開済みから {key} の実際の値(要求の項目名)を
-    取り、その項目の説明(request_params / parameters_backend の description)が画面項目名で始まるなら、その画面項目名で置き換える。
-    対応が取れない穴が1つでもあれば、その文面は触らず穴として残す(検査が差し戻す)。
-    ponytail: 対応は「説明が画面項目名で始まる」だけで取る(最長の項目名を優先)。取れなければ下書きの明示の対応が要る。"""
-    items = sorted({i["item_name"] for i in (out.get("screen_layout") or {}).get("items") or []
-                    if isinstance(i, dict) and i.get("item_name")}, key=len, reverse=True)
-    rows = [r for a in out.get("api_spec") or [] for r in a.get("request_params") or []] + list(out.get("parameters_backend") or [])
-    item_of = {}
-    for r in rows:
-        if isinstance(r, dict) and r.get("name"):
-            desc = r.get("description") or ""
-            item_of.setdefault(r["name"], next((n for n in items if desc.startswith(n)), None))
-    by_id = {}
-    for text, mid in draft_msgs.items():
-        by_id.setdefault(mid, []).append(text)
-    for m in out.get("messages_backend") or []:
-        parts = re.split(r"(\{[^{}\s]+\})", m.get("message") or "")
-        if len(parts) < 3:
+def _expand_messages(out, expansions):
+    """messages_backend の型文({key} など)を、下書きが持つ呼出ごとの実際の文面(from・to・shop_id の実引数で展開したもの)へ置き換える。
+    呼出元: compose(_align_message_ids の前)。意味合い: 画面に出る文言はソースの実行時の文字列なので、型文のままだと
+    verify_intermediate が未展開の穴を ERROR にする。画面項目名への言い換えはせず、呼出ごとに1件のメッセージ(ID は下書きのもの)にする。
+    型文が下書きに無い・展開が取れなかったものは触らず穴のまま残す(検査が差し戻す)。
+    参照(api_spec.error_patterns・validations_frontend の message_id、request_params.validation の括弧内の ID)は、元の型文の ID から
+    展開した ID へ付け替える。展開が複数のときは、その行の字面に request_params の説明の先頭の語(例 集計開始日)があれば、その項目の呼出の ID。
+    決まらなければ先頭の展開の ID。
+    ponytail: 付け替えは説明の先頭の語の一致だけで取る(外れても参照は実在する ID を指す)。"""
+    rows = [m for m in out.get("messages_backend") or []]
+    fixed = [m for m in rows if not (isinstance(m, dict) and expansions.get((m.get("message") or "").rstrip("。")))]
+    have = {m.get("message_id") for m in fixed if isinstance(m, dict)}
+    remap, new = {}, []
+    for m in rows:
+        ex = expansions.get((m.get("message") or "").rstrip("。")) if isinstance(m, dict) else None
+        if not ex:
+            new.append(m)
             continue
-        pat = "".join("(.+?)" if i % 2 else re.escape(p.rstrip("。") if i == len(parts) - 1 else p) for i, p in enumerate(parts))
-        for text in by_id.get(m.get("message_id"), []):
-            g = re.fullmatch(pat, text.rstrip("。"))
-            if g and all(item_of.get(v) for v in g.groups()):
-                names = iter(item_of[v] for v in g.groups())
-                m["message"] = "".join(next(names) if i % 2 else p for i, p in enumerate(parts))
-                break
+        remap[m.get("message_id")] = [(i, p) for i, _, p in ex]
+        for i, text, _ in ex:
+            if i not in have:
+                have.add(i)
+                new.append({**{k: v for k, v in m.items() if k != "src"}, "message_id": i, "code": i, "message": text})
+    if not remap:
+        return
+    out["messages_backend"] = new
+    params = [q for a in out.get("api_spec") or [] for q in a.get("request_params") or [] if isinstance(q, dict) and q.get("name")]
+    head = {q["name"]: re.split(r"[。、（(]", q.get("description") or "")[0] for q in params}
+    refs = [e for a in out.get("api_spec") or [] for e in a.get("error_patterns") or []] + list(out.get("validations_frontend") or [])
+    for r in refs:
+        if isinstance(r, dict) and r.get("message_id") in remap:
+            text = json.dumps(r, ensure_ascii=False)
+            r["message_id"] = next((i for i, p in remap[r["message_id"]] if head.get(p) and head[p] in text), remap[r["message_id"]][0][0])
+    for q in params:
+        def to_id(g, q=q):
+            return next((i for i, p in remap.get(g.group(0), []) if p == q["name"]), g.group(0))
+        if q.get("validation"):
+            q["validation"] = re.sub(r"MSE\d+", to_id, q["validation"])
 
 
 def missing_logical_names(composed):
@@ -393,10 +409,10 @@ def compose(spec, frags, project_config=None):
     # 足した message_id は messages_backend にも入れ、check_refs の参照検査で実在を確かめる。
     common = list((project_config or {}).get("common_errors") or [])
     auth_desc = (project_config or {}).get("auth_description") or ""
-    draft_msgs = {}
+    draft_msgs, expansions = {}, {}
     if project_config is not None:
         # backend 下書きの auth.fact(認証の掛かり方の事実)と、メッセージの ID・文面を正として使う
-        auth_fact, draft_msgs, auth_errs = _backend_draft_facts()
+        auth_fact, draft_msgs, auth_errs, expansions = _backend_draft_facts()
         if not auth_desc and auth_fact:
             auth_desc = auth_fact
         # 401/403 などの認証の失敗は、ソースが拒否の処理を持つときだけ足す(下書きの auth.error_patterns)。固定の文では足さない(D2)
@@ -408,7 +424,9 @@ def compose(spec, frags, project_config=None):
         for ce in _draft_common_errors():
             if not any(c.get("status_code") == ce["status_code"] for c in common):
                 common.append(ce)
-    # F1: message はソースの文字列のまま(下書きの text_expanded)。画面項目名への置き換え(_expand_message_holes)はしない
+    # F1: message はソースの文字列のまま。型文の {key} などは、呼出ごとの実引数で展開した実際の文言(下書きの text_expanded)に
+    # 1呼出1件で置き換える。画面項目名への言い換えはしない。展開できない穴は残す(verify_intermediate が ERROR にする)
+    _expand_messages(out, expansions)
     _align_message_ids(out, draft_msgs)
     if common or auth_desc:
         for api in out.get("api_spec") or []:
