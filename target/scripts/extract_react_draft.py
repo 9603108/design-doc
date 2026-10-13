@@ -625,6 +625,12 @@ def main(argv=None):
     draft.update(_react_facts.extract(links, sources))
     # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
     draft.update(_react_facts.csv_exports(links, sources))
+    # 目的: 計算式の候補(定数配列の calc)を下書きに足し、verify_vs_source.check_calcs が H4 の calculations と突き合わせる(B1)。接続: _react_facts.calc_candidates
+    draft.update(_react_facts.calc_candidates(sources))
+    # 目的: 入力・操作系の JSX 要素(label・種別の目安)を下書きに足し、verify_vs_source.check_items が画面項目と突き合わせる(B2)。接続: _react_facts.jsx_elements
+    draft.update(_react_facts.jsx_elements(sources))
+    # 目的: 処理の種別(表示切替・活性切替・絞り込み・入力検査)を下書きに足し、verify_vs_source.check_kinds が H4/S3 の書き方と突き合わせる(B5)。接続: _react_facts.behaviors
+    draft.update(_react_facts.behaviors(sources))
     # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
     # 不具合の修正: api_call_functions は共通ラッパー(call)だけで、画面の useEffect が呼ぶ fetchXxx を含まない。
     #   画面が使う API 関数は excerpt(api.ts から抜いた断片)の定義名なので、その名前も渡す。

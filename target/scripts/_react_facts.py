@@ -394,6 +394,298 @@ def csv_exports(links, sources):
     return {"csv_exports": out}
 
 
+_CALC = re.compile(r"\bcalc\s*:\s*\((\w+)\)\s*=>\s*")
+_SPEC_OBJ = re.compile(r"\{\s*label:\s*\"([^\"]*)\"([^{}]*)\}")
+
+
+def _expr_end(text, i):
+    """text[i] から始まる式の終わり(深さ0のカンマ、または対の無い閉じ括弧の位置)を返す。文字列の中は数えない。"""
+    depth, quote = 0, None
+    for j in range(i, len(text)):
+        c = text[j]
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif c == "," and depth == 0:
+            return j
+    return len(text)
+
+
+def _col_names(text):
+    """定数配列の {label, csv, kin, cnt} から 列名 → [画面での名前(label・csv)] を作る。呼出元: calc_candidates。"""
+    names = {}
+    for m in _SPEC_OBJ.finditer(text):
+        csv = re.search(r"csv:\s*\"([^\"]*)\"", m.group(2))
+        for col in re.findall(r"\b(?:kin|cnt):\s*\"(\w+)\"", m.group(2)):
+            names.setdefault(col, _uniq([m.group(1)] + ([csv.group(1)] if csv else [])))
+    return names
+
+
+def calc_candidates(sources):
+    """定数配列の `calc: (r) => 式` を {"calc_candidates": [...]} で返す(案 B1)。
+
+    呼出元: extract_react_draft.main()。意味合い: 計算式の「式そのもの」をソースから取り、H4 の calculations と verify_vs_source.check_calcs が突き合わせる。
+    operands は式の中の `<引数>.<列>`、operators は + - * /(深さは見ない)、funcs は Math.xxx、guards は `列 ? … : 値` の三項。
+    operand_labels は列の画面での名前(label・csv)。取れない欄は空で出す。
+    ponytail: 算術を持つ useMemo / 関数は拾わない(calc: の定数配列だけ)。要れば _CALC と同じ形で足す。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        names = _col_names(text)
+        for m in _CALC.finditer(text):
+            s, e = m.end(), _expr_end(text, m.end())
+            expr = text[s:e].strip()
+            if expr.startswith("(") and _end(expr, 0) == len(expr) - 1:
+                expr = expr[1:-1].strip()
+            head = text[text.rfind("{", 0, m.start()):m.start()]
+            lm = re.search(r"label:\s*\"([^\"]*)\"", head)
+            ops = _uniq(re.findall(rf"\b{re.escape(m.group(1))}\.(\w+)", expr))
+            tm = re.match(rf"{re.escape(m.group(1))}\.(\w+)\s*\?[\s\S]*:\s*([^:]+)$", expr)
+            out.append({
+                "id": f"CC{len(out) + 1:02d}", "label": lm.group(1) if lm else "", "expr": expr,
+                "operands": ops, "operators": _uniq(re.findall(r"[+\-*/]", expr)),
+                "funcs": _uniq(re.findall(r"Math\.\w+", expr)),
+                "literals": _uniq(re.findall(r"(?<![\w.])\d+(?:\.\d+)?", expr)),
+                "guards": [f"{tm.group(1)} が 0 のとき {tm.group(2).strip()}"] if tm else [],
+                "operand_labels": {o: names[o] for o in ops if o in names},
+                "in": "フロント",
+                "src": [{"file": str(p), "line_start": text.count("\n", 0, s) + 1, "line_end": text.count("\n", 0, e) + 1}]})
+    return {"calc_candidates": out}
+
+
+_JSX_OPEN = re.compile(r"<(input|select|textarea|button)\b")
+# 入力・操作系の要素 → 画面項目の item_type(案 B2 の表)。input は type で決まる
+_HINT = {"select": "ComboBox", "textarea": "TextArea", "button": "Button"}
+_INPUT_HINT = {"date": "Calendar", "checkbox": "Checkbox", "submit": "Button", "button": "Button"}
+
+
+def _tag_end(text, i):
+    """text[i] の `<` から始まる開きタグの終わりの `>` の位置。属性値の {…} と引用符の中の `>`(=> など)は数えない。"""
+    j = i
+    while j < len(text):
+        c = text[j]
+        if c == "{":
+            j = _end(text, j)
+        elif c in "\"'":
+            j = text.find(c, j + 1)
+            if j < 0:
+                break
+        elif c == ">":
+            return j
+        j += 1
+    return len(text) - 1
+
+
+def jsx_elements(sources):
+    """TSX の入力・操作系の要素(input/select/textarea/button)を {"jsx_elements": [...]} で返す(案 B2)。
+
+    呼出元: extract_react_draft.main()。意味合い: 画面項目(S1)がソースの画面部品と過不足なく対応するかを verify_vs_source.check_items が見る元。
+    label: button は中の文言、checkbox は包む <label> の文言、それ以外は直前の <label>…</label>。item_type_hint は上の表。
+    ponytail: table・span 等の表示専用の要素と visible_if は拾わない(入力・操作系だけ)。要れば _JSX_OPEN に足す。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _JSX_OPEN.finditer(text):
+            tag, e = m.group(1), _tag_end(text, m.start())
+            attrs = text[m.end():e]
+            ty = re.search(r"\btype=\"(\w+)\"", attrs)
+            ty = ty.group(1) if ty else None
+            if tag == "input":
+                hint = _INPUT_HINT.get(ty, "Input")
+            else:
+                hint = _HINT[tag]
+            label = ""
+            if tag == "button":
+                close = text.find("</button>", e)
+                label = re.sub(r"<[^>]*>|\{[^{}]*\}", "", text[e + 1:close]).strip() if close >= 0 else ""
+            elif ty == "checkbox":
+                close = text.find("</label>", e)
+                label = re.sub(r"<[^>]*>|\{[^{}]*\}", "", text[e + 1:close]).strip() if close >= 0 else ""
+            else:
+                lm = re.search(r"<label[^>]*>([^<]*)</label>\s*$", text[:m.start()])
+                label = lm.group(1).strip() if lm else ""
+            bind = re.search(r"\b(?:value|checked)=\{(\w+)\}", attrs)
+            dis = re.search(r"\bdisabled=\{([^{}]*)\}", attrs)
+            out.append({
+                "id": f"JX{len(out) + 1:02d}", "tag": tag, "type": ty, "label": label,
+                "bind": bind.group(1) if bind else None, "on": _uniq(re.findall(r"\b(on[A-Z]\w*)=", attrs)),
+                "disabled": dis.group(1) if dis else None, "item_type_hint": hint,
+                "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, e) + 1}]})
+    return {"jsx_elements": out}
+
+
+_TOGGLE = re.compile(r"\{\s*([^{}?]+?)\s*(?:&&|\?(?!\.))\s*\(?\s*<(\w+)")
+_DISABLED = re.compile(r"\bdisabled=\{([^{}]*)\}")
+_FILTER = re.compile(r"\.filter\(\s*\(?\w+\)?\s*=>\s*")
+_IF_OPEN = re.compile(r"\bif\s*\(")
+_ATTR_CHECK = re.compile(r"<(?:input|select|textarea)\b[^>]*?\b(?:required|min|max|pattern|maxLength)\b")
+
+
+def behaviors(sources):
+    """画面の処理の種別をソースの書き方から {"behaviors": [...]} で返す(案 B5)。
+
+    呼出元: extract_react_draft.main()。意味合い: 「表示の出し分け」を「入力検査」と書く誤りを verify_vs_source.check_kinds が止める元。
+    kind: display_toggle(`{cond && <…>}`・三項)/ enable_toggle(`disabled={…}`)/ data_filter(`.filter(`)/
+    input_check(`if (…) { setError(…) | throw … }` と input の required|min|max|pattern|maxLength)。
+    control_src は、cond の state を value/checked に束ねた入力要素の位置(その操作の処理 FR と src で対にする)。
+    ponytail: format(toLocaleString 等)は拾わない。要れば _FILTER と同じ形で足す。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+
+        def span(s, e):
+            return {"file": str(p), "line_start": text.count("\n", 0, s) + 1, "line_end": text.count("\n", 0, e) + 1}
+
+        def add(kind, cond, target, s, e):
+            ctl = []
+            for ident in _uniq(re.findall(r"[A-Za-z_]\w*", cond)):
+                bm = re.search(rf"\b(?:value|checked)=\{{{re.escape(ident)}\}}", text)
+                if bm:
+                    ctl.append(span(bm.start(), bm.end()))
+            out.append({"id": f"BH{len(out) + 1:02d}", "kind": kind, "cond": cond, "target": target,
+                        "src": [span(s, e)], "control_src": ctl})
+
+        for m in _TOGGLE.finditer(text):
+            t = text.find("<", m.end() - len(m.group(2)) - 1)
+            te = _tag_end(text, t)
+            lbl = re.match(r"[^<>{}]+", text[te + 1:])
+            add("display_toggle", m.group(1).strip(), (lbl.group(0).strip() if lbl else "") or m.group(2), m.start(), te)
+        for m in _DISABLED.finditer(text):
+            t = text.rfind("<", 0, m.start())
+            te = _tag_end(text, t)
+            lbl = re.match(r"[^<>{}]+", text[te + 1:])
+            add("enable_toggle", m.group(1).strip(), lbl.group(0).strip() if lbl else "", t, te)
+        for m in _FILTER.finditer(text):
+            s = m.end()
+            add("data_filter", text[s:_expr_end(text, s)].strip(), "", m.start(), s)
+        for m in _IF_OPEN.finditer(text):
+            c = _end(text, m.end() - 1)
+            nxt = re.match(r"\s*", text[c + 1:]).end() + c + 1
+            body = text[nxt:_end(text, nxt) + 1] if text[nxt:nxt + 1] == "{" else text[nxt:text.find(";", nxt) + 1]
+            if re.search(r"\bsetError\(|\bthrow\b", body):
+                add("input_check", text[m.end():c].strip(), "", m.start(), nxt + len(body))
+        for m in _ATTR_CHECK.finditer(text):
+            add("input_check", "", "", m.start(), _tag_end(text, m.start()))
+    return {"behaviors": out}
+
+
+def selftest_behaviors():
+    """display_toggle・enable_toggle・data_filter・input_check と control_src を最小の TSX で assert する。"""
+    tsx = (
+        "const f = (rows) => rows.filter((s) => showDead || !s.dead);\n"
+        "function S() {\n"
+        "  const go = () => {\n"
+        "    if (!from) { setError(\"x\"); return; }\n"
+        "  };\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <input type=\"checkbox\" checked={showDead} onChange={a} />\n"
+        "      <button type=\"button\" disabled={!rows.length}>CSV</button>\n"
+        "      {rows.length > 1 && (\n"
+        "        <Card>合計</Card>\n"
+        "      )}\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = behaviors([p])["behaviors"]
+        k = {g["kind"]: g for g in got}
+        assert sorted(k) == ["data_filter", "display_toggle", "enable_toggle", "input_check"], got
+        assert k["display_toggle"]["cond"] == "rows.length > 1" and k["display_toggle"]["target"] == "合計", k["display_toggle"]
+        assert k["enable_toggle"]["cond"] == "!rows.length" and k["enable_toggle"]["target"] == "CSV", k["enable_toggle"]
+        assert k["data_filter"]["control_src"][0]["line_start"] == 8, k["data_filter"]
+        assert k["input_check"]["cond"] == "!from", k["input_check"]
+    except AssertionError as e:
+        print(f"[selftest NG] behaviors {e}")
+        return 1
+    print("[selftest OK] _react_facts.behaviors")
+    return 0
+
+
+def selftest_jsx():
+    """select・date・checkbox・button の label・hint・bind・disabled を最小の TSX で assert する。"""
+    tsx = (
+        "<div>\n"
+        "  <label>店舗</label>\n"
+        "  <select value={s} onChange={(e) => f(e.target.value === \"\" ? 1 : 2)}>\n"
+        "    <option>x</option>\n"
+        "  </select>\n"
+        "  <label>開始</label>\n"
+        "  <input type=\"date\" value={from} onChange={(e) => g(e)} />\n"
+        "  <label className=\"c\">\n"
+        "    <input type=\"checkbox\" checked={dead} />\n"
+        "    空欄も表示\n"
+        "  </label>\n"
+        "  <button type=\"button\" onClick={x} disabled={!rows.length}>\n"
+        "    CSV出力\n"
+        "  </button>\n"
+        "</div>\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = jsx_elements([p])["jsx_elements"]
+        assert [(g["label"], g["item_type_hint"]) for g in got] == [
+            ("店舗", "ComboBox"), ("開始", "Calendar"), ("空欄も表示", "Checkbox"), ("CSV出力", "Button")], got
+        assert got[0]["bind"] == "s" and got[0]["on"] == ["onChange"] and got[3]["disabled"] == "!rows.length", got
+        assert got[1]["src"][0]["line_start"] == 7, got[1]
+    except AssertionError as e:
+        print(f"[selftest NG] jsx_elements {e}")
+        return 1
+    print("[selftest OK] _react_facts.jsx_elements")
+    return 0
+
+
+def selftest_calc():
+    """calc の式・operands・funcs・guards・label・operand_labels・行番号を最小の TSX で assert する。"""
+    tsx = (
+        "const L = [\n"
+        "  { label: \"小計\", csv: \"小計3(税込)\", kin: \"s3\" },\n"
+        "  { label: \"点数\", kin: \"n\" },\n"
+        "  { label: \"差\", calc: (r) => r.s3 - r.n, added: true },\n"
+        "  { label: \"平均\", calc: (r) => (r.n ? Math.floor(r.s3 / r.n) : 0) },\n"
+        "];\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = calc_candidates([p])["calc_candidates"]
+        assert [c["label"] for c in got] == ["差", "平均"], got
+        a, b = got
+        assert a["expr"] == "r.s3 - r.n" and a["operands"] == ["s3", "n"] and a["operators"] == ["-"], a
+        assert b["expr"] == "r.n ? Math.floor(r.s3 / r.n) : 0" and b["funcs"] == ["Math.floor"], b
+        assert b["literals"] == ["0"] and b["guards"] == ["n が 0 のとき 0"], b
+        assert a["operand_labels"]["s3"] == ["小計", "小計3(税込)"] and a["src"][0]["line_start"] == 4, a
+    except AssertionError as e:
+        print(f"[selftest NG] calc_candidates {e}")
+        return 1
+    print("[selftest OK] _react_facts.calc_candidates")
+    return 0
+
+
 def selftest_csv():
     """exportCsv 形の最小 TSX で BOM・区切り・改行・固定見出し・合計行・ファイル名・トリガーを assert する。"""
     tsx = (
@@ -553,6 +845,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)

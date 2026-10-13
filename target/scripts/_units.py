@@ -63,7 +63,7 @@ NUMBERED = ["screen_layout.items", "validations_frontend", "calculations", "para
 REQUIRED = {
     "screen_layout.items": ["area_ref", "item_type"],  # screen_no は add_screen_areas.py が area_ref から写す
     "events": ["trigger", "content", "classification"],
-    "validations_frontend": ["field", "rule", "applied_when"],
+    "validations_frontend": ["field", "rule", "applied_when", "kind"],  # kind: B5 の処理の種別(verify_vs_source.check_kinds が照合)
     "calculations": ["name", "formula"],
     "messages_backend": ["code", "severity", "message"],
     "parameters_backend": ["name"],
@@ -290,6 +290,56 @@ def _fill_logical_names(out):
                       "physical_table": pt, "physical_column": pc})
 
 
+def _fill_src(out):
+    """下書きの src(ソースの出典 {file,line_start,line_end} の配列)を、合成した行へ機械で付ける。断片に src がある行は触らない。
+    呼出元: compose(_fill_logical_names の前)。意味合い: src は機械抽出の下書きが正で、単位に書かせると作り話の行番号が混じるため。
+    照合: events/event_processes←react の event_code、api_spec←backend.apis の action、response_items←apis[action] の key、
+    error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id。下書きが無ければ何もしない。"""
+    from _config_loader import INTERMEDIATE_DIR
+    ev, ep, api, ri, err, dbo = {}, {}, {}, {}, {}, {}
+    d = Path(INTERMEDIATE_DIR)
+    for p in sorted(d.glob("*_react_draft.json")):
+        try:
+            r = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        ev.update({e["event_code"]: e["src"] for e in r.get("events") or [] if e.get("src") and e.get("event_code")})
+        ep.update({e["event_code"]: e["src"] for e in r.get("event_processes") or [] if e.get("src") and e.get("event_code")})
+    for p in sorted(d.glob("*_backend_draft.json")):
+        try:
+            b = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for act, a in (b.get("apis") or {}).items():
+            if a.get("src"):
+                api[act] = a["src"]
+            ri.update({(act, x["key"]): x["src"] for x in a.get("response_items") or [] if x.get("src") and x.get("key")})
+            dbo.update({o["id"]: o["src"] for o in a.get("db_operations") or [] if o.get("src") and o.get("id")})
+            err.update({e["id"]: e["src"] for e in a.get("error_patterns") or [] if e.get("src") and e.get("id")})
+        err.update({e["id"]: e["src"] for au in b.get("auth") or [] for e in au.get("error_patterns") or [] if e.get("src") and e.get("id")})
+
+    def put(row, src):
+        if src and not row.get("src"):
+            row["src"] = copy.deepcopy(src)
+
+    for r in _rows(out, "events"):
+        put(r, ev.get(r.get("event_code")))
+    for r in _rows(out, "event_processes"):
+        put(r, ep.get(r.get("event_code")))
+    for r in _rows(out, "db_operations"):
+        put(r, dbo.get(r.get("id")))
+    for r in _rows(out, "messages_backend"):
+        put(r, err.get(r.get("message_id")))
+    for a in _rows(out, "api_spec"):
+        put(a, api.get(a.get("action")))
+        for x in a.get("response_items") or []:
+            if isinstance(x, dict):
+                put(x, ri.get((a.get("action"), x.get("key"))))
+        for x in a.get("error_patterns") or []:
+            if isinstance(x, dict):
+                put(x, err.get(x.get("message_id")))
+
+
 def compose(spec, frags, project_config=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
@@ -344,6 +394,7 @@ def compose(spec, frags, project_config=None):
                 if mid and mid not in have:
                     msgs.append({**{k: ce[k] for k in ("code", "severity", "message") if k in ce}, "message_id": mid})
                     have.add(mid)
+    _fill_src(out)
     _fill_logical_names(out)
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
