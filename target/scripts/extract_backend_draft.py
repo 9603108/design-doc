@@ -364,8 +364,8 @@ def _auth(mods, tables):
                     errs = []
                     for m3, f3 in clo:
                         errs += _expand(_errors(f3, m3.env()), f3, clo)  # 認証の関数の応答は全部を出す(status が取れなければ空)
-                    out.append({"function": name, "applies_to": f"全 API(入口 {entry.name} がディスパッチ表を引く前に呼ぶ)",
-                                "fact": f"{mod.path.name} の {entry.name} が {name} を呼ぶ", "error_patterns": errs})
+                    out.append({"function": name, "applies_to": "全 API(各 API の処理に入る前に認証する)",
+                                "fact": "全 API で、各 API の処理に入る前に認証を行う", "error_patterns": errs})  # 関数名は function の欄にだけ残す
                     break
     return out
 
@@ -583,6 +583,7 @@ def selftest():
     assert [(w["logical_table"], w["logical_column"], w["operator"]) for w in gx["where"]] == [("real_tbl", "a", "="), ("real_tbl", "b", "IS")], gx["where"]
     assert [e["status_code"] for e in r["auth"][0]["error_patterns"]] == [401], r["auth"]
     assert r["auth"][0]["function"] == "identify", r["auth"]
+    assert not any(n in r["auth"][0][k] for n in ("identify", "lambda_handler", "h.py") for k in ("fact", "applies_to")), r["auth"]  # 物理名は function の欄にだけ
     assert any(e["text_expanded"] == "日付 は必須" and e["message"] == "{p} は必須" for e in r["apis"]["get_y"]["error_patterns"]), r["apis"]["get_y"]["error_patterns"]
     ids = [e["id"] for a in r["apis"].values() for e in a["error_patterns"]] + [e["id"] for a in r["auth"] for e in a["error_patterns"]]
     assert ids and len(ids) == len(set(ids)) and all(i.startswith("MSE") for i in ids), ids

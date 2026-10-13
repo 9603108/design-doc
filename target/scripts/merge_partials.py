@@ -215,7 +215,8 @@ def main():
     #             欄名が違うと 5.5 章が空になる。既にある欄は上書きしない。
     #   接続: 読み替えの入力は cs/pe の common_logic。出力は merged["common_logic"]（下の merged 組立）。
     for item in common_logic:
-        if not item.get("description") and item.get("expression"):
+        # description は概要(30字以内)。長い式は写さず processing_steps にだけ入れる(S1 が概要を必ず書く)
+        if not item.get("description") and item.get("expression") and len(item["expression"]) <= 30:
             item["description"] = item["expression"]
         if not item.get("used_by_processes") and item.get("used_in"):
             used = item["used_in"]
