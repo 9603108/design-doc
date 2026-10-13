@@ -104,6 +104,7 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 書くのは {inter}/_unit_{u}.json の1ファイルだけ。他のファイル(partial・中間 JSON・他の単位の _unit_*.json・screen_config)は書かない。"
         f"書いてよい欄は units.json の {u} の owns だけ: {owns}",
         "- 前回の設計書や過去の partial の中身は参照しない(ソースと下書きから書く)。",
+        "- 【出典】下書きにある行の src は書かない(合成が付ける)。下書きに無い行(ソースを読んで足した行)だけ、読んだ範囲 {file,line_start,line_end} の配列を src に書く。",
         f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u}` を流し、"
         f"行末が「→ 差し戻し先 {u}」の問題を直してから、3行以内で報告する(書いた行数・残った問題・判断できなかった所)。",
     ]
@@ -250,6 +251,12 @@ def selftest():
     text = build_prompt(units, "テスト機能", "S1", sendbacks=["ERROR 欄 → 差し戻し先 S1"])
     assert "_unit_S1.json" in text and "ERROR 欄 → 差し戻し先 S1" in text, text
     assert "【差し戻し】" not in build_prompt(units, "テスト機能", "S1")
+    assert "【出典】" in build_prompt(units, "テスト機能", "S1"), "A3: 指示文に出典の1行"
+    # A3: .src の欄は _merge で和集合(同じ要素は1つ)。.src でない list は従来どおり上書き
+    from _units import _merge
+    a, b, c = {"file": "a", "line_start": 1, "line_end": 2}, {"file": "b", "line_start": 3, "line_end": 4}, {"file": "a", "line_start": 1, "line_end": 2}
+    assert _merge({"src": [a]}, {"src": [b, c], "t": [1]}, "x") == {"src": [a, b], "t": [1]}
+    assert _merge({"t": [1]}, {"t": [2]}, "x") == {"t": [2]}
     check_step_args("テスト機能")
 
 

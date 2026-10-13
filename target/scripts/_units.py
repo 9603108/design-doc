@@ -335,7 +335,8 @@ def _fill_src(out):
         put(a, api.get(a.get("action")))
         for x in a.get("response_items") or []:
             if isinstance(x, dict):
-                put(x, ri.get((a.get("action"), x.get("key"))))
+                # rows[].x のように下書きの return キー(rows)の下の項目は、キー自身が無ければ先頭のキー(rows)の出典を使う(下書きにある範囲)
+                put(x, ri.get((a.get("action"), x.get("key"))) or ri.get((a.get("action"), re.split(r"[\[.]", str(x.get("key")))[0])))
         for x in a.get("error_patterns") or []:
             if isinstance(x, dict):
                 put(x, err.get(x.get("message_id")))
@@ -433,6 +434,10 @@ def _merge(dst, src, generic):
                     tgt[k] = _merge(tgt[k], v, g) if k in tgt else copy.deepcopy(v)
             else:
                 dst.append(copy.deepcopy(el))
+        return dst
+    # A3: 汎用パスが .src で終わる欄(出典の配列)は、上書きせず和集合にする(同じ要素は1つ)。複数の単位が同じ行の出典を書いても消し合わない
+    if isinstance(dst, list) and isinstance(src, list) and generic.endswith(".src"):
+        dst += [copy.deepcopy(x) for x in src if x not in dst]
         return dst
     return copy.deepcopy(src)
 
