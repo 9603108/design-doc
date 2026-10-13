@@ -196,16 +196,17 @@ def check_fragments(spec, frags, only=None):
 
 
 def _backend_draft_facts():
-    """backend 下書き(<画面>_backend_draft.json)から (認証の fact, {文面: メッセージ ID}) を取る。
-    呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。下書きが無ければ ("", {})。"""
+    """backend 下書き(<画面>_backend_draft.json)から (認証の fact, {文面: メッセージ ID}, 認証の error_patterns) を取る。
+    呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。auth の error_patterns(ソースに拒否の処理があったものだけ)も返す。下書きが無ければ ("", {}, [])。"""
     from _config_loader import INTERMEDIATE_DIR
-    fact, msgs = "", {}
+    fact, msgs, auth_errs = "", {}, []
     for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         auths = d.get("auth") or []
+        auth_errs += [e for a in auths for e in a.get("error_patterns") or []]
         fact = fact or next((a["fact"] for a in auths if a.get("fact")), "")
         pats = [e for a in (d.get("apis") or {}).values() for e in a.get("error_patterns") or []]
         pats += [e for a in auths for e in a.get("error_patterns") or []]
@@ -213,7 +214,7 @@ def _backend_draft_facts():
             for key in ("message", "text_expanded"):  # H4 は型文のままか展開済みの文面のどちらかで書く
                 if e.get("id") and e.get(key):
                     msgs[e[key]] = e["id"]
-    return fact, msgs
+    return fact, msgs, auth_errs
 
 
 def _align_message_ids(out, draft_msgs):
@@ -317,13 +318,14 @@ def compose(spec, frags, project_config=None):
     draft_msgs = {}
     if project_config is not None:
         # backend 下書きの auth.fact(認証の掛かり方の事実)と、メッセージの ID・文面を正として使う
-        auth_fact, draft_msgs = _backend_draft_facts()
+        auth_fact, draft_msgs, auth_errs = _backend_draft_facts()
         if not auth_desc and auth_fact:
             auth_desc = auth_fact
-            # 認証が掛かるなら 401/403 は全 API 共通のエラー。設定に同じ status_code があれば足さない
-            for sc, cond in ((401, "認証情報が無い、または無効"), (403, "操作の権限が無い")):
-                if not any(c.get("status_code") == sc for c in common):
-                    common.append({"status_code": sc, "condition": cond})
+        # 401/403 などの認証の失敗は、ソースが拒否の処理を持つときだけ足す(下書きの auth.error_patterns)。固定の文では足さない(D2)
+        for e in auth_errs:
+            sc = e.get("status_code")
+            if sc and not any(c.get("status_code") == sc for c in common):
+                common.append({"status_code": sc, "condition": e.get("text_expanded") or e.get("message") or ""})
     _align_message_ids(out, draft_msgs)
     _expand_message_holes(out, draft_msgs)
     if common or auth_desc:

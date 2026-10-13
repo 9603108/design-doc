@@ -453,7 +453,7 @@ def _auth(mods, tables):
                     for m3, f3 in clo:
                         errs += _expand(_errors(f3, m3.env(), m3), f3, clo)  # 認証の関数の応答は全部を出す(status が取れなければ空)
                     out.append({"function": name, "applies_to": "全 API(各 API の処理に入る前に認証する)",
-                                "fact": "全 API で、各 API の処理に入る前に認証を行う", "error_patterns": errs, "src": [_src(mod, c)]})  # 関数名は function の欄にだけ残す
+                                "fact": ("認証に失敗すると " + "、".join(f"{e['status_code']}（{e.get('text_expanded') or e['message']}）" for e in errs if e.get("status_code")) + " を返す") if any(e.get("status_code") for e in errs) else "", "error_patterns": errs, "src": [_src(mod, c)]})  # 関数名は function の欄にだけ残す
                     break
     return out
 
@@ -776,8 +776,12 @@ def _errors(fn, env, mod):
         if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call):
             call = n.exc
             # ValidationError は handler.dispatch が 400 を既定にする。他の例外の status は静的に決められないので空
-            status = 400 if getattr(call.func, "id", "").endswith("ValidationError") else ""
-            msg = call.args[0] if call.args else None
+            # AuthError(code, 文面, status) の形は文面と status を第2・第3引数から取る(D2)。他の形は従来どおり
+            if len(call.args) >= 3 and isinstance(call.args[2], ast.Constant) and isinstance(call.args[2].value, int):
+                status, msg = call.args[2].value, call.args[1]
+            else:
+                status = 400 if getattr(call.func, "id", "").endswith("ValidationError") else ""
+                msg = call.args[0] if call.args else None
         elif isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_err" and len(n.args) >= 2:
             msg = n.args[1]
             st = n.args[2] if len(n.args) > 2 else next((k.value for k in n.keywords if k.arg == "status"), None)
