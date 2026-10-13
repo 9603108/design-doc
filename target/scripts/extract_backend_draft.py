@@ -408,15 +408,19 @@ def _call_name(c):
 
 def _expand(errs, fn, clo):
     """エラー文面の {式} を、呼出側の実引数で展開して text_expanded に入れる(取れなければ空)。
+    穴のある文面は、実引数が全部定数の呼出箇所ごとに1件ずつ返す(from・to・shop_id の別々の文面を落とさない。F1)。
+    呼出元: extract(errors への積み込み)。同じ文の重複は呼出元が src だけ足してまとめる。
     ponytail: 呼出は関数名の一致で拾う(同名の別関数を取り違える余地あり)。実引数が定数の穴だけ展開する。"""
     params = [a.arg for a in fn.args.args]
     sites = [c for _, f in clo for c in ast.walk(f) if isinstance(c, ast.Call) and _call_name(c) == fn.name]
+    out = []
     for e in errs:
         holes = re.findall(r"\{([^{}]+)\}", e["message"])
         if not holes:
             e["text_expanded"] = e["message"]
+            out.append(e)
             continue
-        e["text_expanded"] = ""
+        texts = []
         for site in sites:
             amap = {params[i]: a for i, a in enumerate(site.args) if i < len(params)}
             amap.update({k.arg: k.value for k in site.keywords if k.arg})
@@ -425,9 +429,12 @@ def _expand(errs, fn, clo):
                 text = e["message"]
                 for h, v in zip(holes, vals):
                     text = text.replace("{" + h + "}", str(v.value))
-                e["text_expanded"] = text
-                break
-    return errs
+                if text not in texts:
+                    texts.append(text)
+        # 取れた展開ごとに別の行にする。1件も取れなければ従来どおり空の1件
+        for t in texts or [""]:
+            out.append({**e, "text_expanded": t, "src": list(e.get("src") or [])})
+    return out
 
 
 def _auth(mods, tables):

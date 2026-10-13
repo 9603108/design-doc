@@ -236,7 +236,8 @@ def _align_message_ids(out, draft_msgs):
 
 
 def _expand_message_holes(out, draft_msgs):
-    """messages_backend の型文の {key} 等を、画面項目名で展開する(verify_intermediate は未展開の穴を ERROR にするため)。
+    """【compose からは呼ばない(F1)。verify_partials の selftest だけが使う】
+    messages_backend の型文の {key} 等を、画面項目名で展開する(verify_intermediate は未展開の穴を ERROR にするため)。
     意味合い: 下書きは同じ ID の文面を「型文」と「展開済み(例 shop_id は…)」の両方で持つ。展開済みから {key} の実際の値(要求の項目名)を
     取り、その項目の説明(request_params / parameters_backend の description)が画面項目名で始まるなら、その画面項目名で置き換える。
     対応が取れない穴が1つでもあれば、その文面は触らず穴として残す(検査が差し戻す)。
@@ -376,8 +377,8 @@ def compose(spec, frags, project_config=None):
             sc = e.get("status_code")
             if sc and not any(c.get("status_code") == sc for c in common):
                 common.append({"status_code": sc, "condition": e.get("text_expanded") or e.get("message") or ""})
+    # F1: message はソースの文字列のまま(下書きの text_expanded)。画面項目名への置き換え(_expand_message_holes)はしない
     _align_message_ids(out, draft_msgs)
-    _expand_message_holes(out, draft_msgs)
     if common or auth_desc:
         for api in out.get("api_spec") or []:
             if auth_desc and not api.get("auth"):
