@@ -1378,10 +1378,14 @@ def main():
     except FileNotFoundError:
         sc = {}
     srcs = list(sc.get("source_files") or []) + [str(Path(sc.get("project_root") or ".") / f) for f in sc.get("backend_files") or []]
+    # コメント・文字列・日本語を含む JSX の文は業務の文なので、識別子から外す(「POS会計」「新POS の…」の POS を識別子と取り違えない)。
+    # ponytail: 正規表現での粗い除去(言語ごとの字句解析はしない)。取りこぼすと略語が物理名として残るだけで、ERROR 側へ倒れる
+    prose = re.compile(r'/\*.*?\*/|"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|//[^\n]*|#[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`[^`]*`'
+                       r'|[^<>{}\n]*[^\x00-\x7f][^<>{}\n]*', re.S)
     idents = set()
     for s in srcs:
         try:
-            idents |= set(re.findall(r"[A-Za-z0-9_]+", Path(s).read_text(encoding="utf-8")))
+            idents |= set(re.findall(r"[A-Za-z0-9_]+", prose.sub(" ", Path(s).read_text(encoding="utf-8"))))
         except OSError:
             pass
     verify_overrides["source_identifiers"] = sorted(idents)
