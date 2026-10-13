@@ -57,6 +57,7 @@ AFTER = [
     "python3 target/scripts/apply_id_scheme.py {feat}",
     "python3 target/scripts/migrate_v49_event_unify.py {feat}",
     "python3 target/scripts/migrate_v48_to_v49.py {feat}",
+    "python3 target/scripts/verify_vs_source.py {feat}",
     "python3 target/scripts/verify_intermediate.py {feat}",
     "python3 target/scripts/verify_call_graph.py {feat}",
     "INPUT_JSON=target/intermediate/{feat}.json DOCX_OUTPUT_PATH=target/output/詳細設計書_{feat}.docx "

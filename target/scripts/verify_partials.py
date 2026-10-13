@@ -167,6 +167,8 @@ def selftest():
         assert [p for p in check_partial(todo, "受注入力") if p.startswith("[未記入]")], "未記入の印を検出しない"
 
         selftest_units()
+        import verify_vs_source
+        assert verify_vs_source.selftest() == 0
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
@@ -378,6 +380,12 @@ def main_units(directory, only=None):
         print(w)
     for w in check_src_warn(frags):
         print(w)
+    # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
+    s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
+    for p in sorted(Path(directory).glob("*_react_draft.json"))[:1]:
+        import verify_vs_source
+        for w in verify_vs_source.check_examples(s1_items, verify_vs_source.source_strings(p.name[:-len("_react_draft.json")])):
+            print(w)
     if problems:
         return 1
     print(f"[OK] 断片 {len(frags)} 本({', '.join(sorted(frags))})の検査に問題なし")

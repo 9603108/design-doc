@@ -274,7 +274,8 @@ def build_front_processes(event_processes: list, events: list, initialization: d
             "validation_refs": [],
             "calculation_refs": [],
             "common_logic_refs": [],
-            "parameter_refs": []
+            "parameter_refs": [],
+            "src": next((e.get("src") for e in event_processes if e.get("event_code") == "EV00" and e.get("src")), [])  # ソース出典(A3)
         })
         event_to_id["EV00"] = "F001"
 
@@ -310,7 +311,8 @@ def build_front_processes(event_processes: list, events: list, initialization: d
             "validation_refs": [],
             "calculation_refs": [],
             "common_logic_refs": [],
-            "parameter_refs": ep.get("parameter_refs", []) or []
+            "parameter_refs": ep.get("parameter_refs", []) or [],
+            "src": ep.get("src") or ev.get("src") or []  # ソース出典(A3)。event_processes 優先、無ければ events の src
         })
 
     return front_processes, event_to_id
@@ -708,7 +710,8 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
                     "update_values": db_op.get("update_values", []),
                     "cte_definitions": db_op.get("cte_definitions", []),
                     "remarks": db_op.get("remarks", ""),
-                    "error_message_id": db_op.get("error_message_id", "")
+                    "error_message_id": db_op.get("error_message_id", ""),
+                    "src": db_op.get("src", [])  # ソース出典(A3)。合成の _fill_src が付けた値を落とさず届ける
                 }
             })
 
@@ -752,7 +755,8 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
             },
             # api_spec[].error_patterns を写す。目的: 中間JSONのエラー定義を backend_processes に届ける。
             # 接続: 呼出元は build_backend_processes。api_spec に無い案件は空配列のまま。
-            "error_patterns": api.get("error_patterns", []) or []
+            "error_patterns": api.get("error_patterns", []) or [],
+            "src": api.get("src", [])  # ソース出典(A3)。api_spec の src を backend_processes へ届ける
         }
         # error_patterns を空にする理由（任意）。verify_intermediate.py は、空の error_patterns をこれがあるときだけ通す
         if api.get("error_patterns_none_reason"):
