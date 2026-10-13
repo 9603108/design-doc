@@ -1,8 +1,18 @@
 # H2 DB 操作と論理名の写し(haiku)
 
 ## 入力
-- `{機能名}_backend_draft.json` の `apis.<action>.dataset`(物理テーブル・物理列)
+- `{機能名}_backend_draft.json` の `apis.<action>.db_operations[]`(id・from・columns)。columns は SELECT 句の全列の骨組みで、
+  1列ごとに alias(別名)・expression(元の式)・table / column(元の表と列)・logical_name(論理名の候補)・logical_name_source(候補の出所)を持つ
 - バックエンドのソースの SQL、DDL(あれば)、`05_DB操作.md` の構造化表の節、`10_論理名変換.md`
+
+## 列の骨組みは1列も省かない
+- 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない
+- logical_names にも columns の列を全部書く(同じ表・同じ列は1行にまとめてよい)
+- dataset の physical_column は columns の column(空なら alias)、physical_table は table。並びは columns の no の順
+- 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く
+  (例: 店舗ID(推定))。ソースや DDL でより確かな名前が分かれば、それに置き換えて「(推定)」を外してよい
+- 候補が空の列も省かない。式(expression)と別名から論理名を付け、「(推定)」を付ける
+- 列の省略は `verify_partials.py --units` が [列の省略] の ERROR で止め、欠けた列名を挙げて差し戻す
 
 ## 書く欄(`_unit_H2.json`。db_operations の行を作る)
 - `logical_names[]`: {physical_table, logical_table, physical_column, logical_column}。dataset に出る列を全部

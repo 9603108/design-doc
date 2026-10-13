@@ -12,14 +12,20 @@ ACTIONS = {"action名": module.func, ...} のような「文字列 → 関数参
   - response_items[]: {key}。action の関数が return する dict のキー(return が補助関数の呼出なら、その return を辿る)
   - error_patterns[]: {condition, status_code, message}。raise と _err(...) の返却。condition は業務語彙なので空文字(LLM が書く)
   - unresolved[]: {action, reason}。静的に取れなかったもの。推測で埋めずここにだけ出す
+  - db_operations[]: {id, from, columns}。SQL 1 本ごと(id は H2 と同じ db_op_<action>、複数なら _<n>)。
+    columns は最上位 SELECT 句の全列の骨組み {no, alias, expression, table, column, logical_name, logical_name_source}。
+    SELECT * / t.* は DDL の列で展開する。from は FROM の表 {table, name, alias}
+    logical_name は機械的に取れた論理名の候補。出所 logical_name_source は取れた順に
+    comment(DDL のコメント)/ ui_label(画面の定数配列の label)/ api_type(TS の型のコメント)/ guess(列名からの推定)。取れなければ空
 
 【意味合い】
 Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いていたため、実行ごとに欠落とぶれが出た。
 列名・テーブル名・キー・メッセージ(事実)を機械で出し、LLM は業務の文面だけを書く分担にする(extract_react_draft.py と同じ考え方)。
 
 【入出力】
-  入力: --screen-config <screen_config.json>(backend_files / project_root を読む。相対の backend_files は project_root 基準)
-  出力: --out <JSON>。キーは { apis: {action: {dataset, response_items, error_patterns, joins, where, group_by, order_by, aliases}}, unresolved, auth }
+  入力: --screen-config <screen_config.json>(backend_files / source_files / project_root を読む。相対の backend_files は project_root 基準)
+        論理名の候補には project_root 配下の *.sql(DDL)と source_files の .tsx/.jsx(定数配列)・.ts/.tsx(型)を読む
+  出力: --out <JSON>。キーは { apis: {action: {dataset, response_items, error_patterns, joins, where, group_by, order_by, aliases, db_operations}}, unresolved, auth }
   auth は入口が表を引く前に呼ぶ認証(identify 等)と、その 401/403 の文面。error_patterns の id は MSE + 5 桁の機械採番
   終了コード: 0=未解決なし / 1=unresolved が1件以上(下書きは書く) / 2=入力不正
   backend_files に無いモジュールを指す action は対象外(出力に入れず、unresolved にも出さない)
@@ -402,6 +408,197 @@ def _dataset(sql, unresolved, action):
     return rows
 
 
+def _close(t, i):
+    """t[i] の開き括弧に対応する閉じ括弧の位置(無ければ末尾)。文字列の中の括弧は見ない(ponytail: 文字列に括弧があると外れる)。"""
+    pair = {"(": ")", "[": "]", "{": "}"}[t[i]]
+    depth = 0
+    for j in range(i, len(t)):
+        depth += (t[j] == t[i]) - (t[j] == pair)
+        if depth == 0:
+            return j
+    return len(t)
+
+
+_DDL_TABLE = re.compile(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w.\"]+)\s*\(", re.IGNORECASE)
+_DDL_ALTER = re.compile(r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([\w.\"]+)([^;]*);", re.IGNORECASE)
+_DDL_COMMENT = re.compile(r"COMMENT\s+ON\s+COLUMN\s+([\w.\"]+)\s+IS\s+'((?:[^']|'')*)'", re.IGNORECASE)
+_DDL_NOT_COL = {"PRIMARY", "UNIQUE", "CONSTRAINT", "FOREIGN", "CHECK", "EXCLUDE", "LIKE", "INDEX", "KEY"}
+
+
+def _ddl(root):
+    """root 配下の *.sql から {表: {列: コメント}} を作る(列は定義順)。CREATE TABLE の列と行末の -- コメント、
+    ALTER TABLE ... ADD COLUMN、COMMENT ON COLUMN を読む。SELECT * の展開と論理名の候補(comment)に使う。
+    ponytail: 列の定義は1行1列の前提で行ごとに読む。複数行にまたがる列定義・DB に直接付けたコメントは見ない。"""
+    out = {}
+    if not root or not Path(root).is_dir():
+        return out
+    for d, dirs, names in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in ("node_modules", ".git", "venv", ".venv", "__pycache__")]
+        for n in names:
+            if not n.endswith(".sql"):
+                continue
+            try:
+                t = (Path(d) / n).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for m in _DDL_TABLE.finditer(t):
+                cols = out.setdefault(m.group(1).replace('"', "").split(".")[-1], {})
+                for line in t[m.end():_close(t, m.end() - 1)].splitlines():
+                    cm = re.match(r'\s*"?([A-Za-z_]\w*)"?\s+\w', line)
+                    if cm and cm.group(1).upper() not in _DDL_NOT_COL:
+                        note = re.search(r"--\s*(.+?)\s*$", line)
+                        cols.setdefault(cm.group(1), note.group(1) if note else "")
+            for m in _DDL_ALTER.finditer(t):
+                cols = out.setdefault(m.group(1).replace('"', "").split(".")[-1], {})
+                for cm in re.finditer(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([A-Za-z_]\w*)"?', m.group(2), re.IGNORECASE):
+                    if cm.group(1).upper() not in _DDL_NOT_COL:
+                        cols.setdefault(cm.group(1), "")
+            for m in _DDL_COMMENT.finditer(t):
+                parts = m.group(1).replace('"', "").split(".")
+                if len(parts) >= 2:
+                    out.setdefault(parts[-2], {})[parts[-1]] = m.group(2).replace("''", "'")
+    return out
+
+
+def _ui_specs(paths):
+    """TSX の直下の定数配列(const X = [ {label: "..", kin: "列", ...}, ... ])の要素を (label, [他の文字列の値]) で返す。
+    値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。"""
+    out = []
+    for p in paths:
+        if p.suffix not in (".tsx", ".jsx") or not p.is_file():
+            continue
+        t = p.read_text(encoding="utf-8")
+        for m in re.finditer(r"^const\s+[A-Za-z_$][\w$]*\s*(?::[^=\n]+)?=\s*\[", t, re.M):
+            i, end = m.end(), _close(t, m.end() - 1)
+            while i < end:
+                if t[i] == "{":
+                    j = _close(t, i)
+                    o = t[i:j]
+                    lm = re.search(r"\blabel\s*:\s*['\"]([^'\"]+)['\"]", o)
+                    if lm:
+                        out.append((lm.group(1), [v for k, v in re.findall(r"\b(\w+)\s*:\s*['\"]([^'\"]+)['\"]", o) if k != "label"]))
+                    i = j
+                i += 1
+    return out
+
+
+def _type_blocks(paths):
+    """TS の interface / type の本体ごとに (欄名の集合, {欄: コメント}) を返す。コメントは /** */ か行末の //。"""
+    out = []
+    for p in paths:
+        if p.suffix not in (".ts", ".tsx") or not p.is_file():
+            continue
+        t = p.read_text(encoding="utf-8")
+        for m in re.finditer(r"\b(?:interface\s+\w+[^{\n]*|type\s+\w+\s*=\s*)\{", t):
+            body = t[m.end():_close(t, m.end() - 1)]
+            names = set(re.findall(r"(?:^|;|\*/)\s*(\w+)\??\s*:", body, re.M))
+            notes = {f: c for c, f in re.findall(r"/\*\*\s*(.*?)\s*\*/\s*(\w+)\??\s*:", body, re.S)}
+            notes.update({f: c for f, c in re.findall(r"^\s*(\w+)\??\s*:[^\n]*?//\s*(.+?)\s*$", body, re.M)})
+            out.append((names, notes))
+    return out
+
+
+# 列名の語 → 業務の語。guess(列名からの推定)にだけ使う。全部の語が引けたときだけ候補にする
+_WORDS = {"id": "ID", "no": "番号", "cnt": "件数", "count": "件数", "kin": "金額", "amount": "金額", "name": "名称",
+          "date": "日", "dates": "日付", "days": "日数", "first": "初回", "last": "最終", "shop": "店舗", "mise": "店",
+          "reji": "レジ", "registers": "レジ数", "warn": "警告", "kai": "会計", "total": "合計", "sum": "合計",
+          "code": "コード", "type": "種別", "status": "状態", "qty": "数量", "price": "単価", "created": "作成",
+          "updated": "更新", "at": "日時", "user": "利用者", "tax": "税", "rate": "率"}
+
+
+def _guess(name):
+    toks = (name or "").lower().split("_")
+    if not name or not all(x in _WORDS or x.isdigit() for x in toks):
+        return ""
+    return "".join(_WORDS.get(x, x) for x in toks)
+
+
+def _type_note(c):
+    """型のコメントから論理名に使える頭の句を取る(括弧・句点の前、20 字以内、式や引用符を含まない)。使えなければ空。"""
+    c = re.split(r"[（(。、,]", c or "")[0].strip()
+    return c if c and len(c) <= 20 and not re.search(r"[=\"'`]", c) and not c.isascii() else ""
+
+
+def _candidates(cols, hints):
+    """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / ui_label / api_type / guess。"""
+    ddl, specs, blocks = hints.get("ddl") or {}, hints.get("ui") or [], hints.get("types") or []
+    aliases = {c["alias"] for c in cols if c["alias"]}
+    hits = [(lb, [v for v in vals if v in aliases]) for lb, vals in specs]
+    hits = [(lb, cs) for lb, cs in hits if cs]
+    ui = {}
+    for lb, cs in hits:
+        for c in cs:
+            n = lb
+            if sum(1 for x, _ in hits if x == lb) > 1:  # ponytail: 同じ表示名(小計・合計)が複数の列に付くときは列名の数字で分ける
+                n += "".join(re.findall(r"\d+", c))
+            if len(cs) > 1:  # 1つの表示行に件数と金額のように複数の列があるときは、列名の末尾の語で分ける
+                last = c.rsplit("_", 1)[-1]
+                n += _WORDS.get(last, last)
+            ui.setdefault(c, n)
+    notes = {}
+    # 別名を最も多く含む型を1つだけ見る。3つ以上(別名が3つ未満なら全部)含み、型の欄の半分以上が別名であること。
+    # ponytail: id・name のような汎用の欄名で、別の型のコメントを取り違えないための目安。型の名前は突き合わせない
+    best = max(blocks, key=lambda b: len(b[0] & aliases), default=(set(), {}))
+    hit = len(best[0] & aliases)
+    if hit >= min(3, len(aliases)) and hit * 2 >= len(best[0]):
+        for f, c in best[1].items():
+            if f in aliases and _type_note(c):
+                notes[f] = _type_note(c)
+    for c in cols:
+        com = (ddl.get(c["table"]) or {})
+        for name, src in ((com.get(c["column"]) or com.get(c["alias"]), "comment"), (ui.get(c["alias"]), "ui_label"),
+                          (notes.get(c["alias"]), "api_type"), (_guess(c["alias"]) or _guess(c["column"]), "guess")):
+            if name:
+                c["logical_name"], c["logical_name_source"] = name, src
+                break
+        else:
+            c["logical_name"], c["logical_name_source"] = "", ""
+    return cols
+
+
+def _columns(sql, ddl, unresolved, action):
+    """最上位 SELECT(深さ 0 の最初の SELECT)の全列の骨組みと FROM の行を返す。(from, columns)。
+    列は {alias, expression, table, column}。column は元テーブルの列(式が1つの列だけを参照するときだけ。count(*) 等は空)。
+    SELECT * / t.* は DDL の列で展開し、DDL に無ければ * の1行を残して unresolved に出す。"""
+    m = _mask(sql)
+    alias, real = _tables(m)
+    sels = _depth0_selects(m)
+    if not sels:
+        return {"table": "", "name": "", "alias": ""}, []
+    s, f = sels[0]
+    ft = _FROM_TBL.match(m, f)
+    main = real(ft.group(1)) if ft else ""
+    frm = {"table": main, "name": ft.group(1) if ft else "", "alias": (ft.group(2) or "") if ft else ""}
+    nc = re.sub(r"--[^\n]*", lambda x: " " * len(x.group(0)), sql)  # コメントだけ消す(文字列は残す)
+    cols = []
+    for a, b in _split0(m, s, f):
+        item = " ".join(re.sub(r"^\s*DISTINCT\s+", "", nc[a:b].strip(), flags=re.IGNORECASE).split())
+        if not item:
+            continue
+        am = re.search(r"\bAS\s+([^\W\d]\w*)\s*$", item, re.IGNORECASE)
+        expr = item[:am.start()].strip() if am else item
+        if expr.endswith("*") and re.fullmatch(r"(?:[A-Za-z_]\w*\.)?\*", expr):
+            q = expr[:-1].rstrip(".")
+            tbl = real(q) if q else main
+            names = list(ddl.get(tbl) or {})
+            if not names:
+                unresolved.append({"action": action, "reason": f"{expr} の列を DDL から引けない(表 {tbl})"})
+                names = ["*"]
+            cols += [{"alias": c, "expression": f"{q}.{c}" if q and c != "*" else expr if c == "*" else c, "table": tbl, "column": c} for c in names]
+            continue
+        refs = list(dict.fromkeys(r for r in re.findall(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b", _mask(expr)) if r[0] in alias))
+        if expr == "X":  # f 文字列の穴を評価できなかった式(_render の X)。元の列は分からない
+            tbl, col = main, ""
+        elif re.fullmatch(r"[A-Za-z_]\w*", expr):
+            tbl, col = main, expr
+        elif refs:
+            tbl, col = real(refs[0][0]), refs[0][1] if len(refs) == 1 else ""
+        else:
+            tbl, col = main, ""
+        cols.append({"alias": am.group(1) if am else col, "expression": expr, "table": "" if tbl == "X" else tbl, "column": col})
+    return frm, cols
+
+
 def _callees(fn, mod, mods):
     """fn の本体が呼ぶ、backend_files 内の関数を (Module, FunctionDef) で返す(同モジュールの Name 呼出と module.func 呼出)。"""
     for n in ast.walk(fn):
@@ -486,8 +683,10 @@ def _errors(fn, env):
     return out
 
 
-def extract(files):
-    """backend ファイル(Path の並び)から {apis, unresolved} を作る。"""
+def extract(files, hints=None):
+    """backend ファイル(Path の並び)から {apis, unresolved} を作る。
+    hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。"""
+    hints = hints or {}
     mods = {p.stem: Module(p) for p in files}
     apis, unresolved, tables = {}, [], set()
     for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
@@ -508,7 +707,7 @@ def extract(files):
                 if tm is None or name not in tm.funcs:
                     continue  # backend_files に無いモジュール(または関数でない値)は対象外
                 action, fn = k.value, tm.funcs[name]
-                dataset, errors, seen_col = [], [], set()
+                dataset, errors, seen_col, ops = [], [], set(), []
                 clauses = {k: [] for k in _CLAUSE_KEYS}
                 clo = _closure(tm, fn, mods)
                 for m2, f2 in clo:
@@ -523,6 +722,8 @@ def extract(files):
                         sql = _render(s, env, True) if isinstance(s, (ast.JoinedStr, ast.Constant, ast.BinOp)) else None
                         if sql and _SQL_HEAD.match(sql):
                             _merge(clauses, _clauses(sql))
+                            frm, cols = _columns(sql, hints.get("ddl") or {}, unresolved, action)
+                            ops.append({"from": frm, "columns": _candidates(cols, hints)})
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
@@ -535,8 +736,13 @@ def extract(files):
                     unresolved.append({"action": action, "reason": "return の dict キーを静的に取れない"})
                 if not dataset:
                     unresolved.append({"action": action, "reason": "SELECT 文を取れない(SQL を持たないか、動的に組んでいる)"})
+                for i, op in enumerate(ops, 1):  # id は H2 の db_operations と同じ付け方(複数なら実行順に _<n>)
+                    op["id"] = f"db_op_{action}" + (f"_{i}" if len(ops) > 1 else "")
+                    for no, c in enumerate(op["columns"], 1):
+                        c["no"] = no
                 apis[action] = {"dataset": dataset, "response_items": [{"key": x} for x in keys],
-                                "error_patterns": errors, **clauses}
+                                "error_patterns": errors, **clauses,
+                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"]} for o in ops]}
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
@@ -568,7 +774,21 @@ def selftest():
         (Path(d) / "h.py").write_text(h, encoding="utf-8")
         (Path(d) / "q.py").write_text(qs, encoding="utf-8")
         (Path(d) / "common.py").write_text('def _req(p):\n    raise ValidationError(f"{p} は必須")\ndef identify(p):\n    _err("E1", "認証に失敗", 401)\n', encoding="utf-8")
-        r = extract([Path(d) / "h.py", Path(d) / "q.py"])
+        (Path(d) / "s.sql").write_text("CREATE TABLE real_tbl (\n  id integer, -- 識別番号\n  a integer,\n  PRIMARY KEY (id)\n);\n"
+                                       "ALTER TABLE real_tbl ADD COLUMN b integer;\nCOMMENT ON COLUMN public.real_tbl.a IS '金額A';\n", encoding="utf-8")
+        (Path(d) / "V.tsx").write_text('const ROWS: X[] = [\n  { label: "名前", k: "name" },\n  { label: "対象外", k: "zzz" },\n];\n', encoding="utf-8")
+        (Path(d) / "api.ts").write_text("export interface R {\n  x_id: number;\n  /** 合計B（参考値） */\n  b: number;\n  name: string;\n}\n", encoding="utf-8")
+        hints = {"ddl": _ddl(d), "ui": _ui_specs([Path(d) / "V.tsx"]), "types": _type_blocks([Path(d) / "api.ts"])}
+        r = extract([Path(d) / "h.py", Path(d) / "q.py"], hints)
+    # 骨組み: 最上位 SELECT の全列(別名・元の式・元の表と列)と FROM の行。論理名の候補は出所つき
+    op = r["apis"]["get_x"]["db_operations"][0]
+    assert op["id"] == "db_op_get_x" and op["from"] == {"table": "real_tbl", "name": "d", "alias": "t"}, op["from"]
+    got = [(c["no"], c["alias"], c["table"], c["column"], c["logical_name"], c["logical_name_source"]) for c in op["columns"]]
+    assert got == [(1, "x_id", "real_tbl", "id", "識別番号", "comment"), (2, "a", "real_tbl", "a", "金額A", "comment"),
+                   (3, "b", "real_tbl", "b", "合計B", "api_type"), (4, "name", "shops", "name", "名前", "ui_label")], got
+    assert op["columns"][1]["expression"] == "SUM(t.a)", op["columns"][1]
+    assert [c["alias"] for c in _columns("SELECT r.* FROM real_tbl r", hints["ddl"], [], "t")[1]] == ["id", "a", "b"], "SELECT * を DDL で展開しない"
+    assert _guess("shop_id") == "店舗ID" and _guess("sou_uriage") == "", "列名からの推定"
     a = r["apis"]["get_x"]
     cols = {(x["column"], x["table"]) for x in a["dataset"]}
     assert {("id", "real_tbl"), ("a", "real_tbl"), ("b", "real_tbl"), ("name", "shops")} <= cols, cols
@@ -619,15 +839,25 @@ def main(argv=None):
     if not files or missing:
         print(f"[入力不正] backend_files が空か、無いファイルがある: {missing}", file=sys.stderr)
         return 2
+    srcs = []
+    for s in cfg.get("source_files", []):
+        if s:
+            q = Path(os.path.expanduser(os.path.expandvars(s)))
+            srcs.append(q if q.is_absolute() else root / q)
+    hints = {"ddl": _ddl(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs)}
     try:
-        draft = extract(files)
+        draft = extract(files, hints)
     except SyntaxError as e:
         print(f"[入力不正] 構文エラー: {e}", file=sys.stderr)
         return 2
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(draft, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"[OK] apis={len(draft['apis'])} unresolved={len(draft['unresolved'])} -> {args.out}")
+    cols = [c for a in draft["apis"].values() for o in a["db_operations"] for c in o["columns"]]
+    by_src = {}
+    for c in cols:
+        by_src[c["logical_name_source"] or "none"] = by_src.get(c["logical_name_source"] or "none", 0) + 1
+    print(f"[OK] apis={len(draft['apis'])} columns={len(cols)} {by_src} unresolved={len(draft['unresolved'])} -> {args.out}")
     return 1 if draft["unresolved"] else 0
 
 

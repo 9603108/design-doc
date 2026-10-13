@@ -23,6 +23,7 @@ LLM が書いた語彙の文面より前に、骨格(連番・参照先・呼出
       分担表 prompts/units.json に照らして [範囲外] 担当外の欄 / [重複] 2単位が同じ欄 / [参照] 行の識別子や
       action・event_code・message_id 等が他の単位の断片と食い違う、を1行1件で出す(行末に「→ 差し戻し先 <単位>」)。
       --unit <単位> を付けると、その単位に関わる行だけを出す(単位が自分の断片を検査するとき)
+      [列の省略] H2 の dataset・logical_names の行数が <画面>_backend_draft.json の columns より少ない(欠けた列名を挙げる)
 
 【接続情報】
   - 入力の作り手: extract_react_draft.py の build_draft()(キー: events / db_operations / event_processes)
@@ -189,9 +190,40 @@ def _strings(node):
             yield from _strings(v)
 
 
+def check_h2_columns(h2, draft):
+    """H2 が下書きの列を省いていないか(2026-10-13 混成版で 63 列中 5 列しか書かれなかった)。
+    action ごとに、H2 の dataset の行数が下書きの db_operations[].columns の数より少なければ ERROR。
+    logical_names の行数が下書きの列(表と元の列、元の列が無ければ別名)の種類の数より少なくても ERROR。
+    欠けた列は、H2 の physical_column に別名も元の列も無い列を別名で挙げる。呼出元: check_unit_extras。"""
+    problems, keys = [], {}
+    ops = [o for o in (h2.get("db_operations") or []) if isinstance(o, dict)]
+    for action, api in (draft.get("apis") or {}).items():
+        cols = [c for o in api.get("db_operations") or [] for c in o.get("columns") or []]
+        if not cols:
+            continue
+        for c in cols:
+            keys.setdefault((c.get("table"), c.get("column") or c.get("alias")), c)
+        mine = [o for o in ops if (o.get("api_endpoint") or {}).get("action") == action]
+        rows = [r for o in mine for r in o.get("dataset") or [] if isinstance(r, dict)]
+        if len(rows) < len(cols):
+            have = {r.get("physical_column") for r in rows}
+            lack = [c["alias"] or c["expression"] for c in cols if not ({c.get("alias"), c.get("column")} & have)]
+            where = ",".join(o.get("id") or "?" for o in mine) or f"action={action} の行が無い"
+            problems.append(f"[列の省略] db_operations[{where}].dataset: 下書きの columns {len(cols)} 列に対し {len(rows)} 行。"
+                            f"欠けた列: {', '.join(lack) or '(列名では特定できない。行数が足りない)'} → 差し戻し先 H2")
+    names = [n for n in h2.get("logical_names") or [] if isinstance(n, dict)]
+    if keys and len(names) < len(keys):
+        have = {n.get("physical_column") for n in names}
+        lack = [c["alias"] or c["expression"] for c in keys.values() if not ({c.get("alias"), c.get("column")} & have)]
+        problems.append(f"[列の省略] logical_names: 下書きの列 {len(keys)} 種に対し {len(names)} 行。"
+                        f"欠けた列: {', '.join(lack) or '(列名では特定できない。行数が足りない)'} → 差し戻し先 H2")
+    return problems
+
+
 def check_unit_extras(frags, directory):
     """--units の追加検査(ERROR)。(a) S1 の画面項目に react 下書きの display_rows の行名が全部ある /
-    (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない。
+    (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない /
+    (e) H2 の dataset・logical_names が backend 下書きの columns を省いていない(check_h2_columns)。
     問題は「[種別] 場所: 内容 → 差し戻し先 <単位>」。呼出元: main_units。"""
     problems = []
     s1 = frags.get("S1")
@@ -210,6 +242,12 @@ def check_unit_extras(frags, directory):
             bad = list(dict.fromkeys(k for row in op.get(fld) or [] if isinstance(row, dict) for k in row if not k.isascii()))
             if bad:
                 problems.append(f"[英語キー] db_operations[{op.get('id')}].{fld}: 日本語のキー {', '.join(bad)}(英語のキー名で書く) → 差し戻し先 H2")
+    if frags.get("H2") is not None:
+        for p in sorted(Path(directory).glob("*_backend_draft.json")):
+            try:
+                problems += check_h2_columns(frags["H2"], json.loads(p.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
     h4 = {m.get("message_id"): m.get("message") for m in (frags.get("H4") or {}).get("messages_backend") or [] if isinstance(m, dict)}
     for api in (frags.get("S2") or {}).get("api_spec") or []:
         for e in api.get("error_patterns") or []:
@@ -301,6 +339,18 @@ def selftest_units():
     assert {"[範囲外]", "[重複]", "[参照]"} <= kinds, f"検出不足: {out}"
     assert any("差し戻し先 H3" in p for p in out) and any("差し戻し先 S2" in p for p in out), f"差し戻し先が出ない: {out}"
     assert all("S2" in p for p in _units.check_all(spec, bad, only="S2")), "--unit の絞り込みが効かない"
+    # H2 が下書きの columns を省けば、欠けた列名つきで H2 へ戻す。全列を書けば出さない
+    draft = {"apis": {"save": {"db_operations": [{"id": "db_op_save", "columns": [
+        {"alias": "shop_id", "expression": "p.mise_no", "table": "pos", "column": "mise_no"},
+        {"alias": "days", "expression": "count(*)", "table": "pos", "column": ""}]}]}}}
+    h2 = copy.deepcopy(good["H2"])
+    h2["db_operations"][0]["dataset"] = [{"physical_column": "mise_no"}]
+    h2["logical_names"] = [{"physical_column": "mise_no"}]
+    out = check_h2_columns(h2, draft)
+    assert len(out) == 2 and all("欠けた列: days" in p and p.endswith("差し戻し先 H2") for p in out), out
+    h2["db_operations"][0]["dataset"].append({"physical_column": "days"})
+    h2["logical_names"].append({"physical_column": "days"})
+    assert check_h2_columns(h2, draft) == [], check_h2_columns(h2, draft)
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
