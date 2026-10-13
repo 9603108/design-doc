@@ -425,14 +425,36 @@ def _op_label(t, start, states):
     return ""
 
 
-def _robust_lines(texts):
+def _failure_line(fe):
+    """failure_effects の1件(_react_facts.extract の要素)から、失敗時の行を作る。state を書く先が無ければ None。
+
+    呼出元: _robust_lines()。意味合い: 失敗時に書く state と書かない state(前の値が残る)をソースの書き込みから文にする。
+    """
+    if not fe["on_failure"]:
+        return None
+    s = "取得に失敗したときは、" + "・".join(fe["on_failure"]) + "にエラーの内容"
+    if fe["failure_text"]:
+        s += f"({fe['failure_text']})"
+    s += "を設定する"
+    if fe["untouched_on_failure"]:
+        s += "。" + "・".join(fe["untouched_on_failure"]) + "は更新しない(前の表示が残る)"
+    if fe["in_finally"]:
+        s += "。処理の終わりに " + "・".join(fe["in_finally"]) + " にする"
+    return s
+
+
+def _robust_lines(texts, failures=()):
     """辿った本体の文字から、失敗時・連続操作・0件の下書き行を返す(拾えたものだけ)。
 
-    呼出元: build_draft()。意味合い: API を呼ぶイベントの処理ステップに、画面の振る舞いの骨格を機械的に足す。
+    呼出元: _detail_lines()。意味合い: API を呼ぶイベントの処理ステップに、画面の振る舞いの骨格を機械的に足す。
+    failures はそのイベントの failure_effects。取れた分は失敗時の一般文の代わりに事実の行を出す(取れなければ一般文のまま)。
     """
     body = "\n".join(texts)
     lines = []
-    if _FAIL_HINT.search(body):
+    facts = [ln for ln in (_failure_line(f) for f in failures) if ln]
+    if facts:
+        lines += facts
+    elif _FAIL_HINT.search(body):
         lines.append("取得に失敗したときはエラー表示にメッセージを表示する")
     if _RACE_HINT.search(body):
         lines.append("連続して操作したときは、最後の要求の応答だけを反映する")
@@ -441,22 +463,24 @@ def _robust_lines(texts):
     return lines
 
 
-def _detail_lines(link, called):
+def _detail_lines(link, called, failures=()):
     """呼ぶ API があるイベントの details に足す描画の行。0件分岐は状態が一致した分だけ、分岐の文言つきに置き換える。
 
     呼出元: build_draft()。意味合い: 0件の行を、JSX に書かれた表示文言で具体化する(文言が無ければ穴の無い一般文のまま)。
     """
     if not called:
         return []
-    lines = _robust_lines(link["texts"])
+    lines = _robust_lines(link["texts"], failures)
     if link.get("empty"):
         lines = [ln for ln in lines if not ln.startswith("0件のとき")]
         lines += [f"0件のときは該当なしの旨を表示する(画面の文言: 「{txt}」)" for _x, txt in link["empty"]]
     return lines
 
 
-def build_draft(links, unresolved, screen_name):
+def build_draft(links, unresolved, screen_name, failure_effects=()):
     """解析結果を Phase 1 の下書き JSON(dict)に組む。
+
+    failure_effects は _react_facts.extract の戻りの一覧。イベントごとの details の失敗時の行に使う(省略時は一般文)。
 
     db_operations は action の初出順に1件ずつ作り、各イベントの details の呼出の行は
     その db_operations の並びで出す(verify_partials.py がこの一致を検査する)。
@@ -514,7 +538,7 @@ def build_draft(links, unresolved, screen_name):
             # 目的: このイベントが呼ぶ API 呼出の位置(action と出典)。接続: 合成側が details の行と照合する
             "calls": link["calls"],
             "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
-            + _detail_lines(link, called),
+            + _detail_lines(link, called, [f for f in failure_effects if f["event"] == ev["event_code"]]),
         })
     return {
         "events": events,
@@ -620,9 +644,10 @@ def main(argv=None):
         return 2
 
     links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
-    draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
-    # 目的: 取得失敗時に変える state・残る state を下書きに足す(既存キーは変えない)。接続: _react_facts.extract
-    draft.update(_react_facts.extract(links, sources))
+    # 目的: 取得失敗時に変える state・残る state を下書きに足し(既存キーは変えない)、details の失敗時の行にも使う。接続: _react_facts.extract
+    facts = _react_facts.extract(links, sources)
+    draft = build_draft(links, unresolved, cfg.get("screen_name", ""), facts["failure_effects"])
+    draft.update(facts)
     # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
     draft.update(_react_facts.csv_exports(links, sources))
     # 目的: 計算式の候補(定数配列の calc)を下書きに足し、verify_vs_source.check_calcs が H4 の calculations と突き合わせる(B1)。接続: _react_facts.calc_candidates
