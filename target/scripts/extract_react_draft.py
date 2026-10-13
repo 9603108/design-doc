@@ -156,6 +156,15 @@ def _line(text, i):
     return text.count("\n", 0, i) + 1
 
 
+def _span(path, text, s, e):
+    """文字位置 s〜e(e は含まない)を出典の {file, line_start, line_end}(1始まり・両端を含む)にする。
+
+    呼出元: analyze_sources()・build_draft() の src。意味合い: 下書きの要素が指すソースの行を機械で付ける
+    (数字は LLM に書かせない)。接続: 合成側(_units の _fill_src、A3)が同じ形で読む。
+    """
+    return {"file": str(path), "line_start": _line(text, s), "line_end": _line(text, max(s, e - 1))}
+
+
 def _deps_of(path, text, s, e):
     """引数並び text[s:e] の最後が配列 [...] ならその識別子の集合、無ければ None。"""
     last_s, last_e = _top_split(text, s, e)[-1]
@@ -230,6 +239,10 @@ def _resolve(span, ctx, seen, acc):
             if lm:
                 if lm.group(2) not in acc["actions"]:
                     acc["actions"].append(lm.group(2))
+                # 目的: 呼出位置を出典つきで残す(db_operations の call_sites・event_processes の calls)。同じ呼出は1回だけ積む
+                call = {"action": lm.group(2), "src": [_span(path, text, i, lm.end())]}
+                if call not in acc["calls"]:
+                    acc["calls"].append(call)
             else:
                 ctx["unresolved"].append({"file": str(path), "line": _line(text, i),
                                           "reason": f"{name} の第1引数が文字列リテラルでない"})
@@ -257,7 +270,8 @@ def _excerpt_chunks(used, funcs):
         hs = text.rfind("\n", 0, text.rfind(name, 0, s)) + 1
         body = text[hs:e]
         joined.append(body)
-        parts.append(f"// 出典: {path}\n{body}")
+        sp = _span(path, text, hs, e)
+        parts.append(f"// 出典: {sp['file']}:{sp['line_start']}-{sp['line_end']}\n{body}")
     all_text = "\n".join(joined)
     seen = set()
     for name in sorted(used):
@@ -273,7 +287,8 @@ def _excerpt_chunks(used, funcs):
                 end = _close(text, brace) + 1
             else:
                 end = len(text) if nl < 0 else nl
-            parts.append(f"// 出典: {path}\n{text[m.start():end]}")
+            sp = _span(path, text, m.start(), end)
+            parts.append(f"// 出典: {sp['file']}:{sp['line_start']}-{sp['line_end']}\n{text[m.start():end]}")
     return "\n\n".join(parts) + "\n"
 
 
@@ -310,7 +325,7 @@ def analyze_sources(source_files, api_call_functions):
         for m in _EVENT_ATTR.finditer(t):
             bo = m.end() - 1
             be = _close(t, bo)
-            acc = {"actions": [], "states": set(), "hit": False, "texts": [], "fetch": False}
+            acc = {"actions": [], "states": set(), "hit": False, "texts": [], "fetch": False, "calls": []}
             _resolve((p, t, bo + 1, be), ctx, set(), acc)
             expr = " ".join(t[bo + 1:be].split())[:80]
             if not acc["hit"] and not acc["actions"]:
@@ -333,6 +348,7 @@ def analyze_sources(source_files, api_call_functions):
                 "file": str(p), "line": _line(t, m.start()),
                 "element": tags[-1].group(1) if tags else "",
                 "attr": m.group(1), "handler": expr, "actions": acc["actions"], "texts": acc["texts"],
+                "calls": acc["calls"],
                 "ui_label": _ui_label(t, tags, m, be),
                 # 目的: ui_label が取れない要素(select 等)の連続操作の表示名を、隣の label・操作対象の state から引く。接続: _continuous_ops()
                 "op_label": _op_label(t, tags[-1].start() if tags else m.start(), acc["states"]),
@@ -341,18 +357,22 @@ def analyze_sources(source_files, api_call_functions):
                 "empty": [(x, branches[x]) for x in sorted(acc["states"]) if x in branches],
                 # 目的: 取得を起こすかどうかを連続操作の判定に渡す(文字列リテラルの action が取れなくても取得は起きる)。接続: _continuous_ops()
                 "fetch": acc["fetch"],
+                # 目的: イベント属性の式の出典(下書きの events[].src の元)。接続: build_draft()
+                "src": [_span(p, t, bo + 1, be)],
             })
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
     # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
     # ponytail: effect 内の条件分岐(if で呼ばない場合)は見ない。呼ぶ可能性のある action を全部出す。
-    mount = {"actions": [], "states": set(), "hit": False, "texts": []}
+    mount = {"actions": [], "states": set(), "hit": False, "texts": [], "calls": []}
     for _deps, span in effects:
         _resolve(span, ctx, set(), mount)
     first = effects[0][1] if effects else None
     links.insert(0, {
         "file": str(first[0]) if first else "", "line": _line(first[1], first[2]) if first else 0,
         "element": "", "attr": "mount", "handler": "useEffect(マウント時)", "actions": mount["actions"],
-        "texts": mount["texts"], "ui_label": "", "empty": [],
+        "texts": mount["texts"], "calls": mount["calls"], "ui_label": "", "empty": [],
+        # 目的: 初期表示の出典は先頭の useEffect の本体。接続: build_draft() の EV00 の src
+        "src": [_span(first[0], first[1], first[2], first[3])] if first else [],
     })
     seen_u, uniq = set(), []
     for u in unresolved:
@@ -461,6 +481,7 @@ def build_draft(links, unresolved, screen_name):
             "classification": "サーバー" if link["actions"] else "クライアント",
             "ui_label": link.get("ui_label", ""),
             "source": {"file": link["file"], "line": link["line"], "handler": link["handler"]},
+            "src": link.get("src", []),
         })
         for act in link["actions"]:
             if act not in triggers:
@@ -469,8 +490,17 @@ def build_draft(links, unresolved, screen_name):
             if code not in triggers[act]:
                 triggers[act].append(code)
 
+    # 目的: 操作ごとの呼出位置(全イベントの呼出を集めて重複を除く)。接続: db_operations[].api_endpoint.call_sites
+    call_sites = {}
+    for link in links:
+        for c in link["calls"]:
+            lst = call_sites.setdefault(c["action"], [])
+            for sp in c["src"]:
+                if sp not in lst:
+                    lst.append(sp)
     db_operations = [
-        {"api_endpoint": {"action": act, "trigger_events": triggers[act]}} for act in op_order
+        {"api_endpoint": {"action": act, "trigger_events": triggers[act], "call_sites": call_sites.get(act, [])}}
+        for act in op_order
     ]
     event_processes = []
     for ev, link in zip(events, links):
@@ -479,6 +509,9 @@ def build_draft(links, unresolved, screen_name):
         todo = [] if ev["event_code"] == "EV00" else [DETAIL_TODO]
         event_processes.append({
             "event_code": ev["event_code"],
+            "src": ev["src"],
+            # 目的: このイベントが呼ぶ API 呼出の位置(action と出典)。接続: 合成側が details の行と照合する
+            "calls": link["calls"],
             "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
             + _detail_lines(link, called),
         })
@@ -505,7 +538,8 @@ def _display_rows(sources):
             end = _close(t, m.end() - 1)
             labels = [x.group(1) for x in re.finditer(r"\b(?:label|header|title)\s*:\s*['\"]([^'\"]+)['\"]", t[m.end():end])]
             if labels:
-                rows.append({"array": m.group(1), "labels": labels})
+                # 目的: 表示行の出典(配列の宣言の範囲)。接続: build_draft ではなく main() の display_rows に出る
+                rows.append({"array": m.group(1), "labels": labels, "src": [_span(p, t, m.start(), end)]})
     return rows
 
 
@@ -641,14 +675,21 @@ def selftest():
         assert links[2]["actions"] == ["wrapped"], f"input の actions: {links[2]['actions']}"
         assert "export function call" in _excerpt, "excerpt に api.ts の定義が出ない"
         assert "Screen.tsx" not in _excerpt, "画面の関数が excerpt に混ざった"
+        assert re.search(r"// 出典: \S*api\.ts:\d+-\d+", _excerpt), "excerpt の見出しが 出典: path:行-行 になっていない"
         assert len(unresolved) == 1 and "props.onSave" in unresolved[0]["reason"], f"unresolved: {unresolved}"
         draft = build_draft(links, unresolved, "テスト画面")
         assert [e["event_code"] for e in draft["events"]] == ["EV00", "EV01", "EV02"], "event_code(EV00 = 初期表示、以降 EV01…)"
         assert draft["events"][0]["trigger"] == "テスト画面の初期表示時", "EV00 の trigger"
+        # 目的: src の行番号が TSX の実際の行と一致すること(load の effect は 9 行目、onClick は 13 行目)
+        assert draft["events"][0]["src"][0]["line_start"] == 9, f"EV00 の src: {draft['events'][0]['src']}"
+        assert draft["events"][1]["src"][0] == {"file": str(dp / "Screen.tsx"), "line_start": 13, "line_end": 13}, "EV01 の src"
         assert draft["db_operations"] == [
-            {"api_endpoint": {"action": "load", "trigger_events": ["EV00", "EV01"]}},
-            {"api_endpoint": {"action": "init", "trigger_events": ["EV00"]}},
-            {"api_endpoint": {"action": "wrapped", "trigger_events": ["EV02"]}},
+            {"api_endpoint": {"action": "load", "trigger_events": ["EV00", "EV01"],
+                              "call_sites": [{"file": str(dp / "Screen.tsx"), "line_start": 9, "line_end": 9}]}},
+            {"api_endpoint": {"action": "init", "trigger_events": ["EV00"],
+                              "call_sites": [{"file": str(dp / "Screen.tsx"), "line_start": 10, "line_end": 10}]}},
+            {"api_endpoint": {"action": "wrapped", "trigger_events": ["EV02"],
+                              "call_sites": [{"file": str(dp / "Screen.tsx"), "line_start": 4, "line_end": 4}]}},
         ], f"db_operations: {draft['db_operations']}"
         assert draft["event_processes"][0]["details"] == ["・load をリクエストする", "・init をリクエストする"], "EV00 の details"
         assert draft["event_processes"][1]["details"] == [DETAIL_TODO, "・load をリクエストする"], "EV01 の details"

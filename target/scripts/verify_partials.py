@@ -200,7 +200,9 @@ def check_h2_columns(h2, draft):
     呼出元: check_unit_extras。"""
     from collections import Counter
 
-    def accepted(c):  # この列の物理名として書いてよい名前。手順書どおりの column を先に並べる
+    def accepted(c):  # この列の物理名として書いてよい名前。下書きに physical_column があればそれだけ(別名の取り違えを ERROR にする)
+        if c.get("physical_column"):
+            return [c["physical_column"]]
         names = [n for n in (c.get("column"), c.get("alias")) if n]
         return names or [c.get("expression")]
 
@@ -249,7 +251,8 @@ def check_h2_logical_names(h2):
 def check_unit_extras(frags, directory):
     """--units の追加検査(ERROR)。(a) S1 の画面項目に react 下書きの display_rows の行名が全部ある /
     (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない /
-    (e) H2 の dataset・logical_names が backend 下書きの columns を省いていない(check_h2_columns)。
+    (e) H2 の dataset・logical_names が backend 下書きの columns を省いていない(check_h2_columns)/
+    (f) S1 の example が半数を超えて空でない。
     問題は「[種別] 場所: 内容 → 差し戻し先 <単位>」。呼出元: main_units。"""
     problems = []
     s1 = frags.get("S1")
@@ -263,6 +266,10 @@ def check_unit_extras(frags, directory):
             lack = [lb for r in rows for lb in r.get("labels") or [] if lb not in have]
             if lack:
                 problems.append(f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1")
+    s1_items = [it for it in ((s1 or {}).get("screen_layout") or {}).get("items") or [] if isinstance(it, dict)]
+    no_example = [it.get("item_name") for it in s1_items if not it.get("example")]
+    if s1_items and len(no_example) * 2 > len(s1_items):
+        problems.append(f"[例示値] screen_layout.items: example が空の項目が {len(no_example)}/{len(s1_items)} 件(半数超)。example は全項目に書く → 差し戻し先 S1")
     for op in (frags.get("H2") or {}).get("db_operations") or []:
         if not isinstance(op, dict):
             continue
@@ -288,6 +295,42 @@ def check_unit_extras(frags, directory):
     return problems
 
 
+# 出典(src)を持つべき欄の名前。根拠の行を数える対象(A4 の一覧)
+SRC_KEYS = {"events", "event_processes", "api_spec", "response_items", "error_patterns", "db_operations",
+            "calculations", "validations", "messages", "messages_backend", "items", "common_logic"}
+
+
+def _src_rows(node, key=None):
+    """断片の中で SRC_KEYS の欄に入っている行(dict)を順に返す。呼出元: check_src_warn。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _src_rows(v, k)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, dict) and key in SRC_KEYS:
+                yield v
+            yield from _src_rows(v, key)
+
+
+def check_src_warn(frags):
+    """src(出典)が空の行を、件数を1行にまとめた [WARN] で返す(終了コード には影響させない)。
+    理由: 出典の無い記述は作り話の疑いがあるため目印を付けるが、A3 の合成前の断片にはまだ src が無く、
+    行ごとに出すと欄が多い断片で出力が埋まるので、1件の要約にする。EV00 は初期表示で src を持たない欄として除く。
+    呼出元: main_units。"""
+    lack, units = [], set()
+    for unit, frag in frags.items():
+        for r in _src_rows(frag):
+            if r.get("event_code") == "EV00":
+                continue
+            if not r.get("src"):
+                lack.append(r.get("event_code") or r.get("action") or r.get("item_name") or r.get("message_id") or r.get("id") or "?")
+                units.add(unit)
+    if not lack:
+        return []
+    sample = ", ".join(str(x) for x in lack[:5]) + (f" ほか {len(lack) - 5} 件" if len(lack) > 5 else "")
+    return [f"[WARN] [出典] 行 {len(lack)} 件の src が空(ソースの根拠が不明): {sample} → 差し戻し先 {', '.join(sorted(units))}"]
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -310,6 +353,8 @@ def main_units(directory, only=None):
         print(pr)
     # WARN は終了コードに影響しない(合成で機械的に補うため)
     for w in check_h2_logical_names(frags.get("H2") or {}):
+        print(w)
+    for w in check_src_warn(frags):
         print(w)
     if problems:
         return 1
@@ -416,6 +461,12 @@ def selftest_units():
         return [m for lv, m in vi.check_description_granularity(
             {"backend_processes": [{"process_id": "BE1", "overview": "POS会計を一覧にする"}]}, {"source_identifiers": src_idents}) if "物理名" in m]
     assert not phys([]) and phys(["POS"]), "略語の物理名判定が違う"
+    # src が空の行は件数を1行の [WARN] にまとめる。src が全部ある断片、EV00 だけの断片は出さない
+    src_ok = {"H1": {"events": [{"event_code": "EV01", "src": [{"file": "x", "line_start": 1, "line_end": 2}]}]}}
+    assert check_src_warn(src_ok) == [], "src が揃った断片で WARN を出した"
+    src_lack = {"H1": {"events": [{"event_code": "EV02"}]}, "S3": {"event_processes": [{"event_code": "EV00"}, {"event_code": "EV01", "src": []}]}}
+    out = check_src_warn(src_lack)
+    assert len(out) == 1 and out[0].startswith("[WARN] [出典]") and "行 2 件" in out[0] and "差し戻し先 H1, S3" in out[0], out
 
 
 def main(argv=None):

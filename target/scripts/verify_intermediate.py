@@ -1356,6 +1356,55 @@ def check_message_severity_prefix(merged: dict) -> list:
     return issues
 
 
+def check_src(merged: dict, sc: dict) -> list:
+    """2026-10-13 新設(案 A4): 行の出典 src({file, line_start, line_end}) を検査する。
+    (a) src の無い行は WARN。src が1行も無い中間 JSON(A3 の合成より前)では WARN を1件の要約にまとめる。
+    (b) src.file が screen_config の source_files・backend_files(同じフォルダの補助モジュールを含む)に無い、
+        line_start > line_end、line_end がファイルの行数を超える → ERROR(作り話の行番号を止める)。
+    接続情報: 呼出元 = main() / 入力 = merged・sc / 出力 = [(level, message), ...]"""
+    issues = []
+    lists = {
+        "events": merged.get("events") or [],
+        "event_processes": [e for e in merged.get("event_processes") or [] if isinstance(e, dict) and e.get("event_code") != "EV00"],
+        "api_spec": merged.get("api_spec") or [],
+        "db_operations": merged.get("db_operations") or [],
+        "calculations": merged.get("calculations") or [],
+        "validations": merged.get("validations") or [],
+        "common_logic": merged.get("common_logic") or [],
+        "screen_layout.items": (merged.get("screen_layout") or {}).get("items") or [],
+    }
+    rows = [(name, r) for name, rs in lists.items() for r in rs if isinstance(r, dict)]
+    if rows and not any(r.get("src") for _, r in rows):
+        issues.append(("WARN", f"[出典] src が1行も無い({len(rows)} 行)。合成より前の中間 JSON と思われるため出典は未検査"))
+    else:
+        for name, r in rows:
+            if not r.get("src"):
+                issues.append(("WARN", f"[出典] {name}: src が無い(ソースの根拠が不明)"))
+    srcs = list(sc.get("source_files") or []) + [str(Path(sc.get("project_root") or ".") / f) for f in sc.get("backend_files") or []]
+    allowed_files = {Path(f).resolve() for f in srcs}
+    allowed_dirs = {p.parent for p in allowed_files}
+    line_counts = {}
+    for name, r in rows:
+        for s in r.get("src") or []:
+            if not isinstance(s, dict):
+                continue
+            p = Path(s["file"]).resolve() if s.get("file") else None
+            if p is None or not (p in allowed_files or p.parent in allowed_dirs):
+                issues.append(("ERROR", f"[出典] {name}: src.file が対象のソースに無い: {s.get('file')}"))
+                continue
+            ls, le = s.get("line_start"), s.get("line_end")
+            if isinstance(ls, int) and isinstance(le, int) and ls > le:
+                issues.append(("ERROR", f"[出典] {name}: line_start {ls} が line_end {le} より大きい"))
+            if isinstance(le, int) and p not in line_counts:
+                try:
+                    line_counts[p] = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+                except OSError:
+                    line_counts[p] = None
+            if isinstance(le, int) and line_counts.get(p) is not None and le > line_counts[p]:
+                issues.append(("ERROR", f"[出典] {name}: line_end {le} がファイルの行数 {line_counts[p]} を超える: {p.name}"))
+    return issues
+
+
 def main():
     # 目的: 引数で指定された機能名の中間 JSON を検証する。引数なしなら環境変数 FEATURE_NAME、
     #       どちらも無ければ _config_loader 側が「feature_name 未指定」で止める（既定の機能名は持たない）。
@@ -1446,6 +1495,8 @@ def main():
 
     # 2026-10-13: 中身の穴（名前だけの共通ロジック・物理名残存・未展開の穴・メッセージ ID・DB 操作の英語キー空欄）
     all_issues.extend(check_intermediate_strict(merged))
+    # 2026-10-13 案 A4: 出典(src)の無い記述は WARN、対象外のファイル・作り話の行番号は ERROR
+    all_issues.extend(check_src(merged, sc))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]

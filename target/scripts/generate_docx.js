@@ -739,7 +739,7 @@ function tdCell(text, width, opts = {}) {
 /**
  * 中間JSON の logical_names[] から「論理名 → 物理名」の逆引き Map を構築する。
  * 意味合い: DB操作テーブル等で「論理名[物理名]」併記形式を実現する基盤。
- * 接続情報: 入力 = data 全体 / 出力 = { colMap: 論理列→物理列, tableMap: 論理表→物理表 }
+ * 接続情報: 入力 = data 全体 / 出力 = { colMap: (論理表・論理列の組)→物理列, colAny: 論理列→物理列の集合, tableMap: 論理表→物理表 }
  *           呼出元 = main() で1回だけ構築し、各 sectionXxx に渡す
  */
 /**
@@ -907,17 +907,22 @@ function buildDerivationChainEmbed(diagram, chapterNo) {
 }
 
 function buildLogicalNameMaps(data) {
+  // colMap は (論理表, 論理列) の組で引く。同じ論理列名が別の表に在っても取り違えないため（E2）。
+  // colAny は表を問わない逆引き。表が不明なときに使い、物理列が1つに決まるときだけ採用する。
   const colMap = new Map();
+  const colAny = new Map();
   const tableMap = new Map();
   for (const ln of ((data && data.logical_names) || [])) {
     if (ln.logical_column && ln.physical_column) {
-      colMap.set(ln.logical_column, ln.physical_column);
+      colMap.set(`${ln.logical_table}\u0001${ln.logical_column}`, ln.physical_column);
+      if (!colAny.has(ln.logical_column)) colAny.set(ln.logical_column, new Set());
+      colAny.get(ln.logical_column).add(ln.physical_column);
     }
     if (ln.logical_table && ln.physical_table) {
       tableMap.set(ln.logical_table, ln.physical_table);
     }
   }
-  return { colMap, tableMap };
+  return { colMap, colAny, tableMap };
 }
 
 /**
@@ -926,11 +931,20 @@ function buildLogicalNameMaps(data) {
  * 接続情報: 入力 = 論理名 + kind('column'|'table') + buildLogicalNameMaps の戻り値
  *           出力 = `論理名[物理名]` 文字列（物理名未登録時は論理名のみ）
  */
-function withPhysical(logical, kind, maps) {
+function withPhysical(logical, kind, maps, table) {
   if (!logical) return '';
   if (!maps) return logical;
-  const m = kind === 'table' ? maps.tableMap : maps.colMap;
-  const phys = m.get(logical);
+  let phys;
+  if (kind === 'table') {
+    phys = maps.tableMap.get(logical);
+  } else {
+    // table が分かるときは (表, 列) の組で引く（E2）。無ければ表を問わない逆引きで、物理列が1つに決まるときだけ付ける。
+    if (table) phys = maps.colMap.get(`${table}\u0001${logical}`);
+    if (!phys) {
+      const set = maps.colAny.get(logical);
+      phys = set && set.size === 1 ? [...set][0] : undefined;
+    }
+  }
   return phys ? `${logical}[${phys}]` : logical;
 }
 
@@ -2448,7 +2462,7 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
     const rows = dbOp.dataset.map(d => [
       String(d.no || ''),
       withPhysical(d.logical_table, 'table', maps),
-      withPhysical(d.logical_column, 'column', maps)
+      withPhysical(d.logical_column, 'column', maps, d.logical_table)
     ]);
     // v48: dbOp.dataset の「No」は db_operation カテゴリの header_self（データセット定義表）
     blocks.push(buildTable([getIdHeaderLabel('db_operation', 'self'), 'テーブル（論理[物理]）', '列（論理[物理]）'], rows, [1, 4, 5]));
@@ -2468,7 +2482,7 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
   if (dbOp.where && dbOp.where.length > 0) {
     const rows = dbOp.where.map(w => [
       w.and_or || '', withPhysical(w.logical_table, 'table', maps),
-      withPhysical(w.logical_column, 'column', maps),
+      withPhysical(w.logical_column, 'column', maps, w.logical_table),
       w.operator || '', w.param_no || '', w.param_name || ''
     ]);
     blocks.push(new Paragraph({

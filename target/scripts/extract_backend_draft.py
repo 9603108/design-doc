@@ -462,7 +462,8 @@ def _ddl(root):
 
 def _ui_specs(paths):
     """TSX の直下の定数配列(const X = [ {label: "..", kin: "列", ...}, ... ])の要素を (label, [他の文字列の値]) で返す。
-    値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。"""
+    値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。
+    要素に csv(CSV 用の見出し)があれば label の代わりにそれを名前にする(呼出元は main と selftest。結果は _candidates が読む)。"""
     out = []
     for p in paths:
         if p.suffix not in (".tsx", ".jsx") or not p.is_file():
@@ -474,9 +475,11 @@ def _ui_specs(paths):
                 if t[i] == "{":
                     j = _close(t, i)
                     o = t[i:j]
-                    lm = re.search(r"\blabel\s*:\s*['\"]([^'\"]+)['\"]", o)
+                    # csv: (CSV 用の見出し)があれば label より優先する。画面の label は「小計」「合計」のように重なるが、
+                    # csv は「小計1(値引前)」のように一意で意味まで持つ(PosReport.tsx の行定義)。_candidates の ui_label になる
+                    lm = re.search(r"\bcsv\s*:\s*['\"]([^'\"]+)['\"]", o) or re.search(r"\blabel\s*:\s*['\"]([^'\"]+)['\"]", o)
                     if lm:
-                        out.append((lm.group(1), [v for k, v in re.findall(r"\b(\w+)\s*:\s*['\"]([^'\"]+)['\"]", o) if k != "label"]))
+                        out.append((lm.group(1), [v for k, v in re.findall(r"\b(\w+)\s*:\s*['\"]([^'\"]+)['\"]", o) if k not in ("label", "csv")]))
                     i = j
                 i += 1
     return out
@@ -614,7 +617,13 @@ def _columns(sql, ddl, unresolved, action):
             tbl, col = real(refs[0][0]), refs[0][1] if len(refs) == 1 else ""
         else:
             tbl, col = main, ""
-        cols.append({"alias": am.group(1) if am else col, "expression": expr, "table": "" if tbl == "X" else tbl, "column": col})
+        # 式の列は別名を物理列にする(式 min(kai_date) AS first_date の元列 kai_date を物理列にすると、別名の行が同じ物理列に曖昧に寄る)。
+        # 式でない t.col は元の列名。H2 の dataset・logical_names はこの physical_column をそのまま使う(verify_partials.check_h2_columns が照合)
+        alias_ = am.group(1) if am else col
+        is_expr = not re.fullmatch(r"(?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*", expr)
+        phys = (alias_ if is_expr or not col else col) or expr
+        cols.append({"alias": alias_, "expression": expr, "table": "" if tbl == "X" else tbl, "column": col,
+                     "physical_column": phys, "is_expression": is_expr})
     return frm, cols
 
 
@@ -846,6 +855,14 @@ def selftest():
                       {"alias": "h", "expression": "CASE WHEN t.a THEN 1 END", "table": "real_tbl", "column": "a"}],
                      {"ddl": {"real_tbl": {"kai": "会計日"}}, "csv": {"zz": "店舗コード"}})
     assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("最初の会計日", "expr"), ("店舗コード", "csv_header"), ("", "")], cs
+    # csv: があれば label より優先する(同じ label「小計」が重なっても列名の数字を付けず、csv の見出しのまま)
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "W.tsx").write_text('const R = [\n  { label: "小計", csv: "小計1(値引前)", kin: "s_1" },\n'
+                                       '  { label: "小計", csv: "小計5(現金計)", kin: "s_5" },\n  { label: "総売上", kin: "u" },\n];\n', encoding="utf-8")
+        ui = _ui_specs([Path(d) / "W.tsx"])
+    assert ui == [("小計1(値引前)", ["s_1"]), ("小計5(現金計)", ["s_5"]), ("総売上", ["u"])], ui
+    cs = _candidates([{"alias": a, "expression": a, "table": "", "column": a} for a in ("s_1", "s_5", "u")], {"ui": ui})
+    assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("小計1(値引前)", "ui_label"), ("小計5(現金計)", "ui_label"), ("総売上", "ui_label")], cs
     print("[selftest OK] extract_backend_draft")
     return 0
 
