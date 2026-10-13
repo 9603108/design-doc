@@ -19,10 +19,13 @@ extract_backend_draft.py の下書きに、SQL の集計(SUM/COUNT/MIN/MAX/AVG/a
   - 呼出元: extract_backend_draft.selftest()(形の検査)
   - B3: response_fields(ts_paths) は api.ts の型から apis[action].response_fields(path・ts_base・nullable・ts_src)を作る。
     呼出元は extract_backend_draft.extract()。照合は verify_vs_source.check_types
-  - 呼出先: merge_features() は同じ extract() が API 単位の重ね合わせに使う。ほかに呼出先は無い(標準ライブラリの re のみ)
+  - F2: boundaries(errors, clo, entry) は apis[action].boundaries(入力検査の境界値・暦に無い日付を通すか・大小比較と期間上限が無いこと)、
+    common_errors(mods, tables) は下書き最上位の common_errors(入口の except 節)。enclosing_if は _errors が raise の拒否条件を取るのに使う
+  - 呼出先: merge_features() は同じ extract() が API 単位の重ね合わせに使う。ほかに呼出先は無い(標準ライブラリの re・ast のみ)
 
 ponytail: 括弧は位置で閉じを探すだけ。文字列の中の括弧は _mask で消してある前提。HAVING と ORDER BY の中の集計は見ない。
 """
+import ast
 import re
 from pathlib import Path
 
@@ -209,6 +212,112 @@ def response_fields(ts_paths):
                     pre = f["path"] + ("[]" if im.group(2) else "")
                     fields += _fields(texts[ip], ip, mem, pre, lambda n, k=pre + ".": k + n)
             out[am.group(1)] = fields
+    return out
+
+
+def enclosing_if(fn, node):
+    """fn の中で node(raise)を body に含む最も内側の if。無ければ None。呼出元: extract_backend_draft._errors(F2)。"""
+    best = None
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and any(node is x for s in n.body for x in ast.walk(s)):
+            if best is None or n.lineno >= best.lineno:
+                best = n
+    return best
+
+
+def _regex_consts(mods):
+    """モジュールの `NAME = re.compile("…")` を {NAME: パターン文字列} にする(literal_eval では取れないため別に拾う)。"""
+    out = {}
+    for m in mods:
+        for n in m.tree.body:
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                    and isinstance(n.value, ast.Call) and ast.unparse(n.value.func).endswith("compile")
+                    and n.value.args and isinstance(n.value.args[0], ast.Constant) and isinstance(n.value.args[0].value, str)):
+                out[n.targets[0].id] = n.value.args[0].value
+    return out
+
+
+def boundaries(errors, clo, entry):
+    """入力検査の境界値を、ソースで確かめた事実として返す(案 F2)。
+
+    呼出元: extract_backend_draft.extract()(apis[action].boundaries)。errors は _errors → _expand の戻り(check・param を持つ行だけ使う)。
+    - 検査1件: {param, check(拒否する条件)、compare(条件の比較)、message、src}。条件が `NAME.match(…)` で NAME が re.compile の定数なら
+      pattern と、その形式の検査が暦に無い日付(2026-02-30)を通すか(impossible_dates_accepted。暦の関数 strptime/fromisoformat/date が closure に無いときだけ)。
+    - 無いことの事実: 日付の検査が2つ以上あり、それらの値を使う比較が closure に無ければ order(開始と終了の大小)、
+      引き算・timedelta が無ければ span_limit(期間の上限)。present:false で出す。
+    ponytail: param は文面の穴の実引数(無ければ文面の先頭の語)で決める。暦の関数の有無は呼出名の字面で見る。"""
+    regs = _regex_consts([m for m, _ in clo])
+    calendar = any(isinstance(c, ast.Call) and re.search(r"strptime|fromisoformat|(^|\.)date(time)?$", ast.unparse(c.func))
+                   for _, f in clo for c in ast.walk(f))
+    out = []
+    for e in errors:
+        if not e.get("check"):
+            continue
+        b = {"param": e.get("param", ""), "check": e["check"], "message": e.get("text_expanded") or e["message"], "src": e["src"],
+             "compare": [ast.unparse(c) for c in ast.walk(ast.parse(e["check"], mode="eval")) if isinstance(c, ast.Compare)]}
+        rm = re.search(r"\b(\w+)\.(match|fullmatch|search)\(", e["check"])
+        if rm and rm.group(1) in regs:
+            pat, fn = regs[rm.group(1)], getattr(re, rm.group(2))
+            b["pattern"], b["pattern_name"] = pat, rm.group(1)
+            # 暦に無い日付(2月30日)が形式だけの検査を通るか。実際にパターンへ当てて確かめる(通常の日付が通るときだけ判定する)
+            if fn(pat, "2026-01-30") and fn(pat, "2026-02-30") and not calendar:
+                b["impossible_dates_accepted"] = ["2026-02-30"]
+        if b not in out:
+            out.append(b)
+    names = {}
+    for n in ast.walk(entry):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Call):
+            for a in n.value.args:
+                if isinstance(a, ast.Constant) and any(b.get("pattern") and b["param"] == a.value for b in out):
+                    names[n.targets[0].id] = a.value
+    if len(names) >= 2:
+        uses = lambda node: {x.id for x in ast.walk(node) if isinstance(x, ast.Name)} & set(names)
+        params = list(dict.fromkeys(names.values()))
+        nodes = [c for _, f in clo for c in ast.walk(f)]
+        if not any(isinstance(c, ast.Compare) and len(uses(c)) >= 2 for c in nodes):
+            out.append({"param": ",".join(params), "present": False, "check": "order",
+                        "fact": f"{' と '.join(params)} の大小を比べる式がソースに無い"})
+        if not any(uses(c) and ((isinstance(c, ast.BinOp) and isinstance(c.op, ast.Sub))
+                                or (isinstance(c, ast.Call) and re.search(r"timedelta|relativedelta", ast.unparse(c.func)))) for c in nodes):
+            out.append({"param": ",".join(params), "present": False, "check": "span_limit",
+                        "fact": "期間の長さの上限を決める式(引き算・timedelta)がソースに無い"})
+    return out
+
+
+def _handler_fact(mod, h):
+    """except 節1つの事実: 例外・呼ぶ補助関数(via)・_err の応答(code・status・message)・節内の代入(status などの式)。"""
+    assigns = {n.targets[0].id: ast.unparse(n.value) for n in ast.walk(h)
+               if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}
+    errs, via = [], []
+    for c in ast.walk(h):
+        if not isinstance(c, ast.Call):
+            continue
+        name = ast.unparse(c.func)
+        if name == "_err" and len(c.args) >= 2:
+            st = c.args[2] if len(c.args) > 2 else next((k.value for k in c.keywords if k.arg == "status"), None)
+            errs.append({"code": c.args[0].value if isinstance(c.args[0], ast.Constant) else assigns.get(ast.unparse(c.args[0]), ast.unparse(c.args[0])),
+                         "status_code": (st.value if isinstance(st, ast.Constant) else assigns.get(st.id, ast.unparse(st)) if isinstance(st, ast.Name)
+                                         else ast.unparse(st) if st is not None else ""),
+                         "message": ast.unparse(c.args[1])})
+        elif name in mod.funcs and name not in via:
+            via.append(name)
+    return {"exception": ast.unparse(h.type) if h.type else "(すべて)", "errors": errs, "via": via, "assigns": assigns,
+            "src": [{"file": str(mod.path), "line_start": h.lineno, "line_end": h.end_lineno}]}
+
+
+def common_errors(mods, tables):
+    """ディスパッチ表を引く処理を囲む try の except 節を、全 API 共通のエラーの事実として返す(案 F2)。
+
+    呼出元: extract_backend_draft.extract()(下書きの最上位 common_errors)。意味合い: 形式検査を通った後の DB 例外(暦に無い日付など)が
+    どの except 節でどの status になるかを、S2 の error_patterns・H4 の入力検査が足せるようにする。
+    status が呼出先の関数(via。_busy など)の中で決まるものは空のまま(推測しない)。"""
+    out = []
+    for mod in mods:
+        for f in mod.funcs.values():
+            if not any(isinstance(n, ast.Name) and n.id in tables for n in ast.walk(f)):
+                continue
+            # 入口(表を引く関数)の最上位の try だけ。入れ子の try(個別の処理の中)は共通ではない
+            out += [_handler_fact(mod, h) for t in f.body if isinstance(t, ast.Try) for h in t.handlers]
     return out
 
 

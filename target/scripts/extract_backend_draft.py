@@ -45,6 +45,8 @@ from pathlib import Path
 
 # 集計・ウィンドウ関数の下書き(C4)。同じフォルダの _backend_facts.py を読む(実行時の sys.path は scripts/)
 from _backend_facts import features as _features, merge_features as _merge_features, response_fields as _response_fields
+# 境界値・共通エラーの事実(F2)
+from _backend_facts import boundaries as _boundaries, common_errors as _common_errors, enclosing_if as _enclosing_if
 
 # FROM / JOIN の直後の別名として読んではいけない語
 _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON", "GROUP", "ORDER", "LIMIT",
@@ -418,6 +420,8 @@ def _expand(errs, fn, clo):
         holes = re.findall(r"\{([^{}]+)\}", e["message"])
         if not holes:
             e["text_expanded"] = e["message"]
+            first = e["message"].split(" ")[0]
+            e["param"] = first if first.isascii() and first.isidentifier() else ""  # F2: 文面の先頭の語(例 group)
             out.append(e)
             continue
         texts = []
@@ -429,11 +433,12 @@ def _expand(errs, fn, clo):
                 text = e["message"]
                 for h, v in zip(holes, vals):
                     text = text.replace("{" + h + "}", str(v.value))
-                if text not in texts:
-                    texts.append(text)
+                if text not in [x[0] for x in texts]:
+                    # F2: 文面が穴で始まるとき、その穴の実引数が検査の対象(param)
+                    texts.append((text, str(vals[0].value) if e["message"].startswith("{" + holes[0] + "}") else ""))
         # 取れた展開ごとに別の行にする。1件も取れなければ従来どおり空の1件
-        for t in texts or [""]:
-            out.append({**e, "text_expanded": t, "src": list(e.get("src") or [])})
+        for t, prm in texts or [("", "")]:
+            out.append({**e, "text_expanded": t, "param": prm, "src": list(e.get("src") or [])})
     return out
 
 
@@ -800,7 +805,12 @@ def _errors(fn, env, mod):
             continue
         text = _render(msg, env, False) if msg is not None else None
         if text is not None:
-            out.append({"condition": "", "status_code": status, "message": text, "src": [_src(mod, n)]})
+            e = {"condition": "", "status_code": status, "message": text, "src": [_src(mod, n)]}
+            # F2: raise を囲む if の条件(拒否する条件)。boundaries の材料。囲む if が無ければ付けない
+            ifn = _enclosing_if(fn, n) if isinstance(n, ast.Raise) else None
+            if ifn is not None:
+                e["check"] = ast.unparse(ifn.test)
+            out.append(e)
     return out
 
 
@@ -884,7 +894,7 @@ def extract(files, hints=None):
                         c["no"] = no
                 apis[action] = {"dataset": dataset, "src": [_src(tm, fn)],
                                 "response_items": [{"key": key, "src": s} for key, s in keys.items()],
-                                "error_patterns": errors, **clauses,
+                                "error_patterns": errors, "boundaries": _boundaries(errors, clo, fn), **clauses,
                                 "features": _merge_features([o["features"] for o in ops]),
                                 "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "src": o["src"]} for o in ops]}
     # B3: 応答項目の型(api.ts)。action ごとに response_fields を足す(型が取れない API は空)
@@ -895,7 +905,8 @@ def extract(files, hints=None):
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
         e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
-    return {"apis": apis, "unresolved": unresolved, "auth": auth}
+    return {"apis": apis, "unresolved": unresolved, "auth": auth,
+            "common_errors": _common_errors([x for x in mods.values() if x is not None], tables)}
 
 
 def selftest():
@@ -991,6 +1002,20 @@ def selftest():
     assert ui == [("小計1(値引前)", ["s_1"]), ("小計5(現金計)", ["s_5"]), ("総売上", ["u"])], ui
     cs = _candidates([{"alias": a, "expression": a, "table": "", "column": a} for a in ("s_1", "s_5", "u")], {"ui": ui})
     assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("小計1(値引前)", "ui_label"), ("小計5(現金計)", "ui_label"), ("総売上", "ui_label")], cs
+    # F2: 日付の形式検査(from・to)の boundaries と、暦に無い日付を通すこと・大小比較が無いこと・共通エラー(except 節)
+    src = ('import re\n_D = re.compile(r"^\\d{4}-\\d{2}-\\d{2}$")\nclass ValidationError(Exception):\n    pass\n'
+           'def _req(p, k):\n    v = p.get(k)\n    if not isinstance(v, str) or not _D.match(v):\n        raise ValidationError(f"{k} は形式が違う")\n    return v\n'
+           'def act(p):\n    a = _req(p, "from")\n    b = _req(p, "to")\n    return {"x": 1}\n'
+           'T = {"act": act}\n'
+           'def dispatch(body):\n    fn = T[body["a"]]\n    try:\n        return fn(body)\n    except ValidationError as e:\n        return _err("bad", str(e), status=400)\n'
+           '    except Exception as e:\n        return _err("ng", "x", status=500)\n')
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "q.py").write_text(src, encoding="utf-8")
+        r2 = extract([Path(d) / "q.py"])
+    bs = r2["apis"]["act"]["boundaries"]
+    assert [(b["param"], b.get("impossible_dates_accepted")) for b in bs if b.get("pattern")] == [("from", ["2026-02-30"]), ("to", ["2026-02-30"])], bs
+    assert [b["check"] for b in bs if b.get("present") is False] == ["order", "span_limit"], bs
+    assert [(c["exception"], [e["status_code"] for e in c["errors"]]) for c in r2["common_errors"]] == [("ValidationError", [400]), ("Exception", [500])], r2["common_errors"]
     print("[selftest OK] extract_backend_draft")
     return 0
 
