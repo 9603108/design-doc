@@ -626,7 +626,11 @@ def main(argv=None):
     # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
     draft.update(_react_facts.csv_exports(links, sources))
     # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
-    plan = _react_facts.fetch_plan(sources, pcfg.get("api_call_functions", []))
+    # 不具合の修正: api_call_functions は共通ラッパー(call)だけで、画面の useEffect が呼ぶ fetchXxx を含まない。
+    #   画面が使う API 関数は excerpt(api.ts から抜いた断片)の定義名なので、その名前も渡す。
+    api_names = list(pcfg.get("api_call_functions", [])) + re.findall(
+        r"^(?:export\s+)?(?:async\s+)?(?:function\s+|const\s+)(\w+)", excerpt, re.M)
+    plan = _react_facts.fetch_plan(sources, api_names)
     if plan:
         draft["events"][0]["fetch_plan"] = plan
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
