@@ -192,9 +192,10 @@ def _strings(node):
 
 def check_h2_columns(h2, draft):
     """H2 が下書きの列を省いていないか(2026-10-13 混成版で 63 列中 5 列しか書かれなかった)。
-    action ごとに、H2 の dataset の行数が下書きの db_operations[].columns の数より少なければ ERROR。
-    logical_names の行数が下書きの列(表と元の列、元の列が無ければ別名)の種類の数より少なくても ERROR。
-    欠けた列は、H2 の physical_column に別名も元の列も無い列を別名で挙げる。呼出元: check_unit_extras。"""
+    件数ではなく名前の集合で比べる。下書きの各列の出力名は、別名があれば別名、無ければ元の列名。
+    H2 の dataset(action ごと)と logical_names に、その出力名の physical_column が無ければ ERROR。
+    別名の列を元の列名に戻してまとめた場合も、別名が H2 に無いので止まる(run4 で first_date・last_date が欠けた)。
+    呼出元: check_unit_extras。"""
     problems, keys = [], {}
     ops = [o for o in (h2.get("db_operations") or []) if isinstance(o, dict)]
     for action, api in (draft.get("apis") or {}).items():
@@ -202,21 +203,23 @@ def check_h2_columns(h2, draft):
         if not cols:
             continue
         for c in cols:
-            keys.setdefault((c.get("table"), c.get("column") or c.get("alias")), c)
+            keys.setdefault((c.get("table"), c.get("alias") or c.get("column") or c.get("expression")), c)
         mine = [o for o in ops if (o.get("api_endpoint") or {}).get("action") == action]
         rows = [r for o in mine for r in o.get("dataset") or [] if isinstance(r, dict)]
-        if len(rows) < len(cols):
-            have = {r.get("physical_column") for r in rows}
-            lack = [c["alias"] or c["expression"] for c in cols if not ({c.get("alias"), c.get("column")} & have)]
+        have = {r.get("physical_column") for r in rows}
+        lack = [c.get("alias") or c.get("column") or c.get("expression") for c in cols
+                if (c.get("alias") or c.get("column") or c.get("expression")) not in have]
+        if lack:
             where = ",".join(o.get("id") or "?" for o in mine) or f"action={action} の行が無い"
-            problems.append(f"[列の省略] db_operations[{where}].dataset: 下書きの columns {len(cols)} 列に対し {len(rows)} 行。"
-                            f"欠けた列: {', '.join(lack) or '(列名では特定できない。行数が足りない)'} → 差し戻し先 H2")
+            problems.append(f"[列の省略] db_operations[{where}].dataset: 下書きの列 {len(cols)} 列のうち H2 に無い: "
+                            f"{', '.join(lack)} → 差し戻し先 H2")
     names = [n for n in h2.get("logical_names") or [] if isinstance(n, dict)]
-    if keys and len(names) < len(keys):
+    if keys:
         have = {n.get("physical_column") for n in names}
-        lack = [c["alias"] or c["expression"] for c in keys.values() if not ({c.get("alias"), c.get("column")} & have)]
-        problems.append(f"[列の省略] logical_names: 下書きの列 {len(keys)} 種に対し {len(names)} 行。"
-                        f"欠けた列: {', '.join(lack) or '(列名では特定できない。行数が足りない)'} → 差し戻し先 H2")
+        lack = [name for _table, name in keys if name not in have]
+        if lack:
+            problems.append(f"[列の省略] logical_names: 下書きの列 {len(keys)} 種のうち H2 に無い: "
+                            f"{', '.join(lack)} → 差し戻し先 H2")
     return problems
 
 
@@ -354,10 +357,10 @@ def selftest_units():
         {"alias": "shop_id", "expression": "p.mise_no", "table": "pos", "column": "mise_no"},
         {"alias": "days", "expression": "count(*)", "table": "pos", "column": ""}]}]}}}
     h2 = copy.deepcopy(good["H2"])
-    h2["db_operations"][0]["dataset"] = [{"physical_column": "mise_no"}]
-    h2["logical_names"] = [{"physical_column": "mise_no"}]
+    h2["db_operations"][0]["dataset"] = [{"physical_column": "shop_id"}]
+    h2["logical_names"] = [{"physical_column": "shop_id"}]
     out = check_h2_columns(h2, draft)
-    assert len(out) == 2 and all("欠けた列: days" in p and p.endswith("差し戻し先 H2") for p in out), out
+    assert len(out) == 2 and all("H2 に無い: days" in p and p.endswith("差し戻し先 H2") for p in out), out
     h2["db_operations"][0]["dataset"].append({"physical_column": "days"})
     h2["logical_names"].append({"physical_column": "days"})
     assert check_h2_columns(h2, draft) == [], check_h2_columns(h2, draft)

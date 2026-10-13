@@ -224,6 +224,8 @@ def _resolve(span, ctx, seen, acc):
         if name in ctx["api"]:
             if re.search(r"\bfunction\s*$", text[max(0, i - 20):i]):
                 continue  # 呼出関数そのものの定義
+            # 目的: 第1引数が文字列リテラルでも無くても、API 関数を呼べば取得が起きる。接続: links の "fetch" → _continuous_ops()
+            acc["fetch"] = True
             lm = _API_LIT.match(text, i + len(name), e)
             if lm:
                 if lm.group(2) not in acc["actions"]:
@@ -308,7 +310,7 @@ def analyze_sources(source_files, api_call_functions):
         for m in _EVENT_ATTR.finditer(t):
             bo = m.end() - 1
             be = _close(t, bo)
-            acc = {"actions": [], "states": set(), "hit": False, "texts": []}
+            acc = {"actions": [], "states": set(), "hit": False, "texts": [], "fetch": False}
             _resolve((p, t, bo + 1, be), ctx, set(), acc)
             expr = " ".join(t[bo + 1:be].split())[:80]
             if not acc["hit"] and not acc["actions"]:
@@ -335,6 +337,8 @@ def analyze_sources(source_files, api_call_functions):
                 # 目的: 開きタグの文字(disabled の有無)を連続操作の判定に渡す。接続: _continuous_ops()
                 "tag": t[(tags[-1].start() if tags else m.start()):max(be, t.find(">", be))],
                 "empty": [(x, branches[x]) for x in sorted(acc["states"]) if x in branches],
+                # 目的: 取得を起こすかどうかを連続操作の判定に渡す(文字列リテラルの action が取れなくても取得は起きる)。接続: _continuous_ops()
+                "fetch": acc["fetch"],
             })
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
     # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
@@ -488,21 +492,30 @@ def _display_rows(sources):
 
 
 def _continuous_ops(links):
-    """onClick の button ごとに、読込中の無効化と取消処理の有無を判定する。
+    """データ取得を起こす操作(イベント属性・要素を問わず)ごとに、読込中の無効化・判定・取消処理の有無を判定する。
 
-    呼出元: main()。意味合い: 連続操作(読込中にもう一度押せるか、押したら前の要求を止めるか)を機械で出す。
+    呼出元: main()。意味合い: 連続操作(読込中にもう一度起こせるか、起こしたら前の要求を止めるか)を機械で出す。
+    取得を起こす操作には onChange 等の state 変更も含む(useEffect の依存を経由して actions が付いたもの)。
     接続: links の tag(開きタグ)と texts(辿った本体)を見る。判定は文字の一致だけ(推測で足さない)。
+    防止の仕組みが1つも無いときは prevention を「防止なし」にし、fact にもその旨を書く。
     """
     ops = []
     for link in links:
-        if link["attr"] != "onClick" or link["element"] != "button":
+        # 目的: mount(初期表示)は利用者の操作ではないので外す。接続: actions が空の属性は取得を起こさない
+        if link["attr"] == "mount" or not (link["actions"] or link.get("fetch")):
             continue
         label = link.get("ui_label") or link["handler"]
+        body = "\n".join(link["texts"])
         disabled = bool(re.search(r"disabled=\{[^}]*(?:loading|busy|pending|fetch)", link.get("tag", ""), re.I))
-        cancel = bool(re.search(r"AbortController|\.abort\(", "\n".join(link["texts"])))
-        fact = (f"ボタン「{label}」は読込中に{'無効化される' if disabled else '無効化されない'}。"
-                f"取消処理は{'ある' if cancel else '無い'}。")
-        ops.append({"button": label, "disabled_while_loading": disabled, "cancel": cancel, "fact": fact})
+        guard = bool(re.search(r"\bif\s*\(\s*!?\s*\w*(?:loading|busy|pending|fetching)\w*\s*\)", body, re.I))
+        cancel = bool(re.search(r"AbortController|\.abort\(", body))
+        prevented = disabled or guard or cancel
+        fact = (f"操作「{label}」({link['element']} の {link['attr']})は読込中に"
+                f"{'無効化される' if disabled else '無効化されない'}。取消処理は{'ある' if cancel else '無い'}。")
+        if not prevented:
+            fact += "読込中の再操作の防止は防止なし(無効化・loading の判定・中断が無い)。"
+        ops.append({"button": label, "disabled_while_loading": disabled, "guard": guard, "cancel": cancel,
+                    "prevention": "あり" if prevented else "防止なし", "fact": fact})
     return ops
 
 

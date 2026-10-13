@@ -1318,6 +1318,36 @@ def check_intermediate_strict(merged: dict) -> list:
     return issues
 
 
+# 2026-10-13 新設: メッセージの種別（severity）と ID 接頭辞（MSE/MSW/MSI）の食い違いと、
+# 情報なのに警告の文面がある疑いを検出する（種別の誤りを業務担当者に渡さないため）。
+# 意味合い: 接頭辞は種別を表す。error→MSE / warning→MSW / info→MSI。MS1 のような新体系 ID は接頭辞で判定できないので対象外。
+# 接続情報: 入力 = merged['messages'] の message_id と severity（apply_id_scheme.py は ID を採番し直すが severity には触らない）
+#           / 出力 = [(level, message), ...] / 呼出元 = main()
+MESSAGE_SEVERITY_PREFIX = {"error": "MSE", "warning": "MSW", "info": "MSI"}
+INFO_ALARM_WORDS_RE = re.compile(r"警告|注意|疑い|欠損|確認してください|失敗")
+
+
+def check_message_severity_prefix(merged: dict) -> list:
+    """メッセージの種別と ID 接頭辞の整合を検査する。
+
+    判定ルール:
+      (1) severity と ID の接頭辞（MSE/MSW/MSI）が食い違う → ERROR
+      (2) severity が info なのに文面に警告語（警告・注意・疑い・欠損・確認してください・失敗）がある → WARN（種別の誤りの疑い）
+    接続情報: 入力 = merged['messages'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    for m in merged.get("messages", []) or []:
+        mid = str(m.get("message_id") or m.get("id") or "?")
+        sev = str(m.get("severity") or "").lower()
+        text = str(m.get("message") or "")
+        prefix = next((p for p in MESSAGE_SEVERITY_PREFIX.values() if mid.startswith(p)), None)
+        if prefix is not None and MESSAGE_SEVERITY_PREFIX.get(sev) != prefix:
+            issues.append(("ERROR", f"messages[{mid}]: 種別 severity={sev or '(空)'} と ID の接頭辞 {prefix} が食い違う"))
+        if sev == "info" and INFO_ALARM_WORDS_RE.search(text):
+            issues.append(("WARN", f"messages[{mid}]: 種別が情報だが文面に警告語がある（種別の誤りの疑い）: '{text[:80]}'"))
+    return issues
+
+
 def main():
     # 目的: 引数で指定された機能名の中間 JSON を検証する。引数なしなら環境変数 FEATURE_NAME、
     #       どちらも無ければ _config_loader 側が「feature_name 未指定」で止める（既定の機能名は持たない）。
@@ -1385,6 +1415,8 @@ def main():
     all_issues.extend(check_table_name_placeholders(merged))
     all_issues.extend(check_file_descriptions(merged))
     all_issues.extend(check_message_code_format(merged))
+    # 2026-10-13: メッセージの種別（severity）と ID 接頭辞の食い違い・情報なのに警告文言
+    all_issues.extend(check_message_severity_prefix(merged))
 
     # 2026-10-13: 中身の穴（名前だけの共通ロジック・物理名残存・未展開の穴・メッセージ ID・DB 操作の英語キー空欄）
     all_issues.extend(check_intermediate_strict(merged))

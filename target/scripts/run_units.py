@@ -106,6 +106,19 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u}` を流し、"
         f"行末が「→ 差し戻し先 {u}」の問題を直してから、3行以内で報告する(書いた行数・残った問題・判断できなかった所)。",
     ]
+    # WHY: S1 と S2 は並行に書くため、S2 が画面項目名を推測して S1 と食い違い差し戻しになる(run3 で52件)。
+    # S2 にだけ、下書き(extract_react_draft の出力)にある画面の文言を渡し、screen_item_name をそれに揃えさせる。
+    # 出所: events[].ui_label(操作の表示名)と display_rows[].labels(表示行の名前)。下書きが無ければ何も足さない。
+    if u == "S2":
+        draft = INTER / f"{feat}_react_draft.json"
+        if draft.exists():
+            d = json.loads(draft.read_text(encoding="utf-8"))
+            labels = [e["ui_label"] for e in d.get("events", []) if e.get("ui_label")]
+            labels += [x for r in d.get("display_rows", []) for x in r.get("labels", [])]
+            labels = list(dict.fromkeys(labels))
+            if labels:
+                lines += ["", "【画面項目名の一覧(下書きの画面の文言。screen_item_name はこの名前をそのまま使う。推測で作らない)】"]
+                lines += [f"- {x}" for x in labels]
     if sendbacks:
         lines += [
             "",

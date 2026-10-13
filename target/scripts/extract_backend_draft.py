@@ -16,7 +16,7 @@ ACTIONS = {"action名": module.func, ...} のような「文字列 → 関数参
     columns は最上位 SELECT 句の全列の骨組み {no, alias, expression, table, column, logical_name, logical_name_source}。
     SELECT * / t.* は DDL の列で展開する。from は FROM の表 {table, name, alias}
     logical_name は機械的に取れた論理名の候補。出所 logical_name_source は取れた順に
-    comment(DDL のコメント)/ ui_label(画面の定数配列の label)/ api_type(TS の型のコメント)/ guess(列名からの推定)。取れなければ空
+    comment(DDL のコメント)/ csv_header(backend の列名と日本語の見出しの対応)/ ui_label(画面の定数配列の label)/ expr(式の別名。元列の論理名から SUM・COUNT・MIN・MAX の種類で組む)/ api_type(TS の型のコメント)/ guess(列名からの推定)。取れなければ空
 
 【意味合い】
 Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いていたため、実行ごとに欠落とぶれが出た。
@@ -520,7 +520,8 @@ def _type_note(c):
 
 
 def _candidates(cols, hints):
-    """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / ui_label / api_type / guess。"""
+    """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / csv_header / ui_label / expr / api_type / guess。
+    expr は式の別名(SUM・COUNT・MIN・MAX の1列の式)の元列の論理名から組む。CASE・四則演算は組まない。"""
     ddl, specs, blocks = hints.get("ddl") or {}, hints.get("ui") or [], hints.get("types") or []
     aliases = {c["alias"] for c in cols if c["alias"]}
     hits = [(lb, [v for v in vals if v in aliases]) for lb, vals in specs]
@@ -544,15 +545,33 @@ def _candidates(cols, hints):
         for f, c in best[1].items():
             if f in aliases and _type_note(c):
                 notes[f] = _type_note(c)
+    csv = hints.get("csv") or {}
+    # 1回目: 元列の論理名になるもの(comment・csv_header・ui_label・api_type)を列ごとに出す。式の別名はこれを材料に組む
+    rows = []
     for c in cols:
-        com = (ddl.get(c["table"]) or {})
-        for name, src in ((com.get(c["column"]) or com.get(c["alias"]), "comment"), (ui.get(c["alias"]), "ui_label"),
-                          (notes.get(c["alias"]), "api_type"), (_guess(c["alias"]) or _guess(c["column"]), "guess")):
-            if name:
-                c["logical_name"], c["logical_name_source"] = name, src
-                break
-        else:
-            c["logical_name"], c["logical_name_source"] = "", ""
+        com = ddl.get(c["table"]) or {}
+        plain = re.fullmatch(r"[\w.]+", c["expression"]) is not None  # 式の別名は元列のコメントを借りず、別名そのもので引く
+        keys = (c["column"], c["alias"]) if plain else (c["alias"],)
+        rows.append([(next((com[k] for k in keys if com.get(k)), ""), "comment"),
+                     (next((csv[k] for k in keys if csv.get(k)), ""), "csv_header"),
+                     (ui.get(c["alias"]), "ui_label"),
+                     (notes.get(c["alias"]), "api_type")])
+    known = {}  # 元列の論理名の材料。別名ごとに取れた最初の名前(guess は材料にしない)
+    for c, cs in zip(cols, rows):
+        got = next((n for n, _ in cs if n), "")
+        if got:
+            known.setdefault(c["alias"], got)
+    # 2回目: expr を ui_label の後・api_type の前に入れて、取れた順に決める
+    for c, cs in zip(cols, rows):
+        ex = ""
+        em = re.fullmatch(r"(SUM|COUNT|MIN|MAX)\s*\(\s*[\w.]+\s*\)(?:::\w+)?", c["expression"], re.IGNORECASE)  # CASE・四則演算は種類が無いので組まない
+        # 元列の名前の材料が comment/csv/ui/型に無いときは、列名の推定(guess)で組む(例: min(kai_date) → 最初の会計日)。guess のままより expr の出所のほうが式の意味が残る
+        src = (ddl.get(c["table"]) or {}).get(c["column"]) or known.get(c["column"]) or _guess(c["column"])
+        if em and c["column"] and src:
+            ex = {"SUM": src + "の合計", "COUNT": src + "の件数", "MIN": "最初の" + src, "MAX": "最後の" + src}[em.group(1).upper()]
+        order = cs[:3] + [(ex, "expr")] + cs[3:] + [(_guess(c["alias"]) or _guess(c["column"]), "guess")]
+        name, how = next(((n, s) for n, s in order if n), ("", ""))
+        c["logical_name"], c["logical_name_source"] = name, how
     return cols
 
 
@@ -688,6 +707,20 @@ def extract(files, hints=None):
     hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。"""
     hints = hints or {}
     mods = {p.stem: Module(p) for p in files}
+    # csv_header: backend の定数の辞書、または (列名, 日本語の見出し) の組の並びから、列名→見出しを取る。位置だけで対応する配列は推測しない
+    csv = {}
+    for mod in mods.values():
+        for val in mod.consts.values():
+            if isinstance(val, dict):
+                pairs = list(val.items())
+            elif isinstance(val, (list, tuple)):
+                pairs = [(x[0], x[1]) for x in val if isinstance(x, (list, tuple)) and len(x) == 2]
+            else:
+                continue
+            for k, v in pairs:
+                if isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[A-Za-z_]\w*", k) and not v.isascii():
+                    csv.setdefault(k, v)
+    hints = {**hints, "csv": csv}
     apis, unresolved, tables = {}, [], set()
     for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
         for n in mod.tree.body:
@@ -785,7 +818,7 @@ def selftest():
     assert op["id"] == "db_op_get_x" and op["from"] == {"table": "real_tbl", "name": "d", "alias": "t"}, op["from"]
     got = [(c["no"], c["alias"], c["table"], c["column"], c["logical_name"], c["logical_name_source"]) for c in op["columns"]]
     assert got == [(1, "x_id", "real_tbl", "id", "識別番号", "comment"), (2, "a", "real_tbl", "a", "金額A", "comment"),
-                   (3, "b", "real_tbl", "b", "合計B", "api_type"), (4, "name", "shops", "name", "名前", "ui_label")], got
+                   (3, "b", "real_tbl", "b", "合計Bの合計", "expr"), (4, "name", "shops", "name", "名前", "ui_label")], got
     assert op["columns"][1]["expression"] == "SUM(t.a)", op["columns"][1]
     assert [c["alias"] for c in _columns("SELECT r.* FROM real_tbl r", hints["ddl"], [], "t")[1]] == ["id", "a", "b"], "SELECT * を DDL で展開しない"
     assert _guess("shop_id") == "店舗ID" and _guess("sou_uriage") == "", "列名からの推定"
@@ -807,6 +840,12 @@ def selftest():
     assert any(e["text_expanded"] == "日付 は必須" and e["message"] == "{p} は必須" for e in r["apis"]["get_y"]["error_patterns"]), r["apis"]["get_y"]["error_patterns"]
     ids = [e["id"] for a in r["apis"].values() for e in a["error_patterns"]] + [e["id"] for a in r["auth"] for e in a["error_patterns"]]
     assert ids and len(ids) == len(set(ids)) and all(i.startswith("MSE") for i in ids), ids
+    # expr は元列の論理名から式の種類で組む(MIN は最初の・SUM は合計)。csv_header は見出しの辞書から取る。式の別名はコメントを借りない
+    cs = _candidates([{"alias": "f", "expression": "MIN(t.kai)", "table": "real_tbl", "column": "kai", "logical_name": ""},
+                      {"alias": "g", "expression": "t.zz", "table": "real_tbl", "column": "zz"},
+                      {"alias": "h", "expression": "CASE WHEN t.a THEN 1 END", "table": "real_tbl", "column": "a"}],
+                     {"ddl": {"real_tbl": {"kai": "会計日"}}, "csv": {"zz": "店舗コード"}})
+    assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("最初の会計日", "expr"), ("店舗コード", "csv_header"), ("", "")], cs
     print("[selftest OK] extract_backend_draft")
     return 0
 
