@@ -554,6 +554,51 @@ def _ddl(root):
     return out
 
 
+def _ddl_types(root):
+    """root 配下の *.sql から {表: {列: (型, NOT NULL か)}} を作る(B3)。型は先頭の語を小文字にしたもの(varchar(20) → varchar)。
+    意味合い: index signature の列(api.ts に欄名が無い)の型を、SQL の列の元の定義から確かめる材料にする。
+    呼出元: main と selftest が hints["ddl_types"] に入れ、extract の _sql_type が読む。
+    ponytail: _ddl と同じく1行1列の前提。ALTER ... ADD COLUMN の型は読むが NOT NULL は見ない。"""
+    out = {}
+    if not root or not Path(root).is_dir():
+        return out
+    for d, dirs, names in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in ("node_modules", ".git", "venv", ".venv", "__pycache__")]
+        for n in names:
+            if not n.endswith(".sql"):
+                continue
+            try:
+                t = (Path(d) / n).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for m in _DDL_TABLE.finditer(t):
+                cols = out.setdefault(m.group(1).replace('"', "").split(".")[-1], {})
+                for line in t[m.end():_close(t, m.end() - 1)].splitlines():
+                    cm = re.match(r'\s*"?([A-Za-z_]\w*)"?\s+([A-Za-z]\w*)(.*)', line)
+                    if cm and cm.group(1).upper() not in _DDL_NOT_COL:
+                        cols.setdefault(cm.group(1), (cm.group(2).lower(), bool(re.search(r"\bNOT\s+NULL\b", cm.group(3), re.IGNORECASE))))
+            for m in _DDL_ALTER.finditer(t):
+                cols = out.setdefault(m.group(1).replace('"', "").split(".")[-1], {})
+                for cm in re.finditer(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([A-Za-z_]\w*)"?\s+([A-Za-z]\w*)', m.group(2), re.IGNORECASE):
+                    if cm.group(1).upper() not in _DDL_NOT_COL:
+                        cols.setdefault(cm.group(1), (cm.group(2).lower(), False))
+    return out
+
+
+def _sql_type(c, dt):
+    """SELECT 列 c({expression, table, column})の SQL 上の型の手掛かりを (db_type, db_nullable) で返す(B3)。
+    取れる順に: 式の末尾の ::型(NULL::型 なら null 可)、COUNT(...) は bigint、1列だけの素の式は DDL(dt = _ddl_types)の型と NOT NULL。
+    取れなければ (None, None)(SUM(x) の無印などは推測しない)。呼出元: extract(index signature の列の response_fields)。"""
+    expr = c["expression"]
+    m = re.search(r"::\s*(\w+)\s*$", expr)
+    if m:
+        return m.group(1).lower(), bool(re.match(r"NULL\s*::", expr, re.IGNORECASE))
+    if re.match(r"COUNT\s*\(", expr, re.IGNORECASE):
+        return "bigint", False
+    t = (dt.get(c.get("table")) or {}).get(c.get("column")) if re.fullmatch(r"(?:\w+\.)?\w+", expr) else None
+    return (t[0], not t[1]) if t else (None, None)
+
+
 def _ui_specs(paths):
     """TSX の直下の定数配列(const X = [ {label: "..", kin: "列", ...}, ... ])の要素を (label, [他の文字列の値]) で返す。
     値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。
@@ -901,6 +946,16 @@ def extract(files, hints=None):
     rf = _response_fields(hints.get("ts_files") or [])
     for action, a in apis.items():
         a["response_fields"] = rf.get(action, [])
+        # index signature([col: string]: …)の行は欄名が api.ts に無いので、SQL の列(別名)ごとに型の手掛かり(sql_hint・db_type・db_nullable)つきの欄を足す。
+        # 型が取れない列・api.ts に欄名がある列は足さない。照合は verify_vs_source.check_types(db_type で見る)
+        for idx in [f for f in a["response_fields"] if f.get("index_signature")]:
+            have = {f["path"] for f in a["response_fields"]}
+            for o in a["db_operations"]:
+                for c in o["columns"]:
+                    path, (typ, nul) = idx["path"][:-3] + "." + c["alias"], _sql_type(c, hints.get("ddl_types") or {})
+                    if typ and path not in have:
+                        have.add(path)
+                        a["response_fields"].append({**idx, "path": path, "sql_hint": c["expression"], "db_type": typ, "db_nullable": nul})
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
@@ -937,7 +992,7 @@ def selftest():
                                        "ALTER TABLE real_tbl ADD COLUMN b integer;\nCOMMENT ON COLUMN public.real_tbl.a IS '金額A';\n", encoding="utf-8")
         (Path(d) / "V.tsx").write_text('const ROWS: X[] = [\n  { label: "名前", k: "name" },\n  { label: "対象外", k: "zzz" },\n];\n', encoding="utf-8")
         (Path(d) / "api.ts").write_text("export interface R {\n  x_id: number;\n  /** 合計B（参考値） */\n  b: number;\n  name: string;\n}\n", encoding="utf-8")
-        hints = {"ddl": _ddl(d), "ui": _ui_specs([Path(d) / "V.tsx"]), "types": _type_blocks([Path(d) / "api.ts"]),
+        hints = {"ddl": _ddl(d), "ddl_types": _ddl_types(d), "ui": _ui_specs([Path(d) / "V.tsx"]), "types": _type_blocks([Path(d) / "api.ts"]),
                  "ts_files": [Path(d) / "api.ts"]}
         (Path(d) / "api.ts").write_text("export interface R {\n  x_id: number;\n  /** 合計B */\n  b: number | null;\n  name: string;\n  [col: string]: number | string | null;\n}\n"
                                         "export function g() {\n  return call<{\n    rows: R[];\n    n: number;\n    tags: string[];\n  }>(\"get_x\", {});\n}\n", encoding="utf-8")
@@ -961,6 +1016,12 @@ def selftest():
     assert rf["rows[].b"]["nullable"] is True and rf["rows[].b"]["ts_base"] == "number", rf
     assert rf["rows[].name"]["nullable"] is False and rf["tags"]["ts_base"] == "string[]" and rf["n"]["ts_base"] == "number", rf
     assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
+    # B3 SQL の型: DDL の型と NOT NULL、::型・NULL::型・COUNT の手掛かり、取れない式(無印の SUM)は None
+    dt = hints["ddl_types"]
+    assert dt["real_tbl"]["id"] == ("integer", False) and dt["real_tbl"]["b"] == ("integer", False), dt
+    st = lambda e, t="real_tbl", c="": _sql_type({"expression": e, "table": t, "column": c}, dt)
+    assert st("t.id", c="id") == ("integer", True) and st("SUM(t.a)::bigint") == ("bigint", False) and st("NULL::varchar") == ("varchar", True)
+    assert st("count(*)") == ("bigint", False) and st("SUM(t.a)", c="a") == (None, None), "SQL の型の手掛かり"
     assert "common" not in r["apis"] and set(r["apis"]) == {"get_x", "get_y"}, "補助モジュールを API として数えた"
     ycols = {(x["column"], x["table"]) for x in r["apis"]["get_y"]["dataset"]}
     assert ycols == {("id", "real_tbl")}, ycols
@@ -1053,7 +1114,7 @@ def main(argv=None):
         if s:
             q = Path(os.path.expanduser(os.path.expandvars(s)))
             srcs.append(q if q.is_absolute() else root / q)
-    hints = {"ddl": _ddl(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs),
+    hints = {"ddl": _ddl(root), "ddl_types": _ddl_types(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs),
              "ts_files": [p for p in srcs if p.suffix in (".ts", ".tsx") and p.is_file()]}
     try:
         draft = extract(files, hints)

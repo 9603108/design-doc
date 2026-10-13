@@ -238,7 +238,9 @@ def _cls(t):
     s = re.sub(r"\s*\|\s*(null|undefined)\b", "", str(t or "")).strip().lower()
     if s.endswith("[]") or s.startswith(("array", "配列")):
         return "array"
-    for k, words in (("string", ("string", "date", "文字列", "日付")), ("number", ("number", "int", "numeric", "float", "数値", "整数")),
+    # SQL の型名(bigint・varchar など。db_type)も同じ分類に入れる
+    for k, words in (("string", ("string", "date", "文字列", "日付", "varchar", "text", "char", "timestamp", "time", "uuid")),
+                     ("number", ("number", "int", "bigint", "smallint", "numeric", "decimal", "float", "double", "real", "数値", "整数")),
                      ("boolean", ("boolean", "bool", "真偽")), ("object", ("object", "オブジェクト"))):
         if s.startswith(words):
             return k
@@ -257,11 +259,14 @@ def check_types(api_spec, apis):
             if f is None:
                 continue
             where = f"api_spec[{a.get('action')}].response_items[{r['key']}]"
-            if _cls(r.get("data_type")) and _cls(f["ts_base"]) and _cls(r.get("data_type")) != _cls(f["ts_base"]):
-                problems.append(f"[WARN] [型] {where}: data_type={r.get('data_type')} だが api.ts の型は {f['ts_type']} → 差し戻し先 H3")
+            # index signature の列は api.ts の型が共用体で当てにならないので、SQL の型(db_type)と null 可(db_nullable。不明なら見ない)で見る
+            sql = f.get("index_signature") and f.get("db_type")
+            want, exp = (f["db_type"], f.get("db_nullable")) if sql else (f["ts_base"], f["nullable"])
+            if _cls(r.get("data_type")) and _cls(want) and _cls(r.get("data_type")) != _cls(want):
+                problems.append(f"[WARN] [型] {where}: data_type={r.get('data_type')} だが {'SQL' if sql else 'api.ts'} の型は {want if sql else f['ts_type']} → 差し戻し先 H3")
             got = r["nullable"] if "nullable" in r else "null" in str(r.get("data_type")).lower()
-            if bool(got) != f["nullable"]:
-                problems.append(f"[null可] {where}: nullable={bool(got)} だが api.ts の型は {f['ts_type']}(null 可={f['nullable']}) → 差し戻し先 H3")
+            if exp is not None and bool(got) != exp:
+                problems.append(f"[null可] {where}: nullable={bool(got)} だが {'SQL' if sql else 'api.ts'} の型は {want if sql else f['ts_type']}(null 可={exp}) → 差し戻し先 H3")
     return problems
 
 
@@ -275,6 +280,12 @@ def selftest():
     assert check_types([{"action": "act", "response_items": [{"key": "rows[].reji_no", "data_type": "string | null"}]}], apis) == [], "nullable 無しは data_type の | null で見る"
     got = check_types(spec(("rows[].reji_no", "string", False), ("rows[].days", "string", False), ("x.unknown", "string", True)), apis)
     assert [g.split(" ")[0] for g in got] == ["[null可]", "[WARN]"] and "rows[].reji_no" in got[0], got
+    # B3 SQL の型: index signature の列は db_type(bigint → number)と db_nullable で見る。api.ts の共用体型は見ない
+    ix = {"act": {"response_fields": [{"path": "rows[].s", "ts_type": "number | string | null", "ts_base": "number | string", "nullable": True,
+                                       "index_signature": True, "sql_hint": "SUM(x)::bigint", "db_type": "bigint", "db_nullable": False}]}}
+    assert check_types(spec(("rows[].s", "integer", False)), ix) == []
+    got = check_types(spec(("rows[].s", "string", True)), ix)
+    assert [g.split(" ")[0] for g in got] == ["[WARN]", "[null可]"] and "SQL" in got[0], got
     sp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
     beh = [{"id": "BH01", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)},
            {"id": "BH02", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(305), "control_src": []}]
@@ -357,9 +368,11 @@ def main(argv=None):
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
     cands, jsx, beh, disp_rows = [], [], [], []
-    type_problems = []
+    type_problems, n_sql = [], 0
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
-        type_problems = check_types(data.get("api_spec"), json.loads(p.read_text(encoding="utf-8")).get("apis"))
+        apis = json.loads(p.read_text(encoding="utf-8")).get("apis") or {}
+        type_problems = check_types(data.get("api_spec"), apis)
+        n_sql = sum(1 for a in apis.values() for f in a.get("response_fields") or [] if f.get("db_type"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
         rd = json.loads(p.read_text(encoding="utf-8"))
         cands, jsx, beh = rd.get("calc_candidates") or [], rd.get("jsx_elements") or [], rd.get("behaviors") or []
@@ -378,7 +391,7 @@ def main(argv=None):
     for p in problems + kind_problems + type_problems:
         print(p)
     null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
-    print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件")
+    print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件・SQL の型の手掛かりつきの欄 {n_sql} 件")
     n = len(data.get("calculations") or [])
     print(f"[INFO] 計算式の照合: ソースの式 {len(cands)} 件・calculations {n} 件・WARN {len(calc_problems)} 件")
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
