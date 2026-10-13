@@ -859,6 +859,30 @@ def _errors(fn, env, mod):
     return out
 
 
+_SQLISH = re.compile(r"\b(AND|OR|IS|NOT|NULL|CASE|WHEN|SUM|COUNT|MIN|MAX|BETWEEN)\b|[=<>]|\w\.\w", re.IGNORECASE)
+
+
+def _logic_candidates(mods):
+    """SQL に埋め込まれるモジュール定数(条件・列の並び・グループ表など)を共通ロジックの候補として返す(F4)。
+    意味合い: 業務の規則(例: 取込欠損の条件)が SQL の中にあることを、S1 が runs_on(動作場所)を決める手掛かりとして見えるようにする。
+    呼出元: extract(下書きの最上位 logic_candidates)。{name, kind(sql_condition=文字列 / sql_fragment=列・辞書), text, runs_on, src}。
+    ponytail: 「関数の中で名前が使われる定数で、中身が SQL らしい(AND・IS・= ・t.col など)」ものを拾う。実際に SQL へ入ったかは見ない。"""
+    out = []
+    for mod in mods:
+        for n in mod.tree.body:
+            if not (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)):
+                continue
+            name = n.targets[0].id
+            val = mod.consts.get(name)
+            if val is None or not any(isinstance(x, ast.Name) and x.id == name for f in mod.funcs.values() for x in ast.walk(f)):
+                continue
+            text = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False) if isinstance(val, (list, dict)) else ""
+            if text and _SQLISH.search(text):
+                out.append({"name": name, "kind": "sql_condition" if isinstance(val, str) else "sql_fragment", "text": text,
+                            "runs_on": "データベース", "src": [_src(mod, n)]})
+    return out
+
+
 def extract(files, hints=None):
     """backend ファイル(Path の並び)から {apis, unresolved} を作る。
     hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。"""
@@ -960,7 +984,7 @@ def extract(files, hints=None):
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
         e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
-    return {"apis": apis, "unresolved": unresolved, "auth": auth,
+    return {"apis": apis, "unresolved": unresolved, "auth": auth, "logic_candidates": _logic_candidates([x for x in mods.values() if x is not None]),
             "common_errors": _common_errors([x for x in mods.values() if x is not None], tables)}
 
 
@@ -1016,6 +1040,8 @@ def selftest():
     assert rf["rows[].b"]["nullable"] is True and rf["rows[].b"]["ts_base"] == "number", rf
     assert rf["rows[].name"]["nullable"] is False and rf["tags"]["ts_base"] == "string[]" and rf["n"]["ts_base"] == "number", rf
     assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
+    # F4: SQL に入る定数(COND)は共通ロジックの候補。中身が SQL らしくない定数(COLS)は出さない
+    assert [(c["name"], c["kind"], c["text"], c["runs_on"]) for c in r["logic_candidates"]] == [("COND", "sql_condition", "t.b IS NULL", "データベース")], r["logic_candidates"]
     # B3 SQL の型: DDL の型と NOT NULL、::型・NULL::型・COUNT の手掛かり、取れない式(無印の SUM)は None
     dt = hints["ddl_types"]
     assert dt["real_tbl"]["id"] == ("integer", False) and dt["real_tbl"]["b"] == ("integer", False), dt

@@ -220,6 +220,11 @@ def main():
         # description は概要(30字以内)。長い式は写さず processing_steps にだけ入れる(S1 が概要を必ず書く)
         if not item.get("description") and item.get("expression") and len(item["expression"]) <= 30:
             item["description"] = item["expression"]
+        # F4: S1 が書く runs_on(動作場所)を generate_docx.js の読み先 runtime_location へ写す。書かれていなければ WARN(docx は「（未指定）」になる)
+        if not item.get("runtime_location") and item.get("runs_on"):
+            item["runtime_location"] = item["runs_on"]
+        if not item.get("runtime_location"):
+            print(f"[WARN] [動作場所] common_logic「{item.get('name')}」に runs_on が無い(ブラウザ / サーバー(API) / データベース) → 差し戻し先 S1", file=sys.stderr)
         if not item.get("used_by_processes") and item.get("used_in"):
             used = item["used_in"]
             item["used_by_processes"] = [used] if isinstance(used, str) else list(used)
