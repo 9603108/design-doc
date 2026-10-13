@@ -233,6 +233,31 @@ def _align_message_ids(out, draft_msgs):
             r["message_id"] = rename[r["message_id"]]
 
 
+def missing_logical_names(composed):
+    """dataset に出る (物理列, 論理列) のうち logical_names に論理列が無いもの。戻り: [(logical_table, logical_column, physical_table, physical_column)]
+    呼出元: _fill_logical_names(合成)・verify_partials.check_h2_logical_names(H2 単位の早期 WARN)。"""
+    known = {n.get("logical_column") for n in composed.get("logical_names") or [] if isinstance(n, dict)}
+    out = []
+    for op in composed.get("db_operations") or []:
+        for r in op.get("dataset") or []:
+            lc = r.get("logical_column") if isinstance(r, dict) else None
+            if lc and lc not in known:
+                known.add(lc)
+                out.append((r.get("logical_table", ""), lc, r.get("physical_table", ""), r.get("physical_column", "")))
+    return out
+
+
+def _fill_logical_names(out):
+    """dataset の論理列が logical_names に無ければ、物理名と対で足す(値の欠けを埋めるだけの機械的な補い)。"""
+    miss = missing_logical_names(out)
+    if not miss:
+        return
+    names = out.setdefault("logical_names", [])
+    for lt, lc, pt, pc in miss:
+        names.append({"no": len(names) + 1, "logical_table": lt, "logical_column": lc,
+                      "physical_table": pt, "physical_column": pc})
+
+
 def compose(spec, frags, project_config=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
@@ -285,6 +310,7 @@ def compose(spec, frags, project_config=None):
                 if mid and mid not in have:
                     msgs.append({**{k: ce[k] for k in ("code", "severity", "message") if k in ce}, "message_id": mid})
                     have.add(mid)
+    _fill_logical_names(out)
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
             row["no"] = i

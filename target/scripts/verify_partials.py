@@ -220,6 +220,13 @@ def check_h2_columns(h2, draft):
     return problems
 
 
+def check_h2_logical_names(h2):
+    """H2 の dataset の logical_column が H2 の logical_names に無ければ WARN(合成 _units.compose が自動で足す)。"""
+    import _units
+    return [f"[WARN] [論理名] db_operations.dataset の logical_column={lc}(物理列 {pc}) が logical_names に無い(合成で自動補完) → 差し戻し先 H2"
+            for _lt, lc, _pt, pc in _units.missing_logical_names(h2)]
+
+
 def check_unit_extras(frags, directory):
     """--units の追加検査(ERROR)。(a) S1 の画面項目に react 下書きの display_rows の行名が全部ある /
     (b) H2 の joins・where が英語キー / (c) S2 と H4 で同じ message_id の文面が同じ / (d) 〈 や {…} の穴が残っていない /
@@ -280,6 +287,9 @@ def main_units(directory, only=None):
     problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
     for pr in problems:
         print(pr)
+    # WARN は終了コードに影響しない(合成で機械的に補うため)
+    for w in check_h2_logical_names(frags.get("H2") or {}):
+        print(w)
     if problems:
         return 1
     print(f"[OK] 断片 {len(frags)} 本({', '.join(sorted(frags))})の検査に問題なし")
@@ -351,6 +361,11 @@ def selftest_units():
     h2["db_operations"][0]["dataset"].append({"physical_column": "days"})
     h2["logical_names"].append({"physical_column": "days"})
     assert check_h2_columns(h2, draft) == [], check_h2_columns(h2, draft)
+    # dataset の論理列が logical_names に無ければ WARN、合成で補う
+    h2w = {"db_operations": [{"dataset": [{"logical_column": "店番号", "physical_column": "mise_no"}]}], "logical_names": []}
+    assert len(check_h2_logical_names(h2w)) == 1, "logical_names の欠けを WARN にしない"
+    comp2 = _units.compose(spec, {"H2": h2w})
+    assert comp2["logical_names"][0]["physical_column"] == "mise_no" and not _units.missing_logical_names(comp2), "合成で補わない"
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
