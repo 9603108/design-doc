@@ -5,7 +5,7 @@ verify_vs_source.py — 中間 JSON の記述を、ソースの実物と機械�
 
 【目的】
 LLM が書いた文言・例示値が、ソース(Python / TSX)の文字列に実在するかを照合し、作り話を止める。
-今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)・B3(応答項目の型と null 可。null 可の違いは ERROR)。F の照合は同じファイルへ足す(改良案 0.2)。
+今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)・B3(応答項目の型と null 可。null 可の違いは ERROR)・F2(境界値と DB 例外。WARN)・F3(初期取得の順。WARN)。F の照合は同じファイルへ足す(改良案 0.2)。
 
 【意味合い】
 - 戻りは verify_partials と同じ「[種別] 場所: 内容 → 差し戻し先 <単位>」。先頭に [WARN] を付けた行は終了コードに影響しない。
@@ -289,7 +289,64 @@ def check_fetch_plan(plan, front_processes):
     return out
 
 
+def _boundary_words(b):
+    """boundaries の1件から、H4 の rule に要る語の候補(どれか1つ)を返す。候補が決められない検査(集合に無い値など)は None。"""
+    if b.get("present") is False:
+        return {"order": ("大小", "前後", "逆転"), "span_limit": ("上限", "期間の長さ")}.get(b.get("check"))
+    if b.get("impossible_dates_accepted"):
+        return ("暦", "実在", "存在しない")
+    if re.search(r"<=\s*0\b|<\s*1\b", " ".join(b.get("compare") or [])):
+        return ("正の整数", "0以下", "0 以下", "1以上", "1 以上")
+    if "\\d{4}-\\d{2}-\\d{2}" in str(b.get("pattern")):
+        return ("YYYY-MM-DD", "形式", "書式")
+    return None
+
+
+def check_boundaries(validations, api_spec, apis, common_errors):
+    """境界値と DB 例外を、backend 下書きの boundaries・common_errors と突き合わせる(F2。WARN)。
+    [境界値]: 下書きの境界値(正の整数・日付の書式・暦に無い日付を通すこと・大小や期間上限の検査が無いこと)の語が、
+              H4 の validations の rule・field・applied_when のどこにも無い(差し戻し先 H4)。
+    [DB例外]: common_errors で status が取れた共通エラー(数値のもの)が api_spec の error_patterns に無い、または
+              api_spec の 5xx がソースの common_errors・その API の error_patterns に無い(差し戻し先 S2)。
+    呼出元: main。下書きの boundaries が空なら境界値は見ない。status が式のもの(getattr(…) or 400)・via の中で決まるものは見ない。"""
+    problems = []
+    text = " ".join(str(v.get(k) or "") for v in validations or [] if isinstance(v, dict) for k in ("field", "rule", "applied_when"))
+    for act, a in (apis or {}).items():
+        for b in a.get("boundaries") or []:
+            words = _boundary_words(b)
+            if words and not any(w in text for w in words):
+                what = b.get("fact") or f"{b.get('param')} の検査 {b.get('check')}"
+                problems.append(f"[WARN] [境界値] validations: 下書きの boundaries({act})「{what}」の語({'・'.join(words[:3])})が rule に無い → 差し戻し先 H4")
+    shared = {}
+    for c in common_errors or []:
+        for e in c.get("errors") or []:
+            if isinstance(e.get("status_code"), int):
+                shared.setdefault(e["status_code"], []).append(c.get("exception"))
+    for a in api_spec or []:
+        got = {str(e.get("status_code")) for e in a.get("error_patterns") or [] if isinstance(e, dict)}
+        own = {str(e.get("status_code")) for e in ((apis or {}).get(a.get("action")) or {}).get("error_patterns") or []}
+        where = f"api_spec[{a.get('action')}].error_patterns"
+        problems += [f"[WARN] [DB例外] {where}: ソースの共通エラー {sc}({'・'.join(map(str, ex))})が無い → 差し戻し先 S2"
+                     for sc, ex in shared.items() if str(sc) not in got]
+        problems += [f"[WARN] [DB例外] {where}: status {s} はソースの common_errors にも下書きの error_patterns にも無い → 差し戻し先 S2"
+                     for s in sorted(got) if s.startswith("5") and int(s) not in shared and s not in own]
+    return problems
+
+
 def selftest():
+    # F2: 境界値の語が rule に無い・共通エラーの status が api_spec に無いと WARN
+    bs = [{"param": "shop_id", "check": "v <= 0", "compare": ["v <= 0"]},
+          {"param": "from", "check": "x", "compare": [], "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "impossible_dates_accepted": ["2026-02-30"]},
+          {"param": "from,to", "present": False, "check": "order", "fact": "大小を比べる式が無い"},
+          {"param": "group", "check": "group not in _G", "compare": ["group not in _G"]}]
+    fa = {"act": {"boundaries": bs, "error_patterns": [{"status_code": 400}]}}
+    ce = [{"exception": "psycopg2.Error", "errors": [{"status_code": 500}]}, {"exception": "ValidationError", "errors": [{"status_code": "getattr(e) or 400"}]}]
+    vl = [{"field": "店舗", "rule": "正の整数", "applied_when": ""}, {"field": "日付", "rule": "YYYY-MM-DD。暦に無い日付は DB 例外になる。開始と終了の大小は検査しない"}]
+    ap = [{"action": "act", "error_patterns": [{"status_code": 400}, {"status_code": 500}]}]
+    assert check_boundaries(vl, ap, fa, ce) == [], check_boundaries(vl, ap, fa, ce)
+    got = check_boundaries([{"field": "店舗", "rule": "必須"}], [{"action": "act", "error_patterns": [{"status_code": 400}, {"status_code": 503}]}], fa, ce)
+    assert [g.split(" ")[1] for g in got] == ["[境界値]"] * 3 + ["[DB例外]"] * 2 and all(g.startswith("[WARN]") for g in got), got
+    assert not check_boundaries([], [{"action": "act"}], {}, []) and not check_boundaries([], [], None, None)
     # B3: reji_no は string | null。nullable を反転すると [null可] ERROR、型の分類違いは WARN
     apis = {"act": {"response_fields": [{"path": "rows[].reji_no", "ts_type": "string | null", "ts_base": "string", "nullable": True},
                                          {"path": "rows[].days", "ts_type": "number", "ts_base": "number", "nullable": False},
@@ -395,10 +452,14 @@ def main(argv=None):
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
     cands, jsx, beh, disp_rows = [], [], [], []
-    type_problems, n_sql, plan = [], 0, None
+    type_problems, n_sql, plan, bound_problems, n_bound = [], 0, None, [], 0
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
-        apis = json.loads(p.read_text(encoding="utf-8")).get("apis") or {}
+        bd = json.loads(p.read_text(encoding="utf-8"))
+        apis = bd.get("apis") or {}
         type_problems = check_types(data.get("api_spec"), apis)
+        # F2: 境界値と共通エラー(DB 例外)の照合。validations は最終の validations か、断片の validations_frontend
+        bound_problems = check_boundaries(data.get("validations") or data.get("validations_frontend"), data.get("api_spec"), apis, bd.get("common_errors"))
+        n_bound = sum(len(a.get("boundaries") or []) for a in apis.values())
         n_sql = sum(1 for a in apis.values() for f in a.get("response_fields") or [] if f.get("db_type"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
         rd = json.loads(p.read_text(encoding="utf-8"))
@@ -417,8 +478,9 @@ def main(argv=None):
     problems += calc_problems
     kind_problems = check_kinds(data.get("validations") or data.get("validations_frontend"), data.get("front_processes"), beh)
     fetch_problems = check_fetch_plan(plan, data.get("front_processes"))
-    for p in problems + kind_problems + type_problems + fetch_problems:
+    for p in problems + kind_problems + type_problems + fetch_problems + bound_problems:
         print(p)
+    print(f"[INFO] 境界値・DB 例外の照合: 下書きの boundaries {n_bound} 件・WARN {len(bound_problems)} 件")
     null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
     print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件・SQL の型の手掛かりつきの欄 {n_sql} 件")
     n = len(data.get("calculations") or [])

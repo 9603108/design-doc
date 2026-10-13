@@ -217,6 +217,32 @@ def _backend_draft_facts():
     return fact, msgs, auth_errs
 
 
+def _draft_common_errors():
+    """backend 下書きの最上位 common_errors(入口の except 節)のうち、status が数値で取れたものを共通エラーの行にして返す(F2)。
+    呼出元: compose。意味合い: 入口で受ける DB 例外などの 500 系は、API ごとに書かせると抜けるため、ソースで status が決まったものだけ機械で足す。
+    status が式(getattr(e, 'status', 400) or 400)のもの・via の補助関数の中で決まるもの・同じ status の2件目以降は足さない(推測しない)。
+    condition は例外名と code だけの事実(業務の言い換えは S2 が書く)。下書きが無ければ []。"""
+    from _config_loader import INTERMEDIATE_DIR
+    by_status = {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for c in d.get("common_errors") or []:
+            for e in c.get("errors") or []:
+                if isinstance(e.get("status_code"), int):
+                    by_status.setdefault(e["status_code"], []).append((c.get("exception"), e.get("code"), c.get("src") or []))
+    out = []
+    for sc, hits in by_status.items():
+        excs = "・".join(dict.fromkeys(x for x, _, _ in hits if x))
+        codes = [c for _, c, _ in hits if isinstance(c, str) and re.fullmatch(r"\w+", c)]
+        src = [s for _, _, ss in hits for s in ss]
+        out.append({"status_code": sc, "condition": f"想定外の例外が起きたとき({excs}" + (f"。code={codes[0]}" if codes else "") + ")",
+                    **({"src": src} if src else {})})
+    return out
+
+
 def _align_message_ids(out, draft_msgs):
     """H4 の messages_backend が下書きと同じ文面で別の ID を書いていたら、下書きの ID へ寄せる。
     参照している error_patterns・validations_frontend の message_id も同じ置換にする(参照切れを作らない)。"""
@@ -378,6 +404,10 @@ def compose(spec, frags, project_config=None):
             sc = e.get("status_code")
             if sc and not any(c.get("status_code") == sc for c in common):
                 common.append({"status_code": sc, "condition": e.get("text_expanded") or e.get("message") or ""})
+        # F2: 入口の except 節で status が数値で決まる共通エラー(500 系)。同じ status が既にあれば足さない
+        for ce in _draft_common_errors():
+            if not any(c.get("status_code") == ce["status_code"] for c in common):
+                common.append(ce)
     # F1: message はソースの文字列のまま(下書きの text_expanded)。画面項目名への置き換え(_expand_message_holes)はしない
     _align_message_ids(out, draft_msgs)
     if common or auth_desc:
@@ -386,8 +416,13 @@ def compose(spec, frags, project_config=None):
                 api["auth"] = auth_desc
             errs = api.setdefault("error_patterns", [])
             for ce in common:
-                if not any(e.get("status_code") == ce.get("status_code") for e in errs):
+                same = [e for e in errs if e.get("status_code") == ce.get("status_code")]
+                if not same:
                     errs.append(copy.deepcopy(ce))
+                elif ce.get("src"):  # 単位が書いた同じ status の行にも、入口の except 節の出典を足す(A3)
+                    for e in same:
+                        if not e.get("src"):
+                            e["src"] = copy.deepcopy(ce["src"])
         if common and "api_spec" in out:
             msgs = out.setdefault("messages_backend", [])
             have = {m.get("message_id") for m in msgs if isinstance(m, dict)}

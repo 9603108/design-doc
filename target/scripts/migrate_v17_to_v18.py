@@ -214,6 +214,8 @@ def build_front_processes(event_processes: list, events: list, initialization: d
 
     front_processes = []
     event_to_id = {}  # EV01 → F001 のマップ
+    # A3: EV00 の出典。event_processes に EV00 が無い案件(初期表示は initial_processes が書く)は events の EV00 の src を使う
+    ev00_src = next((x.get("src") for x in list(event_processes) + list(events) if x.get("event_code") == "EV00" and x.get("src")), [])
 
     # v42 案B汎用化: initial_processes[] を screen_config.json から読んで N 個の独立処理を生成
     # 意味合い: URL パラメータ別の分岐パターンを「呼ばれる側」（独立 F001-* 処理）として表現。
@@ -242,6 +244,10 @@ def build_front_processes(event_processes: list, events: list, initialization: d
                 "common_logic_refs": [],
                 "parameter_refs": []
             })
+        # A3: EV00 が呼ぶ最初の初期処理にだけ、EV00 の出典(初期表示の useEffect)を付ける。他の初期処理(URL パラメータ別)は根拠の行が別なので付けない
+        first = next((fp for fp in front_processes if fp["process_id"] == init_procs[0].get("process_id")), None)
+        if first and ev00_src:
+            first["src"] = ev00_src
         # EV00 → 最初の初期処理（既定: F001、新規モード）に紐付ける
         # ※ trigger_dispatch.EV00 が apply_trigger_dispatch.py で URL パラメータ別に分岐させる
         event_to_id["EV00"] = init_procs[0].get("process_id", "F001")
@@ -275,7 +281,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
             "calculation_refs": [],
             "common_logic_refs": [],
             "parameter_refs": [],
-            "src": next((e.get("src") for e in event_processes if e.get("event_code") == "EV00" and e.get("src")), [])  # ソース出典(A3)
+            "src": ev00_src  # ソース出典(A3)
         })
         event_to_id["EV00"] = "F001"
 

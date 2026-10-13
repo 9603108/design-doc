@@ -481,6 +481,24 @@ def selftest_units():
     assert len(check_h2_logical_names(h2w)) == 1, "logical_names の欠けを WARN にしない"
     comp2 = _units.compose(spec, {"H2": h2w})
     assert comp2["logical_names"][0]["physical_column"] == "mise_no" and not _units.missing_logical_names(comp2), "合成で補わない"
+    # F2: 下書きの common_errors のうち status が数値のもの(500)だけを各 api_spec の error_patterns へ足す。式の status(400)は足さない。既にある status は足さない
+    import tempfile, _config_loader
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "x_backend_draft.json").write_text(json.dumps({"common_errors": [
+            {"exception": "ValidationError", "errors": [{"code": "getattr(e) or 'v'", "status_code": "getattr(e, 'status', 400) or 400"}]},
+            {"exception": "psycopg2.Error", "errors": [{"code": "internal_error", "status_code": 500}], "src": [{"file": "h.py", "line_start": 5, "line_end": 6}]},
+            {"exception": "Exception", "errors": [{"code": "internal_error", "status_code": 500}]}]}), encoding="utf-8")
+        old, _config_loader.INTERMEDIATE_DIR = _config_loader.INTERMEDIATE_DIR, Path(td)
+        try:
+            ce = _units._draft_common_errors()
+            comp3 = _units.compose(spec, {"S2": {"api_spec": [{"action": "a", "error_patterns": [{"status_code": 400, "condition": "x"}]},
+                                                               {"action": "b", "error_patterns": [{"status_code": 500, "condition": "y"}]}]}}, {})
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    sr = [{"file": "h.py", "line_start": 5, "line_end": 6}]
+    assert ce == [{"status_code": 500, "condition": "想定外の例外が起きたとき(psycopg2.Error・Exception。code=internal_error)", "src": sr}], ce
+    pa, pb = (a["error_patterns"] for a in comp3["api_spec"])
+    assert [e["status_code"] for e in pa] == [400, 500] and pa[1]["src"] == sr and pb[0]["src"] == sr and len(pb) == 1, (pa, pb)
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
