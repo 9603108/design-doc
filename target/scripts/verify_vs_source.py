@@ -270,6 +270,25 @@ def check_types(api_spec, apis):
     return problems
 
 
+def check_fetch_plan(plan, front_processes):
+    """初期表示(front_processes の名前に「初期」を含む処理)の steps が、react 下書き events[0].fetch_plan.mode と同じ取得順を書いているかを見る(F3)。
+    parallel なら「並行|同時」、serial なら「待って」の語が要る。逆の語だけがあるのも食い違い。呼出元: main。
+    返す行は [WARN] [取得順](差し戻し先 S0。EV00 は S0 の initial_processes が書く)。plan が無い・single は見ない。"""
+    mode = (plan or {}).get("mode")
+    if mode not in ("parallel", "serial"):
+        return []
+    out = []
+    for p in front_processes or []:
+        if "初期" not in str(p.get("name")):
+            continue
+        t = " ".join(str(s.get("description")) for s in p.get("steps") or [])
+        par, wait = bool(re.search(r"並行|同時", t)), "待って" in t
+        if (mode == "parallel" and not par) or (mode == "serial" and (par or not wait)):
+            want = "「並行」か「同時」" if mode == "parallel" else "「…の応答を待って…を取得する」"
+            out.append(f"[WARN] [取得順] {p.get('process_id')}.steps: 下書きの fetch_plan.mode={mode}({plan.get('basis', '')})だが、steps に{want}の書き方が無い → 差し戻し先 S0")
+    return out
+
+
 def selftest():
     # B3: reji_no は string | null。nullable を反転すると [null可] ERROR、型の分類違いは WARN
     apis = {"act": {"response_fields": [{"path": "rows[].reji_no", "ts_type": "string | null", "ts_base": "string", "nullable": True},
@@ -286,6 +305,14 @@ def selftest():
     assert check_types(spec(("rows[].s", "integer", False)), ix) == []
     got = check_types(spec(("rows[].s", "string", True)), ix)
     assert [g.split(" ")[0] for g in got] == ["[WARN]", "[null可]"] and "SQL" in got[0], got
+    # F3: 初期表示の取得順。parallel は「並行」、serial は「待って」の記述が要る。語が無い・食い違うと WARN
+    fr = lambda *d: [{"process_id": "FR1", "name": "初期表示", "steps": [{"description": x} for x in d]}]
+    par, ser = {"mode": "parallel", "basis": "別々の useEffect"}, {"mode": "serial", "basis": "then"}
+    assert check_fetch_plan(par, fr("店舗の一覧と会計レポートの取得は並行して進める")) == []
+    assert check_fetch_plan(ser, fr("店舗の一覧の応答を待って会計レポートを取得する")) == []
+    got = check_fetch_plan(par, fr("店舗の一覧を取得する", "会計レポートを取得する"))
+    assert len(got) == 1 and got[0].startswith("[WARN] [取得順]") and "S0" in got[0], got
+    assert check_fetch_plan(ser, fr("取得は並行して進める")) and not check_fetch_plan({"mode": "single"}, fr("x")) and not check_fetch_plan(None, fr("x"))
     sp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
     beh = [{"id": "BH01", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)},
            {"id": "BH02", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(305), "control_src": []}]
@@ -368,7 +395,7 @@ def main(argv=None):
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
     cands, jsx, beh, disp_rows = [], [], [], []
-    type_problems, n_sql = [], 0
+    type_problems, n_sql, plan = [], 0, None
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
         apis = json.loads(p.read_text(encoding="utf-8")).get("apis") or {}
         type_problems = check_types(data.get("api_spec"), apis)
@@ -377,6 +404,7 @@ def main(argv=None):
         rd = json.loads(p.read_text(encoding="utf-8"))
         cands, jsx, beh = rd.get("calc_candidates") or [], rd.get("jsx_elements") or [], rd.get("behaviors") or []
         disp_rows = rd.get("display_rows") or []
+        plan = ((rd.get("events") or [{}])[0]).get("fetch_plan")
     items = (data.get("screen_layout") or {}).get("items") or []
     item_problems = check_items(items, jsx, disp_rows) if jsx else []
     problems += item_problems
@@ -388,11 +416,13 @@ def main(argv=None):
     calc_problems = check_calcs(data.get("calculations") or [], cands) if cands else []
     problems += calc_problems
     kind_problems = check_kinds(data.get("validations") or data.get("validations_frontend"), data.get("front_processes"), beh)
-    for p in problems + kind_problems + type_problems:
+    fetch_problems = check_fetch_plan(plan, data.get("front_processes"))
+    for p in problems + kind_problems + type_problems + fetch_problems:
         print(p)
     null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
     print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件・SQL の型の手掛かりつきの欄 {n_sql} 件")
     n = len(data.get("calculations") or [])
+    print(f"[INFO] 初期取得の順の照合: fetch_plan {(plan or {}).get('mode', 'なし')}・WARN {len(fetch_problems)} 件")
     print(f"[INFO] 計算式の照合: ソースの式 {len(cands)} 件・calculations {n} 件・WARN {len(calc_problems)} 件")
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
     print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件(うち下書きの ui_strings {n_ui} 件)に対し WARN {len(problems)} 件")
