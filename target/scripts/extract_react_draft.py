@@ -621,6 +621,10 @@ def main(argv=None):
     draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
     # 目的: 取得失敗時に変える state・残る state を下書きに足す(既存キーは変えない)。接続: _react_facts.extract
     draft.update(_react_facts.extract(links, sources))
+    # 目的: 初期表示の取得が並行か順かを EV00(events[0])に足す。接続: _react_facts.fetch_plan
+    plan = _react_facts.fetch_plan(sources, pcfg.get("api_call_functions", []))
+    if plan:
+        draft["events"][0]["fetch_plan"] = plan
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
     draft["continuous_operation"] = _continuous_ops(links)

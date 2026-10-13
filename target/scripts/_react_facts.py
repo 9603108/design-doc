@@ -197,6 +197,108 @@ def extract(links, sources):
     return {"failure_effects": out}
 
 
+_EFFECT = re.compile(r"\buseEffect\s*\(")
+_EFFECT_ARGS = re.compile(r"([\s\S]*?)\s*,\s*\[[^\]]*\]\s*,?\s*$")
+_IDENT_ONLY = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _line_span(p, text, body):
+    """本体の文字列の出現位置を {file, line_start, line_end} にする。見つからなければ None。"""
+    s = text.find(body)
+    if s < 0 or not body:
+        return None
+    return {"file": str(p), "line_start": text.count("\n", 0, s) + 1,
+            "line_end": text.count("\n", 0, s + len(body) - 1) + 1}
+
+
+def _effect_groups(p, text, api_names):
+    """TSX の useEffect ごとに、本体(引数が関数名ならその定義)が呼ぶ API 関数名を [{calls, body, src}] で返す。
+
+    意味合い: 別々の useEffect は React が待たずに起動する(並行)。1つの本体の中の並びは mode の判定に使う。
+    api_names に無い呼出は数えない(推測で足さない)。
+    """
+    out = []
+    for m in _EFFECT.finditer(text):
+        po = m.end() - 1
+        am = _EFFECT_ARGS.match(text[po + 1:_end(text, po)])
+        if not am:
+            continue
+        arg = am.group(1).strip()
+        body = arg
+        if _IDENT_ONLY.fullmatch(arg):
+            dm = re.search(r"\b(?:const|function)\s+" + re.escape(arg) + r"\b[^{]*\{", text)
+            if not dm:
+                continue
+            bo = dm.end() - 1
+            body = text[bo:_end(text, bo) + 1]
+        calls = _uniq([n for n in _CALL.findall(body) if n in api_names])
+        if calls:
+            out.append({"calls": calls, "body": body, "src": _line_span(p, text, body)})
+    return out
+
+
+def fetch_plan(sources, api_names):
+    """初期表示(EV00)の取得が並行か順かを返す。取得が無ければ None。
+
+    呼出元: extract_react_draft.main()(events[0].fetch_plan に入れる)。
+    mode: parallel(別々の useEffect / Promise.all / 待たずに続けて呼ぶ)、serial(await や .then で待ってから次を呼ぶ)、single(1件)。
+    groups: 呼出の並び(parallel は同じ群が同時、serial は1件ずつ)。
+    """
+    groups = []
+    for p in sources:
+        if Path(p).suffix in (".tsx", ".jsx"):
+            groups += _effect_groups(p, Path(p).read_text(encoding="utf-8"), set(api_names))
+    if not groups:
+        return None
+    srcs = [g["src"] for g in groups if g["src"]]
+    if len(groups) >= 2:
+        return {"mode": "parallel", "groups": [g["calls"] for g in groups],
+                "basis": "別々の useEffect で起動し、先の完了を待たない", "src": srcs}
+    g = groups[0]
+    calls, body = g["calls"], g["body"]
+    if len(calls) < 2:
+        return {"mode": "single", "groups": [calls], "basis": "取得は1件", "src": srcs}
+    if "Promise.all" in body:
+        return {"mode": "parallel", "groups": [calls], "basis": "Promise.all で並行に待つ", "src": srcs}
+    if re.search(r"\bawait\b|\.then\s*\(", body):
+        return {"mode": "serial", "groups": [[c] for c in calls],
+                "basis": "同じ本体で応答を待ってから次を呼ぶ", "src": srcs}
+    return {"mode": "parallel", "groups": [calls], "basis": "同じ本体で待たずに続けて呼ぶ", "src": srcs}
+
+
+def selftest_fetch_plan():
+    """fetch_plan の3形(別々の useEffect / Promise.all / await の直列)を最小の TSX で assert する。終了コード 0=OK / 1=NG。"""
+    tsx_a = (
+        "export default function S() {\n"
+        "  const load = useCallback(() => {\n"
+        "    fetchY().then((d) => setRows(d.rows));\n"
+        "  }, []);\n"
+        "  useEffect(() => { fetchX().then((d) => setShops(d.rows)); }, []);\n"
+        "  useEffect(load, [load]);\n"
+        "}\n"
+    )
+    tsx_b = "export default function S() {\n  useEffect(() => { Promise.all([fetchX(), fetchY()]); }, []);\n}\n"
+    tsx_c = "export default function S() {\n  useEffect(() => { fetchX().then(() => fetchY()); }, []);\n}\n"
+    api = ["fetchX", "fetchY"]
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            res = []
+            for name, src in (("A.tsx", tsx_a), ("B.tsx", tsx_b), ("C.tsx", tsx_c)):
+                p = Path(d) / name
+                p.write_text(src, encoding="utf-8")
+                res.append(fetch_plan([p], api))
+        a, b, c = res
+        assert a["mode"] == "parallel" and a["groups"] == [["fetchX"], ["fetchY"]], f"A: {a}"
+        assert a["src"][0]["line_start"] == 5, f"A の src: {a['src']}"
+        assert b["mode"] == "parallel" and b["groups"] == [["fetchX", "fetchY"]], f"B: {b}"
+        assert c["mode"] == "serial" and c["groups"] == [["fetchX"], ["fetchY"]], f"C: {c}"
+    except AssertionError as e:
+        print(f"[selftest NG] fetch_plan {e}")
+        return 1
+    print("[selftest OK] _react_facts.fetch_plan")
+    return 0
+
+
 def selftest():
     """promise chain と try/catch の2形を最小の TSX で試し、失敗時の state と行番号を assert する。終了コード 0=OK / 1=NG。"""
     tsx = (
@@ -250,6 +352,7 @@ def selftest():
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
-        sys.exit(selftest())
+        rc = selftest()
+        sys.exit(rc or selftest_fetch_plan())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
