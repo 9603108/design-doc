@@ -279,7 +279,9 @@ def check_types(api_spec, apis):
 def check_fetch_plan(plan, front_processes):
     """初期表示(front_processes の名前に「初期」を含む処理)の steps が、react 下書き events[0].fetch_plan.mode と同じ取得順を書いているかを見る(F3)。
     parallel なら「並行|同時」、serial なら「待って」の語が要る。逆の語だけがあるのも食い違い。呼出元: main。
-    返す行は [WARN] [取得順](差し戻し先 S0。EV00 は S0 の initial_processes が書く)。plan が無い・single は見ない。"""
+    返す行は [WARN] [取得順]。差し戻し先は付けない: この語は migrate_v17_to_v18.py(_react_facts.add_fetch_order_step)が
+    初期処理の steps に機械で入れるので、無ければモデルの書き直しでなくスクリプトの不具合(units 表に無い S0 へ戻さない)。
+    plan が無い・single は見ない。"""
     mode = (plan or {}).get("mode")
     if mode not in ("parallel", "serial"):
         return []
@@ -291,7 +293,7 @@ def check_fetch_plan(plan, front_processes):
         par, wait = bool(re.search(r"並行|同時", t)), "待って" in t
         if (mode == "parallel" and not par) or (mode == "serial" and (par or not wait)):
             want = "「並行」か「同時」" if mode == "parallel" else "「…の応答を待って…を取得する」"
-            out.append(f"[WARN] [取得順] {p.get('process_id')}.steps: 下書きの fetch_plan.mode={mode}({plan.get('basis', '')})だが、steps に{want}の書き方が無い → 差し戻し先 S0")
+            out.append(f"[WARN] [取得順] {p.get('process_id')}.steps: 下書きの fetch_plan.mode={mode}({plan.get('basis', '')})だが、steps に{want}の書き方が無い → スクリプトの不具合(migrate_v17_to_v18.py が初期処理の steps に入れるはずの行。差し戻しでなく報告する)")
     return out
 
 
@@ -374,7 +376,7 @@ def selftest():
     assert check_fetch_plan(par, fr("店舗の一覧と会計レポートの取得は並行して進める")) == []
     assert check_fetch_plan(ser, fr("店舗の一覧の応答を待って会計レポートを取得する")) == []
     got = check_fetch_plan(par, fr("店舗の一覧を取得する", "会計レポートを取得する"))
-    assert len(got) == 1 and got[0].startswith("[WARN] [取得順]") and "S0" in got[0], got
+    assert len(got) == 1 and got[0].startswith("[WARN] [取得順]") and "差し戻し先" not in got[0] and "スクリプトの不具合" in got[0], got
     assert check_fetch_plan(ser, fr("取得は並行して進める")) and not check_fetch_plan({"mode": "single"}, fr("x")) and not check_fetch_plan(None, fr("x"))
     sp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
     beh = [{"id": "BH01", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)},

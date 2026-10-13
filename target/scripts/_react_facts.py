@@ -266,6 +266,35 @@ def fetch_plan(sources, api_names):
     return {"mode": "parallel", "groups": [calls], "basis": "同じ本体で待たずに続けて呼ぶ", "src": srcs}
 
 
+def add_fetch_order_step(steps, plan):
+    """初期処理の steps に、取得の順(fetch_plan.mode)の書き方が無ければ、スクリプトが1行足す。足したら True。
+
+    WHY: 初期表示の取得が並行か順かは TSX から機械で決まる事実(fetch_plan)なので、モデルに書かせず
+    スクリプトが入れる(verify_vs_source の [取得順] が見る語と同じ: parallel=「並行」、serial=「待って」)。
+    呼出元: migrate_v17_to_v18.build_front_processes(initial_processes[].steps を再採番する前に呼ぶ)。
+    足す位置は最初の backend_call の直前。backend_call が2件未満・mode が single/None・既に語がある steps は触らない。
+    文は、各 backend_call の description の末尾「…を取得する」を落とした名前から作る(API 名・「リクエスト」は入れない)。
+    """
+    mode = (plan or {}).get("mode")
+    if mode not in ("parallel", "serial"):
+        return False
+    idx = [i for i, s in enumerate(steps) if s.get("kind") == "backend_call" or s.get("backend_call")]
+    if len(idx) < 2:
+        return False
+    text = " ".join(str(s.get("description")) for s in steps)
+    if (mode == "parallel" and re.search(r"並行|同時", text)) or (mode == "serial" and "待って" in text):
+        return False
+    names = [re.sub(r"(を取得|を呼び出)(する|します)?$", "", str(steps[i].get("description") or "").strip()) for i in idx]
+    if not all(names):
+        return False
+    if mode == "parallel":
+        desc = "、".join(names[:-1]) + "と" + names[-1] + "の取得は並行して進める(先の応答を待たない)"
+    else:
+        desc = names[0] + "の応答を待って" + "、その応答を待って".join(n + "を取得する" for n in names[1:])
+    steps.insert(idx[0], {"kind": "state_update", "description": desc})
+    return True
+
+
 _RACE_GUARD = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)
 
 
@@ -1019,6 +1048,26 @@ def selftest_fetch_plan():
         assert c["mode"] == "serial" and c["groups"] == [["fetchX"], ["fetchY"]], f"C: {c}"
     except AssertionError as e:
         print(f"[selftest NG] fetch_plan {e}")
+        return 1
+    # add_fetch_order_step: parallel/serial の語が無ければ最初の backend_call の前に1行足す。あれば・single・1件なら足さない
+    def mk():
+        return [{"kind": "backend_call", "description": "店舗の一覧を取得する", "backend_call": {"backend_id": "B001"}},
+                {"kind": "screen_update", "description": "店舗の選択肢を用意する"},
+                {"kind": "backend_call", "description": "会計レポートを取得する", "backend_call": {"backend_id": "B002"}}]
+    try:
+        st = mk()
+        assert add_fetch_order_step(st, {"mode": "parallel"}) and len(st) == 4 and st[0]["description"] == "店舗の一覧と会計レポートの取得は並行して進める(先の応答を待たない)", st
+        assert not add_fetch_order_step(st, {"mode": "parallel"}) and len(st) == 4, "足した後は足さない"
+        st = mk()
+        assert add_fetch_order_step(st, {"mode": "serial"}) and st[0]["description"] == "店舗の一覧の応答を待って会計レポートを取得する", st
+        st = mk()
+        assert not add_fetch_order_step(st, {"mode": "single"}) and not add_fetch_order_step(st, None) and len(st) == 3
+        assert not add_fetch_order_step(mk()[:2], {"mode": "parallel"}), "backend_call が1件なら足さない"
+        st = mk()
+        st[1]["description"] = "取得は同時に進める"
+        assert not add_fetch_order_step(st, {"mode": "parallel"}), "語が既にあれば足さない"
+    except AssertionError as e:
+        print(f"[selftest NG] add_fetch_order_step {e}")
         return 1
     print("[selftest OK] _react_facts.fetch_plan")
     return 0

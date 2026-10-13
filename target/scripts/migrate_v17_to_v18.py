@@ -27,6 +27,7 @@ import sys
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する
 # v43: ID 体系を id_scheme.json (スキル付属) 経由化、ハードコード接頭辞 "F" を全廃
+from _react_facts import add_fetch_order_step
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -238,7 +239,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
                 "called_by_triggers": [
                     {"group_kind": "auto", "group_category": "画面表示時", "trigger_no": 1}
                 ],
-                "steps": _renumber_init_steps(ip.get("steps", []) or []),
+                "steps": _renumber_init_steps(_with_fetch_order(ip.get("steps", []) or [])),
                 "validation_refs": [],
                 "calculation_refs": [],
                 "common_logic_refs": [],
@@ -336,6 +337,24 @@ def _build_initial_process_overview(ip: dict) -> str:
     if url_match:
         return f"{name}。URLパラメータ条件: {url_match}"
     return name
+
+
+def _with_fetch_order(steps: list) -> list:
+    """初期処理の steps に、取得の順(react 下書き events[0].fetch_plan.mode)の1行が無ければ足した写しを返す。
+
+    WHY: 並行か順かは TSX から機械で決まる事実なので、S0(モデル)に書かせずここで入れる(verify_vs_source の [取得順] と同じ語)。
+    接続: 下書き {機能名}_react_draft.json が無い・fetch_plan が無い・single なら何もしない。足す文は _react_facts.add_fetch_order_step。
+    """
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return steps
+    try:
+        plan = ((json.loads(draft.read_text(encoding="utf-8")).get("events") or [{}])[0]).get("fetch_plan")
+    except (OSError, ValueError, AttributeError):
+        return steps
+    out = [dict(s) for s in steps]
+    add_fetch_order_step(out, plan)
+    return out
 
 
 def _renumber_init_steps(steps: list) -> list:

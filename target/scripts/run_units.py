@@ -165,12 +165,16 @@ def parse_sendbacks(text, units=None):
     """検査の出力から「→ 差し戻し先 <単位>」の行を単位ごとに拾う。
 
     units を渡すと、差し戻し先の無い ERROR 行も owner_of で単位を引き、引けなければ "unknown" に入れる。
+    units を渡したとき、units 表に無い名前(S0 など並行の単位の外・誤記)は retry できないので "unknown" に入れる。
     """
     out = {}
     for line in text.splitlines():
         m = SENDBACK_RE.search(line)
         if m:
             targets = [u for u in re.split(r"[,、/]", m.group(1)) if u]
+            if units is not None:
+                targets = [u if u in units else "unknown" for u in targets]
+                targets = list(dict.fromkeys(targets))
         elif units is not None and ERROR_LINE_RE.search(line):
             targets = [owner_of(line, units) or "unknown"]
         else:
@@ -248,6 +252,17 @@ def selftest():
         "  [WARN] backend_processes[BE1].overview 長い\n", units)
     assert {u: len(v) for u, v in s.items()} == {"H4": 1, "S2": 1, "H2": 1, "H3": 1, "unknown": 1}, s
     assert parse_sendbacks("ERROR foo → 差し戻し先 S1", units) == {"S1": ["ERROR foo → 差し戻し先 S1"]}
+    # units 表に無い差し戻し先(S0 など)は unknown に入れる。units を渡さなければ従来どおり名前のまま
+    assert parse_sendbacks("[WARN] x → 差し戻し先 S0", units) == {"unknown": ["[WARN] x → 差し戻し先 S0"]}
+    assert sorted(parse_sendbacks("x → 差し戻し先 S0,S1,H9", units)) == ["S1", "unknown"]
+    assert list(parse_sendbacks("x → 差し戻し先 S0")) == ["S0"]
+    # retry は units 表に無い単位で KeyError にせず、分かる文言で終了コード 2
+    import contextlib
+    import io
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert main(["retry", "テスト機能", "S0", "--issues", "/dev/null"]) == 2
+    assert "units 表に無い" in err.getvalue(), err.getvalue()
     text = build_prompt(units, "テスト機能", "S1", sendbacks=["ERROR 欄 → 差し戻し先 S1"])
     assert "_unit_S1.json" in text and "ERROR 欄 → 差し戻し先 S1" in text, text
     assert "【差し戻し】" not in build_prompt(units, "テスト機能", "S1")
@@ -310,6 +325,12 @@ def main(argv=None):
         return run_after(a.feature)
     if a.cmd == "retry":
         units = load_units()
+        # WHY: units 表に無い名前(S0・unknown・誤記)は単位ではない。KeyError の追跡でなく、何を直すかの文言で止める。
+        if a.unit not in units:
+            print(f"単位 {a.unit} は units 表に無いので retry できない(単位: {'・'.join(units)})。"
+                  "unknown や S0 などの差し戻しは、after が出した行の内容を読んで、スクリプトの不具合か、"
+                  "S0・R1 のような並行の単位の外の担当(units.json の outside_fragments)かを判断して直す", file=sys.stderr)
+            return 2
         with open(a.issues, encoding="utf-8") as f:
             issues = json.load(f)
         # WHY: after の出力(sendbacks の辞書)か、差し戻し文面の一覧の両方を受ける。
