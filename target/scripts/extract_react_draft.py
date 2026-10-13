@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 from verify_partials import DETAIL_TODO
+import _react_facts  # 目的: C2 の失敗時の state の事実を下書きに足す。接続: main() の draft.update(...)
 
 # JSX のイベント属性 → events[].action の動作語。表に無い属性は属性名をそのまま出す(推測で訳さない)
 ACTION_WORDS = {
@@ -618,6 +619,8 @@ def main(argv=None):
 
     links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
     draft = build_draft(links, unresolved, cfg.get("screen_name", ""))
+    # 目的: 取得失敗時に変える state・残る state を下書きに足す(既存キーは変えない)。接続: _react_facts.extract
+    draft.update(_react_facts.extract(links, sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
     draft["continuous_operation"] = _continuous_ops(links)
