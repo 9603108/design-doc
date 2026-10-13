@@ -703,7 +703,7 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
       { "type": "FROM", "logical_table": "顧客マスタ", "condition": "" }
     ],
     "where": [
-      { "and_or": "AND", "logical_table": "顧客マスタ", "logical_column": "削除フラグ", "operator": "=", "param_no": "-", "param_name": "0 (0：未削除)" }
+      { "and_or": "AND", "logical_table": "顧客マスタ", "logical_column": "削除フラグ", "operator": "=", "value": "0", "param_no": "", "param_name": "" }
     ],
     "order_by": [
       { "priority": 1, "logical_table": "顧客マスタ", "logical_column": "顧客コード", "direction": "昇順", "null_position": "" }

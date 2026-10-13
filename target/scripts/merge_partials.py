@@ -177,7 +177,7 @@ def compose_units() -> int:
 
 def apply_unit_details(event_processes: list, unit_eps: list) -> None:
     """断片由来の event_processes（_partial_screen_events.json の event_processes）の details を、event_code で写す。
-    details_none_reason も写す。断片に無いイベントは merge が作った空の details のまま"""
+    details_none_reason と src も写す。断片に無いイベントは merge が作った空の details のまま"""
     by_code = {e.get("event_code"): e for e in unit_eps or [] if isinstance(e, dict)}
     for ep in event_processes:
         src = by_code.get(ep.get("event_code"))
@@ -187,6 +187,8 @@ def apply_unit_details(event_processes: list, unit_eps: list) -> None:
             ep["details"] = list(src["details"])
         if src.get("details_none_reason"):
             ep["details_none_reason"] = src["details_none_reason"]
+        if src.get("src"):
+            ep["src"] = list(src["src"])
 
 
 def main():

@@ -73,7 +73,8 @@
         "db_operations[].insert_values",
         "db_operations[].update_values",
         "db_operations[].transaction",
-        "db_operations[].error_message_id"
+        "db_operations[].error_message_id",
+        "db_operations[].src"
       ]
     },
     "H3": {
@@ -90,7 +91,9 @@
         "api_spec[].response_items[].no",
         "api_spec[].response_items[].display_name",
         "api_spec[].response_items[].data_type",
-        "api_spec[].response_items[].type"
+        "api_spec[].response_items[].type",
+        "api_spec[].src",
+        "api_spec[].response_items[].src"
       ]
     },
     "H4": {

@@ -2483,16 +2483,16 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
     const rows = dbOp.where.map(w => [
       w.and_or || '', withPhysical(w.logical_table, 'table', maps),
       withPhysical(w.logical_column, 'column', maps, w.logical_table),
-      w.operator || '', w.param_no || '', w.param_name || ''
+      w.operator || '', w.value || '', w.param_no || '', w.param_name || '' // fallback-ok: 旧版の中間 JSON には value が無いので空欄で描く
     ]);
     blocks.push(new Paragraph({
       children: [new TextRun({ text: '  ▸ 抽出条件', font: FONT_BODY, size: SIZE_BODY, bold: true })],
       spacing: { before: 40, after: 30 }
     }));
     blocks.push(buildTable(
-      ['AND/OR', 'テーブル', '列', '条件', 'param#', 'パラメータ'],
+      ['AND/OR', 'テーブル', '列', '条件', '値', 'param#', 'パラメータ'],
       rows,
-      [1, 3, 3, 1, 1, 3]
+      [1, 3, 3, 1, 3, 1, 3]
     ));
   }
   // insert_values
