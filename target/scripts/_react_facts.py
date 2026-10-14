@@ -111,6 +111,7 @@ def _promise_chain(b, setters):
         "in_finally": [f"{st}={v}" for a in parts["finally"] for st, v in _set_calls(a, setters)],
         "untouched_on_failure": [s for s in succ if s not in fail],
         "failure_text": fails[0][1] if fails else "",
+        "failure_state": fails[0][0] if fails else "",
         "start": m.start(),
         "end": stop,
     }
@@ -143,6 +144,7 @@ def _try_chain(b, setters):
         "in_finally": [f"{st}={v}" for st, v in _set_calls(fin_body, setters)],
         "untouched_on_failure": [s for s in succ if s not in fail],
         "failure_text": fails[0][1] if fails else "",
+        "failure_state": fails[0][0] if fails else "",
         "start": tm.start(),
         "end": end,
     }
@@ -190,7 +192,7 @@ def extract(links, sources):
             seen.add(key)
             entry = {"event": code}
             for k in ("call", "before_call", "on_success", "on_failure", "in_finally",
-                      "untouched_on_failure", "failure_text"):
+                      "untouched_on_failure", "failure_text", "failure_state"):
                 entry[k] = f[k]
             entry["src"] = src
             out.append(entry)
@@ -198,7 +200,7 @@ def extract(links, sources):
 
 
 _EFFECT = re.compile(r"\buseEffect\s*\(")
-_EFFECT_ARGS = re.compile(r"([\s\S]*?)\s*,\s*\[[^\]]*\]\s*,?\s*$")
+_EFFECT_ARGS = re.compile(r"([\s\S]*?)\s*,\s*\[([^\]]*)\]\s*,?\s*$")
 _IDENT_ONLY = re.compile(r"[A-Za-z_$][\w$]*")
 
 
@@ -233,7 +235,7 @@ def _effect_groups(p, text, api_names):
             body = text[bo:_end(text, bo) + 1]
         calls = _uniq([n for n in _CALL.findall(body) if n in api_names])
         if calls:
-            out.append({"calls": calls, "body": body, "src": _line_span(p, text, body)})
+            out.append({"calls": calls, "body": body, "deps": am.group(2).strip(), "src": _line_span(p, text, body)})
     return out
 
 
@@ -295,6 +297,97 @@ def add_fetch_order_step(steps, plan):
     return True
 
 
+def initial_fetches(sources, api_names):
+    """初期表示で起動する useEffect ごとの API 呼出を {"initial_fetches": [...]} で返す。
+
+    呼出元: extract_react_draft.main()。意味合い: 「初期表示で何の API を呼ぶか」を一覧にして、EV00 の発火(mount)と
+    backend_call の漏れを verify 側が突き合わせる土台にする。effect は出現順の番号、deps は useEffect の依存配列の原文。
+    api_names に無い呼出は出さない(fetch_plan と同じ。推測で足さない)。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix in (".tsx", ".jsx"):
+            for gi, g in enumerate(_effect_groups(p, Path(p).read_text(encoding="utf-8"), set(api_names)), 1):
+                out += [{"call": c, "effect": gi, "deps": g["deps"], "src": g["src"]} for c in g["calls"]]
+    return {"initial_fetches": out}
+
+
+_USESTATE = re.compile(r"\bconst\s*\[\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\s*\]\s*=\s*useState\b")
+_LITERAL_INIT = re.compile(r"""true|false|null|undefined|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[\s*\]""")
+_FN_DEF = re.compile(r"\b(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\()")
+
+
+def _type_end(text, i):
+    """text[i] の `<`(useState の型引数)に対応する `>` の位置を返す。`=>` の `>` は数えない。無ければ i。"""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "<":
+            depth += 1
+        elif text[j] == ">" and text[j - 1] != "=":
+            depth -= 1
+            if depth == 0:
+                return j
+    return i
+
+
+def _today_fns(text):
+    """本体が new Date( と toISOString を使う関数名 → 基準の時差の説明を返す(日付を作る関数の見分け)。"""
+    out = {}
+    for m in _FN_DEF.finditer(text):
+        bo = text.find("{", m.end())
+        if bo < 0:
+            continue
+        body = text[bo:_end(text, bo) + 1]
+        if "new Date(" in body and "toISOString" in body:
+            om = re.search(r"Date\.now\(\)\s*\+\s*(\d+)\s*\*\s*3600\s*\*\s*1000", body)
+            out[m.group(1) or m.group(2)] = f"UTC+{om.group(1)}時間" if om else "UTC"
+    return out
+
+
+def _readable_init(expr, today):
+    """初期値の式を、日付を作る関数の呼出だけ「当月1日」「本日」の言葉に置き換えた文にする。置換が無ければ None。"""
+    r = expr
+    for n, tz in today.items():
+        e = re.escape(n)
+        r = re.sub(e + r"\(\)\.slice\(\s*0\s*,\s*8\s*\)\s*\+\s*\"01\"", f"当月1日({tz}基準)", r)
+        r = re.sub(e + r"\(\)\.slice\(\s*0\s*,\s*7\s*\)", f"当月(yyyy-mm、{tz}基準)", r)
+        r = re.sub(e + r"\(\)", f"本日({tz}基準)", r)
+    return r if r != expr else None
+
+
+def state_initials(sources):
+    """useState ごとの初期値を {"state_initials": [...]} で返す(状態名・setter・原文・リテラルか式か・読める説明・結ぶ画面項目)。
+
+    呼出元: extract_react_draft.main()。意味合い: 「初期表示の項目が全部 Blank」と書く誤りを止めるため、
+    画面項目(bind=state)の初期値をソースの useState から機械で出す。kind: literal(true/false/数値/文字列/null/[])/ expression(それ以外)/ none(引数なし)。
+    readable は expression の中の日付関数の呼出を「当月1日」「本日」に言い換えた文(言い換えが無ければ None)。
+    bound は value/checked でその state を束ねた入力要素(jsx_elements)の id・label・item_type_hint。
+    """
+    items = {}
+    for g in jsx_elements(sources)["jsx_elements"]:
+        if g.get("bind"):
+            items.setdefault(g["bind"], []).append({k: g[k] for k in ("id", "label", "item_type_hint")})
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        today = _today_fns(text)
+        for m in _USESTATE.finditer(text):
+            i = m.end()
+            if text[i:i + 1] == "<":
+                i = _type_end(text, i) + 1
+            if text[i:i + 1] != "(":
+                continue
+            e = _end(text, i)
+            raw = text[i + 1:e].strip()
+            kind = "none" if not raw else "literal" if _LITERAL_INIT.fullmatch(raw) else "expression"
+            out.append({"state": m.group(1), "setter": m.group(2), "initial": raw, "kind": kind,
+                        "readable": _readable_init(raw, today) if kind == "expression" else None,
+                        "bound": items.get(m.group(1), []), "src": [_line_span(p, text, text[m.start():e + 1])]})
+    return {"state_initials": out}
+
+
 _RACE_GUARD = re.compile(r"\bAbortController\b|\w*(?:reqId|requestId|stale)\w*|\+\+\s*\w+\.current\b", re.IGNORECASE)
 
 
@@ -354,6 +447,73 @@ def _split_top(s):
     return parts
 
 
+_JOIN = re.compile(r'(\w+|\])\s*\.join\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
+_LINE_FN = re.compile(r"const\s+(\w+)\s*=\s*\((\w+)\s*(?::[^,)]*)?,[^)]*\)\s*=>\s*\[")
+
+
+def _top_colon(s):
+    """s の深さ0・文字列の外にある最初の `:`(三項の else 側の手前)の位置。無ければ -1。"""
+    depth, quote = 0, None
+    for i, c in enumerate(s):
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ":" and depth == 0:
+            return i
+    return -1
+
+
+def _csv_col(el, rp, qn):
+    """行の配列の要素 el を1列の事実にする。rp は行の仮引数名(null なら合計行)、qn は引用符で包む関数名。
+
+    kind: ternary(`rp ? 通常行の値 : 合計行の値`)/ same(両行で同じ式)/ spread(`...` で複数列を展開。合計行は agg に合計を渡して同じ式)。
+    """
+    quoted = bool(qn) and el.startswith(qn + "(")
+    if el.startswith("..."):
+        return {"kind": "spread", "expr": el[:160], "quoted": False}
+    # WHY: 合計行は同じ行の関数に null を渡して呼ぶため、列の式は「行の値」と「合計の値」の2枝に分かれる。両方を出さないと合計行の列が読めない
+    m = re.search(rf"\b{re.escape(rp)}\s*\?\s*", el)
+    if not m:
+        return {"kind": "same", "expr": el[:160], "quoted": quoted}
+    rest = el[m.end():]
+    c = _top_colon(rest)
+    if c < 0:
+        return {"kind": "same", "expr": el[:160], "quoted": quoted}
+    tail = rest[c + 1:]
+    return {"kind": "ternary", "expr": el[:160], "quoted": quoted, "row_value": rest[:c].strip(),
+            "total_value": tail[:_expr_end(tail, 0)].strip()}
+
+
+def _csv_rows(text, body, qn):
+    """行を作る関数(`const line = (r, agg) => [ … ].join(sep)`)と、それを呼ぶ lines の元の配列・合計行の呼出を読む。無ければ None。"""
+    lm = _LINE_FN.search(body)
+    if not lm:
+        return None
+    ln, rp = lm.group(1), lm.group(2)
+    ao = lm.end() - 1
+    ae = _end(body, ao)
+    jm = re.match(r'\s*\.join\(\s*"((?:[^"\\]|\\.)*)"\s*\)', body[ae + 1:])
+    # WHY: 行の元の配列が state そのものか絞り込み後の派生値かで、CSV の行数と中身が変わる。画面の表示切替(showDead 等)が CSV に効くかを読めるよう、派生の有無を出す
+    src = re.search(rf"const\s+(\w+)\s*=\s*(\w+)\.map\(\s*\(\w+(?:\s*,\s*\w+)?\)\s*=>\s*{re.escape(ln)}\(", body)
+    out = {"function": ln, "row_param": rp, "value_separator": jm.group(1) if jm else None,
+           "columns": [_csv_col(el, rp, qn) for el in _split_top(body[ao + 1:ae])]}
+    if src:
+        sm = re.search(rf"\bconst\s+{re.escape(src.group(2))}\s*=\s*useMemo\(\s*\(\)\s*=>\s*(\w+)\.(filter|slice|sort)\b", text)
+        out["rows_array"] = {"name": src.group(2), "derived_from": sm.group(1) if sm else None,
+                             "op": sm.group(2) if sm else None, "filtered": bool(sm and sm.group(2) == "filter")}
+    pm = re.search(rf"(\w+)\.push\(\s*{re.escape(ln)}\(\s*null\s*,\s*(\w+)", body)
+    if pm:
+        tm = re.search(rf"\bconst\s+{re.escape(pm.group(2))}\s*=\s*useMemo\(\s*\(\)\s*=>\s*(.+?),\s*\[", text)
+        out["total_call"] = {"lines": pm.group(1), "agg_arg": pm.group(2), "agg_expr": tm.group(1) if tm else None}
+    return out
+
+
 def _csv_one(p, text, name_idx_body, codes):
     """exportCsv 形の関数1件(本体 body)から CSV の書式の事実を読む。拾えない欄は空・None のまま出す。"""
     name, body, src = name_idx_body
@@ -385,6 +545,11 @@ def _csv_one(p, text, name_idx_body, codes):
     fn["header"] = {"fixed": fixed, "spread": spread}
     tm = re.search(r"if\s*\(([^\n]*?)\)\s*lines\.push\(", body)
     fn["total_row"] = {"when": tm.group(1).strip()} if tm else None
+    # WHY: join の区切りは CSV の見た目(値の中の区切り・列・行)を決める。モデルに書かせると取り違えるので、join の対象と区切りを機械で出す
+    # 追加の事実: 各 join の区切り・値の区切り・行の元の配列(表示の絞り込み前か後か)・合計行の各列の値
+    fn["joins"] = [{"target": "[…]" if m.group(1) == "]" else m.group(1), "separator": m.group(2)}
+                   for m in _JOIN.finditer(body)]
+    fn["row_builder"] = _csv_rows(text, body, qm.group(1) if qm else None)
     fn["src"] = [src] if src else []
     return fn
 
@@ -1073,6 +1238,63 @@ def selftest_fetch_plan():
     return 0
 
 
+def selftest_initials():
+    """state_initials(リテラル・式・読める説明・結ぶ項目)、initial_fetches、csv の row_builder(区切り・元の配列・合計行)を最小の TSX で assert する。"""
+    tsx = (
+        "function todayJst() {\n"
+        "  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);\n"
+        "}\n"
+        "export default function S() {\n"
+        "  const [from, setFrom] = useState(todayJst().slice(0, 8) + \"01\");\n"
+        "  const [to, setTo] = useState(todayJst());\n"
+        "  const [sid, setSid] = useState<number | \"\">(\"\");\n"
+        "  const [rows, setRows] = useState<Row[]>([]);\n"
+        "  const w = useMemo(() => rows.filter((r) => r.days > 0), [rows]);\n"
+        "  const total = useMemo(() => sumAggs(rows), [rows]);\n"
+        "  useEffect(() => {\n"
+        "    fetchX().then((d) => setRows(d.rows)).catch((e) => setError(String(e)));\n"
+        "  }, []);\n"
+        "  const exportCsv = () => {\n"
+        "    const q = (v: unknown) => `\"${String(v ?? \"\")}\"`;\n"
+        "    const line = (r: Row | null, agg: Agg) =>\n"
+        "      [\n"
+        "        applied.from,\n"
+        "        q(r ? r.name : \"合計\"),\n"
+        "        r ? r.days : \"\",\n"
+        "        q(r ? r.dates.join(\" \") : \"\"),\n"
+        "      ].join(\",\");\n"
+        "    const lines = w.map((r, i) => line(r, aggs[i]));\n"
+        "    if (w.length > 1) lines.push(line(null, total));\n"
+        "    const blob = new Blob([[\"a\", ...lines].join(\"\\r\\n\")], { type: \"text/csv\" });\n"
+        "  };\n"
+        "  return <input type=\"date\" value={from} onChange={a} />;\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            si = {s["state"]: s for s in state_initials([p])["state_initials"]}
+            fe = initial_fetches([p], ["fetchX"])["initial_fetches"]
+            cv = csv_exports([], [p])["csv_exports"][0]
+        assert si["from"]["kind"] == "expression" and si["from"]["readable"] == "当月1日(UTC+9時間基準)", si["from"]
+        assert si["to"]["readable"] == "本日(UTC+9時間基準)" and si["from"]["bound"][0]["item_type_hint"] == "Calendar", si
+        assert si["sid"]["kind"] == "literal" and si["sid"]["initial"] == '""' and si["rows"]["initial"] == "[]", si
+        assert [(f["call"], f["deps"]) for f in fe] == [("fetchX", "")], fe
+        rb = cv["row_builder"]
+        assert rb["value_separator"] == "," and rb["rows_array"] == {"name": "w", "derived_from": "rows", "op": "filter", "filtered": True}, rb
+        assert rb["total_call"]["agg_expr"] == "sumAggs(rows)", rb
+        c = rb["columns"]
+        assert [x["kind"] for x in c] == ["same", "ternary", "ternary", "ternary"], c
+        assert c[1]["total_value"] == '"合計"' and c[1]["quoted"] and c[2]["total_value"] == '""' and not c[2]["quoted"], c
+        assert {"target": "dates", "separator": " "} in cv["joins"] and {"target": "[…]", "separator": ","} in cv["joins"], cv["joins"]
+    except AssertionError as e:
+        print(f"[selftest NG] initials/csv_rows {e}")
+        return 1
+    print("[selftest OK] _react_facts.state_initials/initial_fetches/csv_rows")
+    return 0
+
+
 def selftest():
     """promise chain と try/catch の2形を最小の TSX で試し、失敗時の state と行番号を assert する。終了コード 0=OK / 1=NG。"""
     tsx = (
@@ -1112,7 +1334,7 @@ def selftest():
         assert a["call"] == "fetchX" and a["before_call"] == ["loading=true", "error=null"], f"before/call: {a}"
         assert a["on_success"] == ["rows"] and a["on_failure"] == ["error"], f"on_success/on_failure: {a}"
         assert a["in_finally"] == ["loading=false"] and a["untouched_on_failure"] == ["rows"], f"finally/untouched: {a}"
-        assert a["failure_text"] == "String(e)", f"failure_text: {a}"
+        assert a["failure_text"] == "String(e)" and a["failure_state"] == "error", f"failure_text: {a}"
         assert a["src"] == [{"file": str(p), "line_start": 8, "line_end": 8}], f"src(chain): {a['src']}"
         assert b["call"] == "fetchY" and b["on_failure"] == ["error"] and b["untouched_on_failure"] == ["rows"], f"try: {b}"
         assert b["in_finally"] == ["loading=false"], f"try finally: {b}"
@@ -1127,6 +1349,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)

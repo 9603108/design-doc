@@ -668,6 +668,9 @@ def main(argv=None):
     plan = _react_facts.fetch_plan(sources, api_names)
     if plan:
         draft["events"][0]["fetch_plan"] = plan
+    # 目的: 初期表示で呼ぶ API の一覧(initial_fetches)と、useState の初期値・結ぶ画面項目(state_initials)を下書きに足す。接続: _react_facts.initial_fetches / state_initials
+    draft.update(_react_facts.initial_fetches(sources, api_names))
+    draft.update(_react_facts.state_initials(sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
     draft["continuous_operation"] = _continuous_ops(links, sources)
