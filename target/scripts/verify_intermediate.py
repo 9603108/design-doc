@@ -1518,6 +1518,12 @@ def _resolve_src_file(file: str, project_root: str):
     return None
 
 
+def _tsx_src_of(item: dict) -> list:
+    """項目の出典のうち TSX/JSX の行範囲だけを返す。
+    WHY(round12 V2): 「画面が TSX か」と「項目が位置で結べる出典を持つか」を同じ読み方で判定するため、1か所にまとめる。"""
+    return [s for s in item.get("src") or [] if isinstance(s, dict) and str(s.get("file") or "").endswith((".tsx", ".jsx"))]
+
+
 def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> list:
     """B16 差異6 (2026-10-14): 初期処理の活性・表示を、画面項目の出典（src の TSX の行範囲）から再評価して検査する。
 
@@ -1542,11 +1548,17 @@ def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> li
                     [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)])
     root = sc.get("project_root") or "."
     missing = []
+    # V2 (round12): 画面が TSX か（どれかの項目が TSX/JSX の出典を持つか）。HTML・サンプルの画面は従来どおり出典の無い項目を読み飛ばす
+    tsx_screen = any(_tsx_src_of(sl) for sl in sl_items)
     for ini, sl in zip(init_items, sl_items):
         name = str(sl.get("item_name") or "").strip()
+        srcs = _tsx_src_of(sl)
+        # WHY(round12 V2): TSX 画面の項目で出典が無いものは、位置で結べず仮埋め（活性・表示）になる。読み飛ばすと誤った表示条件が docx まで出るため、名前の一致に関係なく止める
+        if tsx_screen and not srcs:
+            issues.append(("ERROR", f"screen_layout.items[{sl.get('no') or '?'}]({name}): 出典(src)が無く、初期表示の活性・表示を位置で結べない（仮埋めの表示になる）。読んだ範囲 {{file,line_start,line_end}} を書く → 差し戻し先 S1"))
+            continue
         if str(ini.get("item_name") or "").strip() != name:
             continue
-        srcs = [s for s in sl.get("src") or [] if isinstance(s, dict) and str(s.get("file") or "").endswith((".tsx", ".jsx"))]
         if not srcs:
             continue
         s = srcs[0]
@@ -1574,6 +1586,29 @@ def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> li
             issues.append(("ERROR", f"initialization.items[{no}]({name}): 表示の記載「{ini.get('visible')}」が表示条件の評価（{'表示' if vis else '非表示'}）と違う。{where} の表示条件に合わせる"))
     for f in missing:
         issues.append(("INFO", f"initialization.items の表示条件を検査できない（TSX が読めない）: {f}"))
+    return issues
+
+
+def check_initialization_dup(merged: dict) -> list:
+    """B16 round12 V2 (新11 の検査): 初期値に別の項目の初期値が含まれる項目を ERROR にする。
+
+    判定ルール:
+      initialization.items の i≠j で、j の初期値が 12 字以上・Blank でなく、i の初期値に含まれ、
+      かつ i の初期値の方が長いとき、i を ERROR（差し戻し先 S1）。同じ文言の2項目は重複とみなさない。
+    WHY: 出典の行範囲が兄弟の項目の文言まで取ると、初期値に別の項目の文言が重複して入る（round12 の IT61・IT62 で再現）。
+         12 字未満の語は別の文言に偶然含まれやすいので見ない。
+    接続情報: 入力 = merged['initialization']['items'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    items = (merged.get("initialization") or {}).get("items") or []
+    vals = [str(i.get("initial_value") or "").strip() for i in items]
+    for a, ia in enumerate(items):
+        va = vals[a]
+        for b, ib in enumerate(items):
+            vb = vals[b]
+            if a == b or len(vb) < 12 or vb == "Blank" or len(vb) >= len(va) or vb not in va:
+                continue
+            issues.append(("ERROR", f"initialization.items[{ia.get('no') or '?'}]({str(ia.get('item_name') or '').strip()}): 初期値に項目 {ib.get('no') or '?'}({str(ib.get('item_name') or '').strip()}) の初期値が含まれる（出典の範囲が兄弟の項目の文言まで取っている）→ 差し戻し先 S1（出典の行範囲を、その項目の文言だけに直す）"))
     return issues
 
 
@@ -1784,7 +1819,48 @@ def _selftest() -> int:
         if [lvl for lvl, _ in check_initialization_eval(unlinked, {}, drafts_loading)] != ["ERROR"]:
             print("[selftest NG] 出典の位置で結べない項目を ERROR にしない（仮埋めのまま通した）")
             return 1
-    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)")
+    # B16 round12 V2: TSX 画面で出典(TSX/JSX)の無い項目は位置で結べないので、読み飛ばさず ERROR（差し戻し先 S1）。
+    # TSX の出典が1つも無い画面（HTML・サンプル）は従来どおり読み飛ばす
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx2 = Path(tmp) / "v2.tsx"
+        tsx2.write_text("export default function P() {\n  return (\n    <div>\n"
+                        "      {loading && <p>読込中</p>}\n"
+                        "    </div>\n  );\n}\n", encoding="utf-8")
+        drafts_v2 = [{"state_initials": [{"state": "loading", "kind": "literal", "initial": "false"}]}]
+        mixed = {"screen_layout": {"items": [
+            {"no": "IT1", "item_name": "読込中", "src": [{"file": str(tsx2), "line_start": 4, "line_end": 4}]},
+            {"no": "IT2", "item_name": "総売上", "item_type": "Label"}]},
+            "initialization": {"items": [
+                {"no": 1, "item_name": "読込中", "active": "活性", "visible": "非表示"},
+                {"no": 2, "item_name": "総売上", "active": "活性", "visible": "表示"}]}}
+        v2_errs = [m for lvl, m in check_initialization_eval(mixed, {}, drafts_v2) if lvl == "ERROR"]
+        if not (len(v2_errs) == 1 and "総売上" in v2_errs[0] and "出典(src)が無く" in v2_errs[0]):
+            print(f"[selftest NG] TSX 画面で出典の無い項目を ERROR にしない: {v2_errs}")
+            return 1
+        tsx_free = {"screen_layout": {"items": [{"item_name": "総売上", "item_type": "Label"}]},
+                    "initialization": {"items": [{"no": 1, "item_name": "総売上", "active": "活性", "visible": "表示"}]}}
+        if check_initialization_eval(tsx_free, {}, drafts_v2):
+            print("[selftest NG] TSX の出典が1つも無い画面（HTML・サンプル）を ERROR にした")
+            return 1
+    # B16 round12 V2 (新11): 初期値に別の項目の文言が含まれるものは ERROR（含む側だけ）。同じ文言の2項目と、12字未満の語は見ない
+    dup_long = "この期間・店舗のPOS会計データはありません。0店だけなので表示できません。"
+    dup_bad = {"initialization": {"items": [
+        {"no": 61, "item_name": "注記", "initial_value": dup_long},
+        {"no": 62, "item_name": "説明", "initial_value": "0店だけなので表示できません。"}]}}
+    dup_errs = [m for lvl, m in check_initialization_dup(dup_bad) if lvl == "ERROR"]
+    if not (len(dup_errs) == 1 and "注記" in dup_errs[0] and "説明" in dup_errs[0]):
+        print(f"[selftest NG] 初期値に兄弟の文言が含まれるのを ERROR にしない: {dup_errs}")
+        return 1
+    dup_same = {"initialization": {"items": [
+        {"no": 1, "item_name": "注記A", "initial_value": dup_long},
+        {"no": 2, "item_name": "注記B", "initial_value": dup_long}]}}
+    dup_short = {"initialization": {"items": [
+        {"no": 1, "item_name": "注記", "initial_value": dup_long},
+        {"no": 2, "item_name": "語", "initial_value": "表示できません。"}]}}
+    if check_initialization_dup(dup_same) or check_initialization_dup(dup_short):
+        print("[selftest NG] 同じ文言の2項目、または12字未満の語を重複として ERROR にした")
+        return 1
+    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)・出典の無い項目・初期値の重複")
     return 0
 
 
@@ -1887,6 +1963,8 @@ def main():
     all_issues.extend(check_common_logic_callers(merged))
     # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価して照合する
     all_issues.extend(check_initialization_eval(merged, sc, _load_react_drafts()))
+    # B16 round12 V2: 初期値に別の項目の文言が重複して入るもの（出典の範囲が兄弟の文言まで取った）を止める
+    all_issues.extend(check_initialization_dup(merged))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]
