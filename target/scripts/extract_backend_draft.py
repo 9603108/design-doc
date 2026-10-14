@@ -228,7 +228,7 @@ def _conds(sql, m, depth, s, e, real, main):
     for sep, txt, _ in items:
         cm = _COND.match(txt)
         if not cm:  # 形の分からない条件は列を空のまま、文だけ残す
-            rows.append({"and_or": sep, "logical_table": "", "logical_column": "", "operator": "", "param_no": "", "param_name": "", "expression": txt})
+            rows.append({"and_or": sep, "text": txt, "logical_table": "", "logical_column": "", "operator": "", "param_no": "", "param_name": "", "expression": txt})
             continue
         tbl, col = _colref(cm.group(1), real, main)
         # BETWEEN の右辺は「A AND B」の2つの値。それ以外は右辺の1つの値。プレースホルダは param# と名前にする
@@ -246,7 +246,7 @@ def _conds(sql, m, depth, s, e, real, main):
                 vals.append(nm or "?")
             else:
                 vals.append(p.strip())
-        rows.append({"and_or": sep, "logical_table": tbl, "logical_column": col, "operator": op,
+        rows.append({"and_or": sep, "text": txt, "logical_table": tbl, "logical_column": col, "operator": op,
                      "param_no": ",".join(pnos), "param_name": ", ".join(pnames),
                      "value": " AND ".join(vals) if op == "BETWEEN" else (vals[0] if vals else "")})
     return rows
@@ -310,23 +310,90 @@ def _clauses(sql):
     return out
 
 
+def _when_text(test):
+    """if の条件式を、行に付ける when の文にする(B1)。X → 「X が指定されたとき」、not X → 「X が未指定のとき」、他は「条件: 式」。"""
+    if isinstance(test, ast.Name):
+        return f"{test.id} が指定されたとき"
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Name):
+        return f"{test.operand.id} が未指定のとき"
+    return "条件: " + ast.unparse(test)
+
+
 def _local_lists(fn, env):
-    """関数の中で組む文字列の並び(where = ["a", ...]; where.append("b"))を {名前: [文字列]} にする。
+    """関数の中で組む文字列の並び(where = ["a", ...]; where.append("b"))を {名前: [(文字列, when か None)]} にする。
     f 文字列の {' AND '.join(where)} を評価できるようにするため。要素が表せなければ X(構造だけ保つ)。
+    when: append が if の中(body)なら、囲む if の条件の文(_when_text)。else 側なら「条件: not (式)」。囲む if が無ければ None(無条件)。
     ponytail: 条件付きの append も全部足す(分岐は見ない)。WHERE の候補を全部出す側に倒す。"""
     def one(e):  # 文字列の式か、モジュール定数の名前(LIVE = "..." 等)
         v = env.get(e.id) if isinstance(e, ast.Name) else _render(e, env, True)
         return v if isinstance(v, str) else "X"
 
+    def whens(n):  # n を囲む if の条件を「かつ」で連ねる。body に居れば条件そのまま、orelse に居れば否定
+        out = []
+        for i in ast.walk(fn):
+            if not isinstance(i, ast.If):
+                continue
+            if any(x is n for b in i.body for x in ast.walk(b)):
+                out.append(_when_text(i.test))
+            elif any(x is n for b in i.orelse for x in ast.walk(b)):
+                out.append("条件: not (" + ast.unparse(i.test) + ")")
+        return " かつ ".join(out) or None
+
     lists = {}
     for n in ast.walk(fn):
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.List):
-            lists[n.targets[0].id] = [one(e) for e in n.value.elts]
+            lists[n.targets[0].id] = [(one(e), None) for e in n.value.elts]
     for n in ast.walk(fn):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
                 and isinstance(n.func.value, ast.Name) and n.func.value.id in lists and n.args):
-            lists[n.func.value.id].append(one(n.args[0]))
+            lists[n.func.value.id].append((one(n.args[0]), whens(n)))
     return lists
+
+
+def _cond_map(lists):
+    """_local_lists の結果から、条件付きの断片の {正規化した字面: when} を作る(_conds の行と突き合わせる)。"""
+    return {" ".join(t.split()): w for v in lists.values() for t, w in v if w}
+
+
+def _mark_conditional(cl, conds):
+    """句の結果(_clauses の戻り)の where 行のうち、条件付きの断片と字面が同じ行に when を付ける(B1)。"""
+    for r in cl["where"]:
+        if r.get("text") in conds:
+            r["when"] = conds[r["text"]]
+    return cl
+
+
+def _split_conditional(defn, conds):
+    """CTE の定義文(正規化済み)から、条件付きの断片を取り除き、取り除いた断片を [{sql, when}] で返す(B1)。
+    断片は直前の AND、無ければ直後の AND、それも無ければ WHERE と一緒に外す。残りの定義が無条件の部分になる。"""
+    parts = []
+    for text, when in (conds or {}).items():
+        p = re.escape(text)
+        for pat, rep in ((r"\s+AND\s+" + p + r"(?=\s|\)|$)", ""), (r"(WHERE\s+)" + p + r"\s+AND\s+", r"\1"),
+                         (r"\s+WHERE\s+" + p + r"(?=\s|\)|$)", "")):
+            new, n = re.subn(pat, rep, defn, count=1, flags=re.IGNORECASE)
+            if n:
+                defn = new
+                parts.append({"sql": text, "when": when})
+                break
+    return defn, parts
+
+
+def _table_aliases(sql):
+    """本体の SQL の別名 → 実表({別名: 実表})。別名と実表が同じものは除く(B1。H2 の別名を実表へ解く材料)。"""
+    alias, real = _tables(_mask(sql))
+    return {a: real(a) for a in alias if real(a) != a}
+
+
+def _find_nows(flat, call):
+    """空白を無視して call を flat から探す。(開始, 終了) を flat の位置で返す。無ければ (-1, -1)(B1。改行・CASE・ORDER BY を含む集計の別名探索に使う)。"""
+    keep = [i for i, ch in enumerate(flat) if not ch.isspace()]
+    nows = "".join(flat[i] for i in keep)
+    key = "".join(call.split())
+    p = nows.find(key)
+    if p < 0:
+        return -1, -1
+    return keep[p], keep[p + len(key) - 1] + 1
 
 
 def _merge(acc, got):
@@ -390,7 +457,8 @@ def _merge_scenarios(acc, per, labels):
         rows = [r for p in per for r in p[k]]
         for r in rows:
             where = [labels[i] for i, p in enumerate(per) if r in p[k]]
-            row = r if len(where) == len(per) else {**r, "when": " / ".join(where)}
+            scen = "" if len(where) == len(per) else " / ".join(where)  # 通りの when と、条件付き断片の when(_mark_conditional)を連ねる(B1)
+            row = {**r, "when": " かつ ".join(x for x in (scen, r.get("when", "")) if x)} if (scen or r.get("when")) else r
             if row not in acc[k]:
                 acc[k].append(row)
 
@@ -796,7 +864,7 @@ def _top_has(m, kw):
     return False
 
 
-def _subqueries(sql):
+def _subqueries(sql, conds=None):
     """SQL の WITH の CTE と、CTE 以外の括弧つき副問合せを返す。(ctes, subqueries)。
     ctes: {name, definition, from(最初の FROM の表の書き), filtered(深さ 0 に WHERE があるか)}
     subqueries: {location(SELECT/FROM/JOIN/WHERE/HAVING/ON のどの句の中か), definition, filtered}
@@ -813,7 +881,8 @@ def _subqueries(sql):
         a, b = _body(m, o)
         f = _FROM_TBL.search(m, a, b)
         cte_opens.add(o)
-        ctes.append({"name": c.group(1), "definition": " ".join(sql[a:b].split()), "from": f.group(1) if f else "",
+        defn, parts = _split_conditional(" ".join(sql[a:b].split()), conds)  # 条件付きの断片は定義から外し、conditional_parts に持つ(B1)
+        ctes.append({"name": c.group(1), "definition": defn, "conditional_parts": parts, "from": f.group(1) if f else "",
                      "filtered": _top_has(m[a:b], "WHERE")})
     subs = []
     for t in re.finditer(r"\(\s*SELECT\b", m, re.IGNORECASE):
@@ -849,9 +918,9 @@ def _agg_units(sql, feats):
                 scope, body = "subquery " + sub["location"], sub["definition"]
         if alias is None:
             # array_remove(array_agg(..)) AS x のように集計が式の中に入っているとき、外側の式の別名を補う。取れなければ空文字(別名なしを None と区別して単位の取り違えを防ぐ)
-            i = flat.find(call)
+            i, call_end = _find_nows(flat, call)  # 空白の違い(改行・ORDER BY・CASE)を無視して集計の位置を取る(B1)
             alias, depth = "", 0
-            for k in range(i + len(call), len(flat)) if i >= 0 and not scope.startswith("subquery") else ():
+            for k in range(call_end, len(flat)) if i >= 0 and not scope.startswith("subquery") else ():
                 depth += (flat[k] == "(") - (flat[k] == ")")
                 if depth < 0 and flat[k] == ")":  # 外側の式を閉じる括弧の直後に AS があれば、それが式全体の別名
                     am = re.match(r"\s*(?:::\w+\s*)?AS\s+(\w+)", flat[k + 1:], re.IGNORECASE)
@@ -1067,7 +1136,9 @@ def extract(files, hints=None):
                 clauses = {k: [] for k in _CLAUSE_KEYS}
                 clo = _closure(tm, fn, mods)
                 for m2, f2 in clo:
-                    scens = _scenarios(f2, {**m2.env(), **_local_lists(f2, m2.env())})
+                    lists = _local_lists(f2, m2.env())  # 条件付きの append は断片ごとの when を持つ(B1)
+                    cond_map = _cond_map(lists)
+                    scens = _scenarios(f2, {**m2.env(), **{k: [t for t, _ in v] for k, v in lists.items()}})
                     env = scens[0][1]  # 句以外(列・出典・エラー)は最初の通りで組む。句だけ全部の通りで取る
                     parts = set()  # f 文字列・+ 連結の部品。親の _render が一括で組むので単独では拾わない
                     for s in ast.walk(f2):
@@ -1078,17 +1149,17 @@ def extract(files, hints=None):
                             continue
                         sql = _render(s, env, True) if isinstance(s, (ast.JoinedStr, ast.Constant, ast.BinOp)) else None
                         if sql and _SQL_HEAD.match(sql):
-                            _merge_scenarios(clauses, [_clauses(_render(s, e, True)) for _, e in scens], [l for l, _ in scens])
+                            _merge_scenarios(clauses, [_mark_conditional(_clauses(_render(s, e, True)), cond_map) for _, e in scens], [l for l, _ in scens])
                             frm, cols = _columns(sql, hints.get("ddl") or {}, unresolved, action)
                             feats = _features(sql, _mask(sql))
-                            ctes, subs = _subqueries(sql)
+                            ctes, subs = _subqueries(sql, cond_map)
                             # 集計の単位は通りごとに出して重ねる(分岐で GROUP BY が変わると単位も変わる。最初の通りだけでは取り違える)
                             per_aggs = []
                             for lab, e2 in scens:
                                 q = _render(s, e2, True)
                                 per_aggs.append((lab, _agg_units(q, _features(q, _mask(q)))))
                             ops.append({"from": frm, "columns": _candidates(cols, hints), "features": feats, "ctes": ctes, "subqueries": subs,
-                                        "aggregate_units": _merge_aggs(per_aggs), "src": [_src(m2, s)]})
+                                        "aggregate_units": _merge_aggs(per_aggs), "table_aliases": _table_aliases(sql), "src": [_src(m2, s)]})
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
@@ -1115,7 +1186,7 @@ def extract(files, hints=None):
                                 "response_items": [{"key": key, "src": s} for key, s in keys.items()],
                                 "error_patterns": errors, "boundaries": _boundaries(errors, clo, fn), **clauses,
                                 "features": _merge_features([o["features"] for o in ops]),
-                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "ctes": o["ctes"], "subqueries": o["subqueries"],
+                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "ctes": o["ctes"], "subqueries": o["subqueries"], "table_aliases": o["table_aliases"],
                                                      "aggregate_units": o["aggregate_units"], "src": o["src"]} for o in ops]}
     # B3: 応答項目の型(api.ts)。action ごとに response_fields を足す(型が取れない API は空)
     rf = _response_fields(hints.get("ts_files") or [])
@@ -1151,7 +1222,7 @@ def selftest():
         'def get_x(p):\n'
         '    if not p:\n        raise ValidationError("必須です")\n'
         '    _req(p)\n'
-        '    w = ["t.a = %(a)s"]\n    w.append(COND)\n'  # CTE の中で組む WHERE も where に出す(局所の並び・モジュール定数を展開)
+        '    w = ["t.a = %(a)s"]\n    w.append(COND)\n    shop = p.get("shop")\n    if shop:\n        w.append("t.c = %(shop)s")\n'  # CTE の中で組む WHERE も where に出す(局所の並び・モジュール定数を展開)
         '    sql = f"""WITH d AS (SELECT t.* FROM real_tbl t WHERE {\' AND \'.join(w)}) SELECT t.id AS x_id, {_sel()}, s.name FROM d t LEFT JOIN shops s ON s.id=t.id"""\n'
         '    return {"rows": sql, "n": 1}\n'
         'def get_y(p):\n    _req("日付")\n'  # CTE の連鎖(t → k → 実表)は実表へ、FROM が動的な CTE は unresolved へ
@@ -1205,7 +1276,16 @@ def selftest():
     gx = r["apis"]["get_x"]
     assert {"type": "LEFT JOIN", "logical_table": "shops", "condition": "s.id=t.id"} in gx["joins"], gx["joins"]
     assert {"alias": "a", "expression": "SUM(t.a)"} in gx["aliases"], gx["aliases"]
-    assert [(w["logical_table"], w["logical_column"], w["operator"]) for w in gx["where"]] == [("real_tbl", "a", "="), ("real_tbl", "b", "IS")], gx["where"]
+    assert [(w["logical_column"], w["operator"], w.get("when")) for w in gx["where"]] == [("a", "=", None), ("b", "IS", None), ("c", "=", "shop が指定されたとき")], gx["where"]
+    # B1: 条件付きの断片は CTE の定義から外して conditional_parts に持つ。表の別名は実表へ解ける
+    cte = gx["db_operations"][0]["ctes"][0]
+    assert cte["conditional_parts"] == [{"sql": "t.c = %(shop)s", "when": "shop が指定されたとき"}] and cte["definition"] == "SELECT t.* FROM real_tbl t WHERE t.a = %(a)s AND t.b IS NULL", cte
+    assert gx["db_operations"][0]["table_aliases"]["t"] == "real_tbl" and gx["db_operations"][0]["table_aliases"]["s"] == "shops", gx["db_operations"][0]["table_aliases"]
+    assert _when_text(ast.parse("not shop", mode="eval").body) == "shop が未指定のとき" and _split_conditional("SELECT 1 WHERE x = 1", {"x = 1": "w"}) == ("SELECT 1", [{"sql": "x = 1", "when": "w"}])
+    # B1: 改行・ORDER BY・CASE を含む array_agg でも、式の別名(warn_dates)を取る
+    nl = "SELECT s.name, array_remove(array_agg(\n  CASE WHEN p.k > 0 THEN p.d END\n  ORDER BY p.d\n), NULL) AS warn_dates FROM p JOIN s ON s.id = p.m GROUP BY s.name"
+    nu = _agg_units(nl, _features(nl, _mask(nl)))
+    assert [(u["alias"], u["func"]) for u in nu if u["func"] == "array_agg"] == [("warn_dates", "array_agg")], nu
     # 集計・ウィンドウ(C4): FILTER と OVER と ::型 と CTE の範囲を、本体と CTE の両方で取る
     fsql = "WITH d AS (SELECT count(*) FILTER (WHERE t.x <> 0) OVER (PARTITION BY t.m, t.r) AS nz FROM real_tbl t) SELECT SUM(d.nz)::bigint AS total FROM d"
     ff = _features(fsql, _mask(fsql))
