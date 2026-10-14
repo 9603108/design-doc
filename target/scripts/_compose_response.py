@@ -5,7 +5,7 @@ ORDER を 110 にする理由: 表示名の補完は論理名(_compose_db_facts.
   既定の 100 のままだと、ファイル名の順(_compose_db_facts.py が先)にしか頼れないため、順序を数で固定する。
 入力: out(compose の途中の dict)。下書きは target/intermediate の *_backend_draft.json と *_react_draft.json を読む
   (_fill_error_codes と同じ読み方)。
-書き換えるのは空の欄と未設定の欄だけ。書かれた値は触らない。
+書き換えるのは空の欄と未設定の欄だけ。ただし a) の表示名のうち、表示行の事実で決まる行(キーに [] を含み、欄名が表示行の kin・cnt に在る行)は、書かれた値があっても事実で上書きする(V3。H3 が表示行と違う名前を書いても、ここで直す)。
   a) api_spec[].response_items[].display_name が空: 画面への写し(同じ path の画面項目名が1つに決まるとき)
      → 同じ別名の列の元の列の論理名 → request_params の同名の説明、の順。どれでも決まらなければ空のまま
      (検査 B14 が H3 へ戻す)
@@ -79,13 +79,40 @@ def _request_desc(api, leaf):
     return descs.pop() if len(descs) == 1 else ""
 
 
-def _fill_display_names(out, api, draft_cols, log):
-    """response_items の display_name が空の行を、画面への写し・論理名・request の説明で補う(a)。"""
-    for x in _list(api, "response_items"):
-        if x.get("display_name"):
+def _spec_display_names(specs):
+    """表示行(react 下書きの display_rows の specs)から、応答の欄の表示名を決める {欄名: 表示名}(V3)。
+    規則: 名 = csv があれば csv、なければ label。cnt の欄は 名+「点数」、kin の欄は cnt があれば 名+「金額」、なければ 名。
+    WHY: 応答のキー順と表示行の並びは一致しない(RIGHT 配列の並びと kamoku_1〜6 の対応がずれる)。位置で対にせず、欄の名で引く。
+    同じ欄を2つ以上の表示行が指すときは決めない(推測しない)。"""
+    got = {}
+    for s in specs:
+        base = str(s.get("csv") or s.get("label") or "")
+        if not base:
             continue
+        if s.get("cnt"):
+            got.setdefault(s["cnt"], []).append(base + "点数")
+        if s.get("kin"):
+            got.setdefault(s["kin"], []).append(base + ("金額" if s.get("cnt") else ""))
+    return {k: v[0] for k, v in got.items() if len(v) == 1}
+
+
+def _fill_display_names(out, api, draft_cols, log, spec_names=None):
+    """response_items の display_name を補う。
+    a) 表示行の事実(spec_names)に当たる行(キーに [] を含み、欄名が表示行の kin・cnt に在る)は、書かれた値も事実で上書きする(V3)。
+    b) それ以外は、空の行だけを画面への写し・論理名・request の説明で補う(従来どおり)。"""
+    spec_names = spec_names or {}
+    for x in _list(api, "response_items"):
         key = x.get("key")
         leaf = _leaf(key)
+        fact = spec_names.get(leaf) if "[]" in str(key or "") else None
+        if fact:
+            old = x.get("display_name")
+            if old != fact:
+                x["display_name"] = fact
+                log.append(f"[表示名] api_spec[{api.get('action')}].response_items[{key}] の display_name を {old or '(空)'} から表示行の事実 {fact} に直す")
+            continue
+        if x.get("display_name"):
+            continue
         name = _mapped_name(api, key) or _alias_logical(out, draft_cols, leaf) or _request_desc(api, leaf)
         if name:
             x["display_name"] = name
@@ -270,11 +297,12 @@ def fill(out, log):
     """api_spec の各行を補う。下書きが無い API は、下書きの db 操作の数が 0 なので b) は動かず、a) の列の参照も空になる。"""
     from _config_loader import INTERMEDIATE_DIR
     backend, specs = _load_drafts(INTERMEDIATE_DIR)
+    names = _spec_display_names(specs)
     for api in _list(out, "api_spec"):
         bd = backend.get(api.get("action")) or {}
         dbs = [o for o in (bd.get("db_operations") or []) if isinstance(o, dict)]
         cols = [c for o in dbs for c in (o.get("columns") or []) if isinstance(c, dict)]
-        _fill_display_names(out, api, cols, log)
+        _fill_display_names(out, api, cols, log, names)
         _fix_merged_source(api, len(dbs), log)
         _fill_screen_nth(api, specs, log)
         _fill_types(api, bd, log)
@@ -357,6 +385,28 @@ def _selftest():
                    "rows[].nn": ("string", True), "rows[].rj": ("string", True),
                    "rows[].miss": ("number | string", True), "total": ("number | string", True)}, got
     assert len(tlog) == 6, tlog
+
+    # a2) 表示行の事実(V3): 名 = csv か label、cnt は 名+点数、kin は cnt があれば 名+金額。欄の名で引くので RIGHT の並びとずれない。
+    #     書かれた値(入れ替わった値・空)は事実で上書きする。同じ欄を2行が指すときは決めない。[] を含まないキーは触らない
+    sp = [{"label": "内金", "csv": "", "kin": "kamoku_2", "cnt": None},
+          {"label": "現金", "csv": "現金(実)", "kin": "kamoku_1", "cnt": "cnt_1"},
+          {"label": "小計", "csv": "", "kin": "syoukei_5", "cnt": None},
+          {"label": "小計", "csv": "小計1(値引前)", "kin": "syoukei_6", "cnt": None},
+          {"label": "重複", "csv": "", "kin": "same", "cnt": None},
+          {"label": "重複", "csv": "", "kin": "same", "cnt": None}]
+    names = _spec_display_names(sp)
+    assert names == {"kamoku_2": "内金", "kamoku_1": "現金(実)金額", "cnt_1": "現金(実)点数",
+                     "syoukei_5": "小計", "syoukei_6": "小計1(値引前)"}, names
+    api4 = {"action": "a", "response_items": [
+        {"key": "rows[].kamoku_2", "display_name": "現金"},
+        {"key": "rows[].kamoku_1", "display_name": "現金"},
+        {"key": "rows[].cnt_1", "display_name": ""},
+        {"key": "rows[].same", "display_name": "x"},
+        {"key": "total", "display_name": "合計"}]}
+    l4 = []
+    _fill_display_names({}, api4, [], l4, names)
+    assert [x["display_name"] for x in api4["response_items"]] == ["内金", "現金(実)金額", "現金(実)点数", "x", "合計"], api4
+    assert len(l4) == 3, l4
 
     # fill 全体: 一時の下書きを読み、表示名・出典・nth が入る。INTERMEDIATE_DIR は必ず戻す
     import json as _json
