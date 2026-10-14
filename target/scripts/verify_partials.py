@@ -347,24 +347,83 @@ def _src_rows(node, key=None):
             yield from _src_rows(v, key)
 
 
-def check_src_warn(frags):
-    """src(出典)が空の行を、件数を1行にまとめた [WARN] で返す(終了コード には影響させない)。
-    理由: 出典の無い記述は作り話の疑いがあるため目印を付けるが、A3 の合成前の断片にはまだ src が無く、
-    行ごとに出すと欄が多い断片で出力が埋まるので、1件の要約にする。EV00 は初期表示で src を持たない欄として除く。
-    呼出元: main_units。"""
-    lack, units = [], set()
-    for unit, frag in frags.items():
-        for r in _src_rows(frag):
-            if r.get("event_code") == "EV00":
-                continue
-            if not r.get("src"):
-                lack.append(r.get("event_code") or r.get("action") or r.get("item_name") or r.get("message_id") or r.get("id") or "?")
-                units.add(unit)
-    if not lack:
-        return []
-    sample = ", ".join(str(x) for x in lack[:5]) + (f" ほか {len(lack) - 5} 件" if len(lack) > 5 else "")
-    return [f"[WARN] [出典] 行 {len(lack)} 件の src が空(ソースの根拠が不明): {sample} → 差し戻し先 {', '.join(sorted(units))}"]
+def _src_rows_at(node, key=None, generic=""):
+    """_src_rows と同じ歩き方で、SRC_KEYS の欄の行を (汎用パス, 欄名, 行) で返す。
+    WHY: 行がどの単位の欄かを _units.owner_of(spec, 汎用パス)で引くため、パスを持たせる(_src_rows は行だけを返す)。
+    汎用パスは _units._walk と同じ形(a.b[].c)。呼出元: check_src_warn。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _src_rows_at(v, k, f"{generic}.{k}" if generic else k)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, dict) and key in SRC_KEYS:
+                yield f"{generic}[]", key, v
+            yield from _src_rows_at(v, key, generic + "[]" if isinstance(v, dict) else generic)
 
+
+def _row_label(r):
+    return str(r.get("event_code") or r.get("action") or r.get("item_name") or r.get("name") or r.get("message_id") or r.get("id") or "?")
+
+
+def check_src_warn(composed, spec, skip=None):
+    """合成の後に src(出典)が空の行を、単位ごとに1行の [WARN] で返す(終了コードには影響させない)。
+    WHY(W1): 合成前の断片を数えると events・items など合成が src を付ける行まで「空」に数え、227 件が 9 件になる実測があった。
+    _fill_src・_compose_*.py の後の形(= _units.compose の戻り)で数えるので、残るのは機械で付けられなかった行だけになる。
+    単位は汎用パスから _units.owner_of(spec, パス)で引き(引けなければ creators の最上位キーの作り手)、差し戻し先を1単位に絞る。
+    skip: {(欄名, 行の名前)}。check_cl_src・check_error_rows が ERROR にした行は WARN に重ねない。EV00 は除く。
+    呼出元: main_units。"""
+    import _units
+    skip = skip or set()
+    by_unit = {}
+    for generic, key, r in _src_rows_at(composed):
+        if r.get("event_code") == "EV00" or r.get("src"):
+            continue
+        name = _row_label(r)
+        if (key, name) in skip or (key, str(r.get("condition"))) in skip:
+            continue
+        unit = _units.owner_of(spec, generic) or (spec.get("creators") or {}).get(re.split(r"[\[.]", generic)[0]) or "?"
+        by_unit.setdefault((unit, key), []).append(name)
+    out = []
+    for (unit, key), names in sorted(by_unit.items()):
+        sample = ", ".join(names[:5]) + (f" ほか {len(names) - 5} 件" if len(names) > 5 else "")
+        out.append(f"[WARN] [出典] {unit}: {key} {len(names)} 件({sample})の src が空 → 差し戻し先 {unit}")
+    return out
+
+
+def check_cl_src(frags):
+    """S1 の common_logic の行で src が無いものを ERROR にする(W1 b)。差し戻し先 S1。
+    WHY: 合成は CL の src を付けない。src が無いと fill_common_logic_callers が呼出元の BE を絞れず、全 BE を足す退避に落ちる
+    (run12 の新7')。S1 の手順書(W12)が書く決まりの検査。呼出元: main_units(戻りの行は skip にも使う)。"""
+    out = []
+    for r in ((frags.get("S1") or {}).get("common_logic") or []):
+        if isinstance(r, dict) and not r.get("src"):
+            out.append(f"[出典] common_logic[{_row_label(r)}]: src が無い。合成は付けない。DB で動くものは条件・定数の定義の行、"
+                       "画面で動くものは関数の定義の行を {file,line_start,line_end} で書く → 差し戻し先 S1")
+    return out
+
+
+def _bad_error_rows(frags):
+    """S2 の error_patterns で根拠の無い行を (action, 番号, 行) で返す。message_id が無く、(a) status_code が無い、
+    または (b) 同じ API に同じ status_code で message_id のある行がある。呼出元: check_error_rows。"""
+    for a in ((frags.get("S2") or {}).get("api_spec") or []):
+        if not isinstance(a, dict):
+            continue
+        rows = [e for e in a.get("error_patterns") or [] if isinstance(e, dict)]
+        with_mid = {str(e.get("status_code")) for e in rows if e.get("message_id") and e.get("status_code") is not None}
+        for i, e in enumerate(rows):
+            if e.get("message_id"):
+                continue
+            if e.get("status_code") is None or str(e.get("status_code")) in with_mid:
+                yield a.get("action"), i, e
+
+
+def check_error_rows(frags):
+    """S2 の error_patterns の、出典(message_id)の無い注記の行を ERROR にする(W1 c)。差し戻し先 S2。
+    WHY: S2 が処理の無いことの注記に status_code=400 を付けて行にし、合成が error_code を補って本物のエラー行に見えた(run12 の新6)。
+    共通エラー(500 など)は合成が足すので S2 の断片に無く、対象外。呼出元: main_units。"""
+    return [f"[根拠] api_spec[{act}].error_patterns[{i}]「{str(e.get('condition') or '')[:30]}」: 出典(message_id)が無い。"
+            "起きる条件と返るステータスの行だけを書き、注記は api_spec の description へ → 差し戻し先 S2"
+            for act, i, e in _bad_error_rows(frags)]
 
 def check_composed_gaps(composed, frags):
     """合成した形の穴を、verify_intermediate(最後の検査)より前の単位の検査で拾う(ERROR)。呼出元: main_units。
@@ -556,14 +615,20 @@ def main_units(directory, only=None):
     problems += _units.check_all(spec, frags, only)
     extra = check_unit_extras(frags, directory) + check_example_format(frags)
     # 合成後の穴(画面への写しの欠け・400 の検査の漏れ)。project_config を渡して下書きの展開済み ID へ寄せた形で見る
-    extra += check_composed_gaps(_units.compose(spec, frags, {}), frags)
+    composed = _units.compose(spec, frags, {})  # check_composed_gaps と check_src_warn(合成の後に数える)で使い回す
+    extra += check_composed_gaps(composed, frags)
+    # W1 b)(c): S1 の CL の src 無し・S2 の根拠の無いエラー行は ERROR。WARN には重ねない(skip に入れる)
+    cl_errs, err_errs = check_cl_src(frags), check_error_rows(frags)
+    extra += cl_errs + err_errs
+    skip = {("common_logic", _row_label(r)) for r in ((frags.get("S1") or {}).get("common_logic") or []) if isinstance(r, dict) and not r.get("src")}
+    skip |= {("error_patterns", str(e.get("condition"))) for _a, _i, e in _bad_error_rows(frags)}
     problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
     for pr in problems:
         print(pr)
     # WARN は終了コードに影響しない(合成で機械的に補うため)
     for w in check_h2_logical_names(frags.get("H2") or {}):
         print(w)
-    for w in check_src_warn(frags) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags):
+    for w in check_src_warn(composed, spec, skip) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags):
         print(w)
     # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
     s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
@@ -740,12 +805,27 @@ def selftest_units():
     got = [m for lv, m in vi.check_intermediate_strict(holes) if "未展開の穴" in m]
     assert len(got) == 2 and all("screen_layout" not in m for m in got), got
     assert [m for lv, m in vi.check_intermediate_strict({"screen_layout": {"items": [{"example": "〈金額〉 円"}]}}) if "未展開の穴" in m], "example の 〈 は ERROR のまま"
-    # src が空の行は件数を1行の [WARN] にまとめる。src が全部ある断片、EV00 だけの断片は出さない
-    src_ok = {"H1": {"events": [{"event_code": "EV01", "src": [{"file": "x", "line_start": 1, "line_end": 2}]}]}}
-    assert check_src_warn(src_ok) == [], "src が揃った断片で WARN を出した"
-    src_lack = {"H1": {"events": [{"event_code": "EV02"}]}, "S3": {"event_processes": [{"event_code": "EV00"}, {"event_code": "EV01", "src": []}]}}
-    out = check_src_warn(src_lack)
-    assert len(out) == 1 and out[0].startswith("[WARN] [出典]") and "行 2 件" in out[0] and "差し戻し先 H1, S3" in out[0], out
+    # W1: src の WARN は合成の後の形で、単位ごとに1行。合成が src を付ける行(events・items)は WARN にしない
+    sp = {"units": {"H1": {"owns": ["events"]}, "H4": {"owns": ["calculations"]}, "S3": {"owns": ["event_processes"]}}, "creators": {}}
+    src1 = [{"file": "x", "line_start": 1, "line_end": 2}]
+    assert check_src_warn({"events": [{"event_code": "EV01", "src": src1}]}, sp) == [], "src が揃った行で WARN を出した"
+    assert check_src_warn({"events": [{"event_code": "EV00"}]}, sp) == [], "EV00 を WARN にした"
+    out = check_src_warn({"events": [{"event_code": "EV01", "src": src1}],
+                          "calculations": [{"name": "額", "src": []}, {"name": "過不足"}]}, sp)
+    assert len(out) == 1 and out[0].startswith("[WARN] [出典] H4: calculations 2 件") and out[0].endswith("差し戻し先 H4"), out
+    assert check_src_warn({"calculations": [{"name": "額"}]}, sp, {("calculations", "額")}) == [], "skip の行を WARN にした"
+    # W1 b): S1 の common_logic の src 無しは ERROR、src ありは通る
+    cl = check_cl_src({"S1": {"common_logic": [{"name": "判定"}, {"name": "定数", "src": src1}]}})
+    assert len(cl) == 1 and "common_logic[判定]" in cl[0] and cl[0].endswith("差し戻し先 S1"), cl
+    # W1 c): message_id 無し・同じ status の行あり = ERROR、message_id 無し・status が一意 = 通す、status 無し = ERROR
+    def s2(*rows):
+        return {"S2": {"api_spec": [{"action": "a", "error_patterns": list(rows)}]}}
+    ok_row = {"condition": "形式が違う", "status_code": 400, "message_id": "MSE00001"}
+    out = check_error_rows(s2(ok_row, {"condition": "注記", "status_code": 400}))
+    assert len(out) == 1 and "error_patterns[1]" in out[0] and out[0].endswith("差し戻し先 S2"), out
+    assert check_error_rows(s2(ok_row, {"condition": "別の status", "status_code": 404})) == [], "status が一意の行を ERROR にした"
+    assert len(check_error_rows(s2(ok_row, {"condition": "status 無し"}))) == 1, "status 無しを ERROR にしない"
+    assert check_error_rows(s2(ok_row)) == [], "message_id のある行を ERROR にした"
 
 
 def selftest_warn():
