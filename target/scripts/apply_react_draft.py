@@ -12,7 +12,8 @@ Phase 1 の LLM は業務語彙の文面だけを書く。events と API の対�
   --stage merge   (merge_partials.py の後、Phase 4 の前):
       {機能名}.json の event_processes[].details の呼出の行を、下書きの並びと数で保証する。
       details が空なら下書きの呼出の行(「・<action> をリクエストする」)を入れる。LLM が書いた業務語彙の文は残し、
-      呼出の行の数(「API」「呼出」「リクエスト」等を含む行)が下書きと同じことだけを確かめる
+      呼出の行の数(「API」「呼出」「リクエスト」等を含む行)が下書きと同じことだけを確かめる。
+      事実の行(fact_lines)は position(before_calls・after_calls・end)どおりに入れ、match の語を含む同趣旨の行は落とす(B6)
 
 【意味合い】
 - 既存の値と下書きが食い違うときは上書きしない。「[種別] 場所: 内容」を1行1件で出し、終了コード 1 にする
@@ -130,11 +131,15 @@ def apply_backend(bdraft, backend):
 
 
 def apply_details(draft, merged):
-    """merged(中間JSON)の event_processes[].details の呼出の行を、下書きの並びと数に揃える。
+    """merged(中間JSON)の event_processes[].details を、下書きの呼出の並びと数に揃え、事実の行を機械で入れる。
 
     戻り: (書いた event_processes の件数, 食い違いの list)。merged は破壊的に更新する。
+    WHY: fact_lines(開始時・成功時・失敗時・0件・CSV・連続操作)は TSX から機械で決まる事実なので、
+    details に同趣旨の行がモデルや下書きの側にあっても落とし、position どおりに入れ直す(B6)。
+    食い違いのあるイベントは触らない(上書きしない。人が決める)。
     """
     want_by = {p.get("event_code"): p.get("details") or [] for p in draft.get("event_processes") or []}
+    facts_by = {p.get("event_code"): p.get("fact_lines") or [] for p in draft.get("event_processes") or []}
     changed, conflicts = 0, []
     for ep in merged.get("event_processes") or []:
         code = ep.get("event_code")
@@ -146,17 +151,51 @@ def apply_details(draft, merged):
         have = ep.get("details") or []
         have_calls = [ln for ln in have if is_call_line(ln)]
         where = f"event_processes {code}"
-        if not have:
-            if want:
-                ep["details"] = list(want)
-                changed += 1
-        elif len(have_calls) != len(want_calls):
-            conflicts.append(f"[details] {where}: 既存の呼出の行 {len(have_calls)} 行が下書きの {len(want_calls)} 行と食い違う")
-        else:
+        if have:
+            if len(have_calls) != len(want_calls):
+                conflicts.append(f"[details] {where}: 既存の呼出の行 {len(have_calls)} 行が下書きの {len(want_calls)} 行と食い違う")
+                continue
             got = [DETAIL_RE.match(ln) for ln in have_calls]
             if all(got) and [m.group(1) for m in got] != [DETAIL_RE.match(w).group(1) for w in want_calls]:
                 conflicts.append(f"[details] {where}: 呼出の並び {[m.group(1) for m in got]} が下書きと食い違う")
+                continue
+        base = have if have else list(want)
+        new = _place_facts(base, facts_by.get(code) or [])
+        if new != have:
+            ep["details"] = new
+            changed += 1
     return changed, conflicts
+
+
+def _place_facts(lines, facts):
+    """details の行(lines)へ事実の行(facts)を position どおりに入れた新しい list を返す。
+
+    WHY: fact_lines の match の語を含む行は、モデルが書いた同趣旨の行でも下書きの行でも落として1回にする。
+    呼出の行は落とさない。before_calls は最初の呼出の行の前、after_calls は最後の呼出の行の後、
+    end(および未知の position)は末尾に置く。呼出の行が無いときは before_calls を先頭、after_calls を末尾にする。
+    業務の行の相対順は保つ。同じ文の重複は1回にする。
+    """
+    words = [w for f in facts for w in (f.get("match") or [])]
+    kept = []
+    for ln in lines:
+        if not is_call_line(ln) and (any(w in ln for w in words) or ln in kept):
+            continue
+        kept.append(ln)
+    texts = set(kept)
+
+    def pick(positions):
+        out = []
+        for f in facts:
+            if f.get("position") in positions and f["text"] not in texts and f["text"] not in out:
+                out.append(f["text"])
+        return out
+
+    before = pick(("before_calls",))
+    after = pick(("after_calls",))
+    end = pick(("end",) + tuple(p for p in {f.get("position") for f in facts} if p not in ("before_calls", "after_calls", "end")))
+    calls = [i for i, ln in enumerate(kept) if is_call_line(ln)]
+    i0, i1 = (calls[0], calls[-1] + 1) if calls else (0, len(kept))
+    return kept[:i0] + before + kept[i0:i1] + after + kept[i1:] + end
 
 
 def _load(path):
@@ -285,6 +324,31 @@ def selftest():
                                                   "dataset": [{"no": 1, "logical_table": "店舗", "logical_column": "店舗番号",
                                                                "physical_column": "p.mise_no"}]}]}
         assert apply_backend(bd, bk5) == 0 and bk5["db_operations"][0]["dataset"][0]["logical_column"] == "店舗番号", "スキーマどおりの行を消した"
+        # (f) 事実の行(fact_lines)の強制(B6): 開始時は最初の呼出の前、成功時は最後の呼出の後、0件は末尾。
+        #     モデルの同趣旨の行(開始時が後ろ・成功時が無い・連続操作の重複)は落として1回にする
+        fdraft = {"event_processes": [{"event_code": "EV01", "details": ["・load をリクエストする"], "fact_lines": [
+            {"key": "start", "text": "取得の開始時に、loading を true にする", "position": "before_calls", "match": ["取得の開始時"]},
+            {"key": "success", "text": "取得に成功したときは、rows を応答の内容に置き換える", "position": "after_calls", "match": ["取得に成功"]},
+            {"key": "failure", "text": "取得に失敗したときは、error にエラーの内容を設定する", "position": "after_calls", "match": ["取得に失敗"]},
+            {"key": "empty", "text": "0件のときは該当なしの旨を表示する", "position": "end", "match": ["0件のとき"]},
+            {"key": "continuous.1", "text": "連続操作の後から届く応答は上書きする", "position": "end", "match": ["後から届く"]},
+        ]}]}
+        mf = {"event_processes": [{"event_code": "EV01", "details": [
+            "画面の入力を読み取る", "取得の開始時に、loading を true にする", "・load をリクエストする",
+            "0件のときは空を表示する", "後から届く応答は上書きする", "後から届く応答は上書きする"]}]}
+        n, bad = apply_details(fdraft, mf)
+        assert n == 1 and not bad, f"事実の行: {n} {bad}"
+        assert mf["event_processes"][0]["details"] == [
+            "画面の入力を読み取る", "取得の開始時に、loading を true にする", "・load をリクエストする",
+            "取得に成功したときは、rows を応答の内容に置き換える", "取得に失敗したときは、error にエラーの内容を設定する",
+            "0件のときは該当なしの旨を表示する", "連続操作の後から届く応答は上書きする"], f"事実の行の位置: {mf['event_processes'][0]['details']}"
+        n2, bad2 = apply_details(fdraft, mf)
+        assert n2 == 0 and not bad2, f"再実行は何もしない: {n2} {bad2}"
+        mf2 = {"event_processes": [{"event_code": "EV01", "details": []}]}
+        assert apply_details(fdraft, mf2) == (1, []) and mf2["event_processes"][0]["details"] == [
+            "取得の開始時に、loading を true にする", "・load をリクエストする",
+            "取得に成功したときは、rows を応答の内容に置き換える", "取得に失敗したときは、error にエラーの内容を設定する",
+            "0件のときは該当なしの旨を表示する", "連続操作の後から届く応答は上書きする"], "空の details は下書きの呼出から作り事実を入れる"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
