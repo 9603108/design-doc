@@ -1,7 +1,7 @@
 # H2 DB 操作と論理名の写し(haiku)
 
 ## 入力
-- `{機能名}_backend_draft.json` の `apis.<action>.db_operations[]`(id・from・columns)。columns は SELECT 句の全列の骨組みで、
+- `{機能名}_backend_draft.json` の `apis.<action>.db_operations[]`(id・from・columns・ctes・subqueries・aggregate_units)。columns は SELECT 句の全列の骨組みで、
   1列ごとに alias(別名)・expression(元の式)・table / column(元の表と列)・logical_name(論理名の候補)・logical_name_source(候補の出所)・kind(column か alias_only)・real_column・alias_name・source_columns を持つ
 - バックエンドのソースの SQL、DDL(あれば)、`05_DB操作.md` の構造化表の節、`10_論理名変換.md`
 
