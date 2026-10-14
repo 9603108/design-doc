@@ -39,6 +39,17 @@ from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv, get_for
 # 接続情報: FEATURE_NAME は下の INTERMEDIATE_JSON と、main() の get_forbidden_terms_map(FEATURE_NAME) が使う。
 FEATURE_NAME = get_feature_name_from_argv()
 INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
+# WHY: 画面側の節の置換で、react 下書きの state 名・派生配列名を置換の表から外すための入力。
+#      state 名（shops 等）が DB の表名と同じだと、画面の state 名が「店舗マスタ(推定)[shops]」に化けるため。
+#      接続先: extract_react_draft.py が出す下書き（state_initials[].state・derived_arrays[].name）を読む。
+REACT_DRAFT_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+
+# WHY: 画面側の節（ユーザー操作・画面の処理・画面の検証・初期処理）だけ、react 名を外した表で置換する。
+#      バック側の節（backend_processes・api_spec・db_operations・calculations・common_logic）は
+#      DB の表名を置換する必要があるため、従来どおり全表で置換する。
+SCREEN_SECTION_NAMES = {
+    "events", "event_processes", "front_processes", "trigger_groups", "validations", "initialization",
+}
 
 # 置換対象フィールド名（業務担当者向けテキストが入る場所のみ。バックエンド固有の sql 文等は対象外）
 # 意味合い: 全フィールドを置換するとパフォーマンス低下 + API 名等まで誤変換するため、
@@ -236,6 +247,47 @@ def apply_forbidden_terms(data: dict, forbidden_map: dict, target_sections: list
     return count
 
 
+def _react_front_names(draft: dict) -> set:
+    """react 下書きの state 名と派生配列名を集める（画面側の置換で外す名前）。
+
+    WHY: state_initials[].state（例: shops）と derived_arrays[].name は画面の中だけの名前で、
+         DB の物理名と同じ綴りになりうる。画面側の節でこれを置換すると、画面の state 名が
+         「論理名[shops]」に化けるため、置換の表から外す名前の一覧として使う。
+    """
+    names = set()
+    for s in draft.get("state_initials") or []:
+        if isinstance(s, dict) and s.get("state"):
+            names.add(s["state"])
+    for d in draft.get("derived_arrays") or []:
+        if isinstance(d, dict) and d.get("name"):
+            names.add(d["name"])
+    return names
+
+
+def _load_front_names(path) -> set:
+    """react 下書きを読んで front_names を返す。下書きが無ければ None（従来どおり全節を同じ表で置換する）。
+
+    WHY: 下書きは extract_react_draft.py の出力（_config_loader の INTERMEDIATE_DIR）。
+         無いときに止めると従来の実行経路が壊れるため、None で「画面側の表の分け方をしない」を示す。
+    """
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        return _react_front_names(json.load(f))
+
+
+def _maps_without(col_map: dict, table_map: dict, names) -> tuple:
+    """col_map・table_map から names の物理名を除いた (col_map, table_map) を返す。
+
+    WHY: 画面側の節の置換で、react の state 名・派生配列名が表の物理名と同じときに
+         その行を置換対象から外すため。build_substitution_map の結果を変えず、外す所だけ分ける。
+    """
+    return (
+        {k: v for k, v in col_map.items() if k not in names},
+        {k: v for k, v in table_map.items() if k not in names},
+    )
+
+
 def main():
     if not INTERMEDIATE_JSON.exists():
         print(f"[ERROR] 中間JSONが見つかりません: {INTERMEDIATE_JSON}", file=sys.stderr)
@@ -248,6 +300,18 @@ def main():
     col_map, table_map = build_substitution_map(logical_names)
     col_pattern = _build_regex(list(col_map.keys()))
     table_pattern = _build_regex(list(table_map.keys()))
+
+    # WHY: 画面側の節だけ、react の state 名・派生配列名を外した表で置換する（新5・W4）。
+    #      下書きが無いときは front_names が None になり、画面側も全表で従来どおり置換する。
+    front_names = _load_front_names(REACT_DRAFT_JSON)
+    if front_names is None:
+        screen_col_map, screen_table_map = col_map, table_map
+        print("[INFO] react 下書きが無いため、画面側も全表で置換します")
+    else:
+        screen_col_map, screen_table_map = _maps_without(col_map, table_map, front_names)
+        print(f"[INFO] 画面側の置換から除く react 名 {len(front_names)} 件: {', '.join(sorted(front_names))}")
+    screen_col_pattern = _build_regex(list(screen_col_map.keys()))
+    screen_table_pattern = _build_regex(list(screen_table_map.keys()))
 
     print(f"[INFO] 物理名マップ構築: カラム {len(col_map)} 件、テーブル {len(table_map)} 件")
     print(f"  サンプル カラム: {', '.join(f'{k}→{v}' for k, v in list(col_map.items())[:3])}")
@@ -279,7 +343,12 @@ def main():
     replaced_sections = []
     for section in target_sections:
         if section in data:
-            walk_replace(data[section], col_pattern, col_map, table_pattern, table_map, section)
+            # WHY: 画面側の節は react 名を外した表、バック側の節は従来の全表で置換する（W4）。
+            if section in SCREEN_SECTION_NAMES:
+                walk_replace(data[section], screen_col_pattern, screen_col_map,
+                             screen_table_pattern, screen_table_map, section)
+            else:
+                walk_replace(data[section], col_pattern, col_map, table_pattern, table_map, section)
             replaced_sections.append(section)
 
     with INTERMEDIATE_JSON.open("w", encoding="utf-8") as f:
@@ -311,7 +380,23 @@ def _selftest():
     # derived の行だけ先に来ても、通常の行の対応が残ること
     rev_map, _ = build_substitution_map(list(reversed(names)))
     assert rev_map == {"kai_date": "会計日"}, rev_map
-    print("[selftest OK] apply_logical_name_substitution (B19: derived の行を置換の表に使わない)")
+    # W4: react の state 名（shops）は画面側の表から外れ、バック側の表では従来どおり置換される。
+    # WHY: 画面の state 名 shops が「店舗マスタ(推定)[shops]」に化けないことを確かめる（新5）。
+    tmap = {"shops": "店舗マスタ(推定)"}
+    draft = {"state_initials": [{"state": "shops"}, {"state": "loading"}],
+             "derived_arrays": [{"name": "warnRows"}]}
+    front = _react_front_names(draft)
+    assert front == {"shops", "loading", "warnRows"}, front
+    assert _react_front_names({}) == set()
+    scr_c, scr_t = _maps_without({}, tmap, front)
+    assert scr_t == {}, scr_t
+    fr_text = "取得に成功したときは、shops を応答の内容に置き換える"
+    out_scr = substitute_text(fr_text, _build_regex(list(scr_c)), scr_c,
+                              _build_regex(list(scr_t)), scr_t)
+    assert out_scr == fr_text, out_scr
+    out_be = substitute_text(fr_text, _build_regex([]), {}, _build_regex(list(tmap)), tmap)
+    assert out_be == "取得に成功したときは、店舗マスタ(推定)[shops] を応答の内容に置き換える", out_be
+    print("[selftest OK] apply_logical_name_substitution (B19: derived の行を置換の表に使わない / W4: 画面側の react 名を置換しない)")
 
 
 if __name__ == "__main__":
