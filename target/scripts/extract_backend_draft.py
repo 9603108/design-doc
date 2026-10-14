@@ -745,7 +745,8 @@ def _columns(sql, ddl, unresolved, action):
             if not names:
                 unresolved.append({"action": action, "reason": f"{expr} の列を DDL から引けない(表 {tbl})"})
                 names = ["*"]
-            cols += [{"alias": c, "expression": f"{q}.{c}" if q and c != "*" else expr if c == "*" else c, "table": tbl, "column": c} for c in names]
+            cols += [{"alias": c, "expression": f"{q}.{c}" if q and c != "*" else expr if c == "*" else c, "table": tbl, "column": c,
+                      "kind": "column", "real_column": f"{tbl}.{c}", "alias_name": "", "alias_expression": "", "source_columns": [f"{tbl}.{c}"]} for c in names]
             continue
         refs = list(dict.fromkeys(r for r in re.findall(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b", _mask(expr)) if r[0] in alias))
         if expr == "X":  # f 文字列の穴を評価できなかった式(_render の X)。元の列は分からない
@@ -761,9 +762,130 @@ def _columns(sql, ddl, unresolved, action):
         alias_ = am.group(1) if am else col
         is_expr = not re.fullmatch(r"(?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*", expr)
         phys = (alias_ if is_expr or not col else col) or expr
+        # B1: 実列と別名の区別。kind=column は表.列そのもの(real_column が実列、alias_name は AS の名前)、
+        # kind=alias_only は式(alias_name が別名、alias_expression が式の原文、実列は無い)。式が参照する実列は source_columns に全部出す
+        # (COALESCE(s.name, ...) → shops.name 等。count(*) は空)。physical_column と違い、式の別名を物理列として書かない
+        src = [f"{real(q)}.{c}" for q, c in refs if real(q) != "X"] or ([f"{main}.{expr}"] if re.fullmatch(r"[A-Za-z_]\w*", expr) and expr != "X" else [])
         cols.append({"alias": alias_, "expression": expr, "table": "" if tbl == "X" else tbl, "column": col,
-                     "physical_column": phys, "is_expression": is_expr})
+                     "physical_column": phys, "is_expression": is_expr,
+                     "kind": "alias_only" if is_expr else "column", "real_column": "" if is_expr or not col or tbl == "X" else f"{tbl}.{col}",
+                     "alias_name": am.group(1) if am else "", "alias_expression": expr if is_expr else "", "source_columns": src})
     return frm, cols
+
+
+def _body(m, open_):
+    """マスク済み m の open_ にある "(" から対応する ")" までの (中身の開始, 終了)。"""
+    d = 0
+    for i in range(open_, len(m)):
+        d += (m[i] == "(") - (m[i] == ")")
+        if d == 0:
+            return open_ + 1, i
+    return open_ + 1, len(m)
+
+
+def _top_has(m, kw):
+    """m(括弧の中身を含む SQL 片)の深さ 0 に語 kw があるか。副問合せ・CTE の絞り込み(WHERE)の有無を見る。"""
+    d = 0
+    for t in re.finditer(r"[()]|\b" + kw + r"\b", m, re.IGNORECASE):
+        if t.group(0) == "(":
+            d += 1
+        elif t.group(0) == ")":
+            d -= 1
+        elif d == 0:
+            return True
+    return False
+
+
+def _subqueries(sql):
+    """SQL の WITH の CTE と、CTE 以外の括弧つき副問合せを返す。(ctes, subqueries)。
+    ctes: {name, definition, from(最初の FROM の表の書き), filtered(深さ 0 に WHERE があるか)}
+    subqueries: {location(SELECT/FROM/JOIN/WHERE/HAVING/ON のどの句の中か), definition, filtered}
+    なぜ要るか: CTE が絞っているのか(WHERE の有無)・副問合せがどの句に居るかを、LLM が読み違えて「CTE 空」「絞り込み無し」と書くのを防ぐ。
+    呼出元: extract()(db_operations の ctes / subqueries)。ponytail: 句の判定は直前の同じ深さのキーワード。UNION の枝は区別しない。"""
+    m = _mask(sql)
+    depth, d = [], 0
+    for c in m:
+        depth.append(d)
+        d += (c == "(") - (c == ")")
+    ctes, cte_opens = [], set()
+    for c in _CTE.finditer(m):
+        o = c.end() - 1
+        a, b = _body(m, o)
+        f = _FROM_TBL.search(m, a, b)
+        cte_opens.add(o)
+        ctes.append({"name": c.group(1), "definition": " ".join(sql[a:b].split()), "from": f.group(1) if f else "",
+                     "filtered": _top_has(m[a:b], "WHERE")})
+    subs = []
+    for t in re.finditer(r"\(\s*SELECT\b", m, re.IGNORECASE):
+        if t.start() in cte_opens:
+            continue
+        kw = [k for k in re.finditer(r"\b(SELECT|FROM|JOIN|WHERE|HAVING|ON)\b", m[:t.start()], re.IGNORECASE) if depth[k.start()] == depth[t.start()]]
+        a, b = _body(m, t.start())
+        subs.append({"location": kw[-1].group(1).upper() if kw else "", "definition": " ".join(sql[a:b].split()), "filtered": _top_has(m[a:b], "WHERE")})
+    return ctes, subs
+
+
+def _agg_units(sql, feats):
+    """集計関数ごとに数える単位(GROUP BY の列)を返す。[{func, arg, alias, scope, group_by:["表.列"…], unit}]。
+    scope が main なら本体 SELECT の GROUP BY、cte <名前> ならその CTE の本体の GROUP BY。group_by が空なら結果全体で1つ(unit は "全体")。
+    なぜ要るか: count(*) AS days が「何を1と数えるか」(例: 店舗×レジ単位の日数)の取り違えを防ぐ。呼出元: extract()(db_operations の aggregate_units)。
+    ponytail: GROUP BY が列でない式・番号のときは式の原文をそのまま出す。"""
+    ctes = {c["name"]: c["definition"] for c in _subqueries(sql)[0]}
+    cache = {}
+
+    def gb(scope):
+        if scope not in cache:
+            body = ctes.get(scope[4:], "") if scope.startswith("cte ") else sql
+            rows = _clauses(body)["group_by"] if body else []
+            cache[scope] = [(r["logical_table"] + "." if r["logical_table"] else "") + r["logical_column"] for r in rows]
+        return cache[scope]
+
+    return [{"func": a["func"], "arg": a["arg"], "alias": a["alias"], "scope": a["scope"], "group_by": gb(a["scope"]),
+             "unit": ", ".join(gb(a["scope"])) or "全体"} for a in feats["aggregates"]]
+
+
+def _merge_aggs(per):
+    """通りごとの集計の単位(_agg_units の戻り)を重ねる。全ての通りで同じ行はそのまま、一部の通りにしか無い行には when(その通りのラベル)を付ける。
+    呼出元: extract()(db_operations の aggregate_units)。なぜ要るか: 分岐で GROUP BY が変わると count(*) の単位も通りで変わるため、通りごとに分ける。"""
+    if len(per) == 1:
+        return per[0][1]
+    seen, out = [], []
+    for _, rows in per:
+        for r in rows:
+            if r in seen:
+                continue
+            seen.append(r)
+            where = [lab for lab, rs in per if r in rs]
+            out.append(r if len(where) == len(per) else {**r, "when": " / ".join(where)})
+    return out
+
+
+def _error_origins(common):
+    """common_errors の各 error に、code と message の出どころを足す(案 B1)。元の欄は変えない。
+    code_from: literal(固定の文字列)/ exception_attr:<属性>(例外の属性。code_default が無いときの既定の文字列)/ expression
+    message_from: literal / exception_message(str(e) 等、例外のメッセージそのもの)/ exception_type_and_message / expression
+    なぜ要るか: 返す code が MSE0000x の採番でなく、ソースの文字列(validation_error 等)で、文言は例外のメッセージだと機械で示すため。
+    呼出元: extract()(最上位 common_errors)。"""
+    for ce in common:
+        for e in ce["errors"]:
+            try:
+                cn = ast.parse(str(e["code"]), mode="eval").body
+            except SyntaxError:
+                cn = None
+            lits = [n.value for n in ast.walk(cn) if isinstance(n, ast.Constant) and isinstance(n.value, str)] if cn else []
+            attr = next((n.args[1].value for n in ast.walk(cn) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "getattr"
+                         and len(n.args) > 1 and isinstance(n.args[1], ast.Constant)), "") if cn else ""
+            if not lits and re.fullmatch(r"\w+", str(e["code"])):  # _common_errors は定数の code を引用符なしで持つ(internal_error)。識別子だけなら固定の文字列
+                lits = [str(e["code"])]
+                cn = ast.Constant(value=lits[0])
+            lits = [x for x in lits if x != attr]  # getattr(e, 'code', ...) の属性名 code は既定の文字列ではない
+            e["code_default"] = lits[-1] if lits else ""
+            e["code_from"] = "exception_attr:" + attr if attr else "literal" if isinstance(cn, ast.Constant) else "expression"
+            msg = str(e["message"])
+            e["message_from"] = ("exception_type_and_message" if re.fullmatch(r"f?['\"]\{type\(\w+\)\.__name__\}: \{\w+\}['\"]", msg)
+                                 else "exception_message" if re.fullmatch(r"str\(\w+\)", msg)
+                                 else "literal" if re.fullmatch(r"f?(['\"]).*\1", msg) and "{" not in msg else "expression")
+    return common
 
 
 def _callees(fn, mod, mods):
@@ -876,7 +998,8 @@ def _logic_candidates(mods):
             val = mod.consts.get(name)
             if val is None or not any(isinstance(x, ast.Name) and x.id == name for f in mod.funcs.values() for x in ast.walk(f)):
                 continue
-            text = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False) if isinstance(val, (list, dict)) else ""
+            # WHY: 辞書の値に set(例: 利用者の一覧)が入ると json.dumps が TypeError で止まる。set は並べ替えた list にして文字列化する
+            text = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=lambda o: sorted(o, key=str) if isinstance(o, (set, frozenset)) else str(o)) if isinstance(val, (list, dict)) else ""
             if text and _SQLISH.search(text):
                 out.append({"name": name, "kind": "sql_condition" if isinstance(val, str) else "sql_fragment", "text": text,
                             "runs_on": "データベース", "src": [_src(mod, n)]})
@@ -938,7 +1061,15 @@ def extract(files, hints=None):
                         if sql and _SQL_HEAD.match(sql):
                             _merge_scenarios(clauses, [_clauses(_render(s, e, True)) for _, e in scens], [l for l, _ in scens])
                             frm, cols = _columns(sql, hints.get("ddl") or {}, unresolved, action)
-                            ops.append({"from": frm, "columns": _candidates(cols, hints), "features": _features(sql, _mask(sql)), "src": [_src(m2, s)]})
+                            feats = _features(sql, _mask(sql))
+                            ctes, subs = _subqueries(sql)
+                            # 集計の単位は通りごとに出して重ねる(分岐で GROUP BY が変わると単位も変わる。最初の通りだけでは取り違える)
+                            per_aggs = []
+                            for lab, e2 in scens:
+                                q = _render(s, e2, True)
+                                per_aggs.append((lab, _agg_units(q, _features(q, _mask(q)))))
+                            ops.append({"from": frm, "columns": _candidates(cols, hints), "features": feats, "ctes": ctes, "subqueries": subs,
+                                        "aggregate_units": _merge_aggs(per_aggs), "src": [_src(m2, s)]})
                             for r in _dataset(sql, unresolved, action):
                                 if (r["column"], r["table"]) not in seen_col:
                                     seen_col.add((r["column"], r["table"]))
@@ -965,7 +1096,8 @@ def extract(files, hints=None):
                                 "response_items": [{"key": key, "src": s} for key, s in keys.items()],
                                 "error_patterns": errors, "boundaries": _boundaries(errors, clo, fn), **clauses,
                                 "features": _merge_features([o["features"] for o in ops]),
-                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "src": o["src"]} for o in ops]}
+                                "db_operations": [{"id": o["id"], "from": o["from"], "columns": o["columns"], "features": o["features"], "ctes": o["ctes"], "subqueries": o["subqueries"],
+                                                     "aggregate_units": o["aggregate_units"], "src": o["src"]} for o in ops]}
     # B3: 応答項目の型(api.ts)。action ごとに response_fields を足す(型が取れない API は空)
     rf = _response_fields(hints.get("ts_files") or [])
     for action, a in apis.items():
@@ -985,7 +1117,7 @@ def extract(files, hints=None):
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
         e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
     return {"apis": apis, "unresolved": unresolved, "auth": auth, "logic_candidates": _logic_candidates([x for x in mods.values() if x is not None]),
-            "common_errors": _common_errors([x for x in mods.values() if x is not None], tables)}
+            "common_errors": _error_origins(_common_errors([x for x in mods.values() if x is not None], tables))}
 
 
 def selftest():
@@ -1103,6 +1235,29 @@ def selftest():
     assert [(b["param"], b.get("impossible_dates_accepted")) for b in bs if b.get("pattern")] == [("from", ["2026-02-30"]), ("to", ["2026-02-30"])], bs
     assert [b["check"] for b in bs if b.get("present") is False] == ["order", "span_limit"], bs
     assert [(c["exception"], [e["status_code"] for e in c["errors"]]) for c in r2["common_errors"]] == [("ValidationError", [400]), ("Exception", [500])], r2["common_errors"]
+    # B1: 実列と別名の区別(s.name AS shop_name は実列 shops.name、count(*) AS days は実列なし)、CTE・副問合せ、集計の単位、例外の code の出どころ
+    bsql = ("WITH d AS (SELECT p.m, p.r FROM tbl p WHERE p.k > 0), e AS (SELECT * FROM tbl) "
+            "SELECT s.name AS shop_name, p.m, count(*) AS days, upper(s.name) AS nm, max(p.k) AS mk "
+            "FROM d p JOIN shops s ON s.id = p.m WHERE p.m IN (SELECT m FROM tbl WHERE z = 1) AND p.r IN (SELECT r FROM tbl) GROUP BY p.m")
+    _, bc = _columns(bsql, {}, [], "t")
+    bk = {c["alias"]: (c["kind"], c["real_column"], c["alias_name"], c["source_columns"]) for c in bc}
+    assert bk["shop_name"] == ("column", "shops.name", "shop_name", ["shops.name"]), bk
+    assert bk["days"] == ("alias_only", "", "days", []) and bk["nm"] == ("alias_only", "", "nm", ["shops.name"]), bk
+    assert bk["m"][0] == "column" and bk["m"][2] == "", bk
+    bcte, bsub = _subqueries(bsql)
+    assert [(c["name"], c["filtered"]) for c in bcte] == [("d", True), ("e", False)] and bcte[0]["from"] == "tbl", bcte
+    assert [(s["location"], s["filtered"]) for s in bsub] == [("WHERE", True), ("WHERE", False)], bsub
+    bu = {u["alias"]: u["group_by"] for u in _agg_units(bsql, _features(bsql, _mask(bsql)))}
+    assert bu == {"days": ["tbl.m"], "mk": ["tbl.m"]}, bu
+    n_sql = "SELECT count(*) AS n FROM tbl"
+    bu2 = _agg_units(n_sql, _features(n_sql, n_sql))
+    assert bu2[0]["unit"] == "全体" and bu2[0]["group_by"] == [], bu2
+    mg = _merge_aggs([("group = register", _agg_units(bsql, _features(bsql, _mask(bsql)))), ("group = shop", bu2)])
+    assert [(x["alias"], x.get("when")) for x in mg] == [("days", "group = register"), ("mk", "group = register"), ("n", "group = shop")], mg
+    ce = _error_origins([{"errors": [{"code": "getattr(e, 'code', None) or 'validation_error'", "message": "str(e)"},
+                                      {"code": "internal_error", "message": "f'{type(e).__name__}: {e}'"}]}])[0]["errors"]
+    assert [(x["code_from"], x["code_default"], x["message_from"]) for x in ce] == [
+        ("exception_attr:code", "validation_error", "exception_message"), ("literal", "internal_error", "exception_type_and_message")], ce
     print("[selftest OK] extract_backend_draft")
     return 0
 
