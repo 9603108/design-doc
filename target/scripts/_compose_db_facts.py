@@ -229,6 +229,44 @@ def _rename_logical_names(out, drafts, log):
                 it["display_name"] = by_name[it["display_name"]]
 
 
+def _ws(s):
+    """空白を1つに詰めて小文字にする(字面の比較専用)。"""
+    return " ".join(str(s or "").split()).lower()  # fallback-ok: None は空文字として比べる(比較専用)
+
+
+def _api_draft(drafts, action, log):
+    """action の下書きの API(apis[action])を取る。下書きが複数あって決まらないときは None(推測しない)。
+    WHY: 合成の db_operations の id(DB1 等)は下書きの id(db_op_…)と一致しないことがあるため、id ではなく API の action で結ぶ(run10 で確認)。"""
+    found = [a for a in ((d.get("apis") or {}).get(action) for d in drafts) if action and a]  # fallback-ok: 下書きの apis は任意
+    if len(found) > 1:
+        log.append(f"WARN _compose_db_facts: {action} の下書きが {len(found)} 件あり、副問い合わせの集計の除外を行わない")
+        return None
+    return found[0] if found else None
+
+
+def _drop_subquery_aggs(op, api, log):
+    """aggregate の行のうち、下書きの副問い合わせ(subqueries の定義文)に同じ集計があり、主の SELECT の集計(aggregate_units の scope が main)に無いものを外す(F2)。
+    呼出元: _compose_db(_fill_agg の前)。意味合い: 副問い合わせの max(...) を外側の集計として書くと、外側の単位の集計に化ける。
+    モデルが入れても、下書きの事実(副問い合わせの定義文)で消す。主の SELECT にも同じ字面の集計があるときは残す(別の集計として使われている)。
+    api は下書きの API 1件(apis[action])。その中の全 db_operations の副問い合わせ・単位を見る。"""
+    dops = [x for x in api.get("db_operations") or [] if isinstance(x, dict)]  # fallback-ok: 下書きの欄は任意
+    subs = " ".join(_ws(s.get("definition")) for d in dops for s in d.get("subqueries") or [] if isinstance(s, dict))  # fallback-ok: 副問い合わせが無ければ空
+    if not subs:
+        return
+    main = {(_ws(u.get("func")), _ws(u.get("arg"))) for d in dops for u in d.get("aggregate_units") or []  # fallback-ok: 下書きの単位は任意
+            if str(u.get("scope") or "").startswith("main")}  # fallback-ok: scope の無い単位は主の集計として数えない
+    keep = []
+    for row in op.get("aggregate") or []:  # fallback-ok: aggregate は任意
+        f, t = _ws(row.get("function")), _ws(row.get("target"))  # fallback-ok: 関数名・式の無い行は一致しない
+        pat = r"(?<![\w.])" + re.escape(f) + r"\s*\(\s*" + re.escape(t) + r"\s*\)(?![\w.])"
+        if f and re.search(pat, subs) and (f, t) not in main:
+            log.append(f"INFO _compose_db_facts: aggregate {f}({t}) は副問い合わせの中の集計なので外す({op.get('id')})")
+            continue
+        keep.append(row)
+    if len(keep) != len(op.get("aggregate") or []):
+        op["aggregate"] = keep
+
+
 def _compose_db(out, drafts, log):
     ops = out.get("db_operations") or []  # fallback-ok: db_operations は任意(無い版は何もしない)
     lns = out.get("logical_names") or []  # fallback-ok: logical_names は任意
@@ -262,6 +300,11 @@ def _compose_db(out, drafts, log):
             for row in op.get(key) or []:  # fallback-ok: 任意の句
                 if row.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
                     row["logical_table"] = _sfx(row["logical_table"])
+    for op in ops:                                  # d0) 副問い合わせの中の集計は外側から外す(下書きの subqueries が正。API の action で結ぶ)
+        ep = op.get("api_endpoint")  # fallback-ok: api_endpoint は任意
+        api = _api_draft(drafts, ep.get("action") if isinstance(ep, dict) else None, log)  # fallback-ok: 形の崩れた endpoint は結べない
+        if api:
+            _drop_subquery_aggs(op, api, log)
     for op, dop, _ in pairs:                        # d) 集計の別名
         _fill_agg(op, dop)
     return out
@@ -409,6 +452,26 @@ def selftest():
     assert out5["api_spec"][0]["response_items"][0]["display_name"] == "店番号", out5["api_spec"]
     assert out5["api_spec"][0]["response_items"][1]["display_name"] == "売上訂正点数", out5["api_spec"]
     assert log5 and any("WARN" in x for x in log5), log5
+    # F2: 副問い合わせの中の集計(max(kai_date))は、モデルが aggregate に入れても外す。主の SELECT の同じ字面の集計(max(kai_date))は残す
+    sub_drafts = [{"apis": {"lp": {"db_operations": [{"id": "db_op_lp",
+        "subqueries": [{"location": "WHERE", "definition": "SELECT max(kai_date) FROM pos_account_reports", "filtered": False}],
+        "aggregate_units": [{"func": "max", "arg": "p.kai_date", "alias": "last_date", "scope": "main"},
+                            {"func": "max", "arg": "kai_date", "alias": "", "scope": "subquery WHERE"}]}]},
+        "lq": {"db_operations": [{"id": "db_op_lq",
+        "subqueries": [{"location": "WHERE", "definition": "SELECT max(kai_date)  FROM pos_account_reports", "filtered": False}],
+        "aggregate_units": [{"func": "max", "arg": "kai_date", "alias": "same", "scope": "main"}]}]}}}]
+    out6 = {"logical_names": [], "db_operations": [
+        {"id": "DB9", "api_endpoint": {"action": "lp"},  # 合成の id(DB9)は下書きの id(db_op_lp)と違う。action で結ぶ
+         "aggregate": [{"function": "max", "target": "p.kai_date", "alias": "last_date", "scope": "main"},
+                       {"function": "max", "target": "kai_date", "alias": None, "scope": "main"}]},
+        {"id": "DB10", "api_endpoint": {"action": "lq"},
+         "aggregate": [{"function": "max", "target": "kai_date", "alias": None, "scope": "main"}]}]}
+    log6 = []
+    _compose_db(out6, sub_drafts, log6)
+    got6 = [[(r["function"], r["target"]) for r in op["aggregate"]] for op in out6["db_operations"]]
+    assert got6 == [[("max", "p.kai_date")], [("max", "kai_date")]], got6  # db_op_lq は主の SELECT にも同じ集計があるので残す
+    assert any("副問い合わせ" in x and "max(kai_date)" in x for x in log6), log6
+    print("[selftest OK] _compose_db_facts F2 (副問い合わせの集計を外す・主の集計は残す)")
     print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
     print("[selftest OK] _compose_db_facts (B2: 物理列・when・句の論理名・(推定)・集計の別名・derived の除外)")
 

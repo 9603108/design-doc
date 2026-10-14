@@ -624,8 +624,14 @@ def _fill_initial_db_triggers(out, log=None):
 FILLER_ORDER_DEFAULT = 100
 
 
+def _code_present(v):
+    """error_code の欄に値が入っているか。None・空文字・空白だけは「未記入」(モデルが "" と書いたときも埋める対象にする)。"""
+    return v not in (None, "") and str(v).strip() != ""
+
+
 def _fill_error_codes(out):
-    """api_spec[].error_patterns[] のうち error_code が無い行に、backend 下書きの common_errors の code_default を入れる(B0)。
+    """api_spec[].error_patterns[] のうち error_code が無いか空文字の行に、backend 下書きの common_errors の code_default を入れる(B0)。
+    WHY: error_code が空文字・空白だけの行も未記入として埋める(_code_present)。run10 で残った 400 の4行は、下書きの式の status_code を数に取れていなかったため(下の status の WHY)。
     呼出元: compose(_run_fillers の前)。意味合い: API ごとに code を書かせると食い違うため、入口の except 節でソースが決めた code を機械で入れる。
     一致: 行の status_code(数値)が、下書きの status_code と等しい、または下書きの status の式にある数値リテラルと等しい(getattr(e, 'status', 400) or 400 → 400)。
     候補の code_default が2種類以上になる status は、どれも入れない(推測しない)。行に既に error_code があれば触らない。下書きが無ければ何もしない。"""
@@ -642,15 +648,19 @@ def _fill_error_codes(out):
                 if not (isinstance(code, str) and code):
                     continue
                 nums = set()
-                if isinstance(e.get("status_code"), int):
-                    nums.add(e["status_code"])
-                if isinstance(e.get("status"), str):
-                    nums |= {int(n) for n in re.findall(r"(?<![\w.])\d{3}(?![\w.])", e["status"])}
+                # WHY: 下書きは式(getattr(e, 'status', 400) or 400)を status_code の欄に書くこともある(run10 の 400 の行が埋まらなかった原因)。
+                #      int と式の両方から数値を取る
+                for key in ("status_code", "status"):
+                    v = e.get(key)
+                    if isinstance(v, int):
+                        nums.add(v)
+                    elif isinstance(v, str):
+                        nums |= {int(n) for n in re.findall(r"(?<![\w.])\d{3}(?![\w.])", v)}
                 for n in nums:
                     codes_by_status.setdefault(n, set()).add(code)
     for a in _rows(out, "api_spec"):
         for x in a.get("error_patterns") or []:
-            if not isinstance(x, dict) or x.get("error_code"):
+            if not isinstance(x, dict) or _code_present(x.get("error_code")):
                 continue
             sc = x.get("status_code")
             cands = codes_by_status.get(sc) if isinstance(sc, int) else None
@@ -988,6 +998,7 @@ def _selftest_b0():
         {"exception": "Gate", "errors": [{"status_code": 503, "code_default": "a"}]},
         {"exception": "Gate2", "errors": [{"status_code": 503, "code_default": "b"}]},
         {"exception": "Auth", "errors": [{"status": "getattr(e, 'status', 404) or 404", "code_default": "not_found"}]},
+        {"exception": "Conflict", "errors": [{"status_code": "getattr(e, 'status', 409) or 409", "code_default": "conflict"}]},  # 式を status_code に書いた下書き(run10 形)
     ]}
     old = _config_loader.INTERMEDIATE_DIR
     with tempfile.TemporaryDirectory() as td:
@@ -998,13 +1009,14 @@ def _selftest_b0():
             assert "。code=" not in ce[400]["condition"] and ce[400]["condition"] == "想定外の例外が起きたとき(queries.ValidationError)", ce[400]
             assert ce[400]["error_code"] == "validation_error" and "error_code" not in ce[503], ce
             api = {"api_spec": [{"action": "a", "error_patterns": [
-                {"status_code": 400, "condition": "x"}, {"status_code": 404, "condition": "y"},
-                {"status_code": 503, "condition": "z"}, {"status_code": 500, "condition": "w", "error_code": "keep"}]}]}
+                {"status_code": 400, "condition": "x"}, {"status_code": 404, "condition": "y", "error_code": ""},
+                {"status_code": 503, "condition": "z"}, {"status_code": 500, "condition": "w", "error_code": "keep"},
+                {"status_code": 400, "condition": "v", "error_code": "  "}, {"status_code": 409, "condition": "u", "error_code": ""}]}]}
             _fill_error_codes(api)
         finally:
             _config_loader.INTERMEDIATE_DIR = old
     got = [e.get("error_code") for e in api["api_spec"][0]["error_patterns"]]
-    assert got == ["validation_error", "not_found", None, "keep"], got
+    assert got == ["validation_error", "not_found", None, "keep", "validation_error", "conflict"], got  # "" と空白だけの欄は未記入として埋める。式の status_code も数に取る
     # d) 処理名(EV の形でない文字列)は削らず、旧 EV は現行の番号へ写す
     out = {"events": [{"no": "EV1", "event_code": "EV00"}],
            "common_logic": [{"name": "判定", "used_in": ["EV00", "初期表示", "EV09"], "used_by_processes": ["FR1 名"]}]}

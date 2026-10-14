@@ -772,6 +772,22 @@ def _doc_hints(paths):
 _DOC_HINT = re.compile(r"([々぀-ヿ㐀-鿿]{2,12})[（(]([A-Za-z_]\w*)[）)]")
 
 
+def _pair_note(note, expr):
+    """型のコメントが「AとB」の形なら、2列をまとめて説明しているので、式の種類で1つの意味に分ける(T18)。
+    count 系(count(...))は A(「…数」で終わるとき)を、array_agg 系は B の「…の一覧」を名前にする。
+    どちらの式でもない、または A が「数」で終わらない count は分けられないので空(候補を出さない)。「AとB」でない型のコメントはそのまま返す。
+    WHY: 同じ「AとB」の名前を別々の別名に付けると、別の列が同じ論理名になる(取込欠損の疑いがある日数と日付)。出所は型の欄のグループ説明。"""
+    parts = (note or "").split("と")  # fallback-ok: コメントが無い列は空のまま返す
+    if len(parts) != 2 or not all(p.strip() for p in parts):
+        return note
+    a, b = parts[0].strip(), parts[1].strip()
+    if re.search(r"\bcount\s*\(", expr or "", re.IGNORECASE):
+        return a if a.endswith("数") else ""
+    if re.search(r"\barray_agg\s*\(", expr or "", re.IGNORECASE):
+        return b + "の一覧"
+    return ""
+
+
 def _candidates(cols, hints):
     """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / csv_header / docstring / ui_label / expr / api_type / guess。
     expr は式の別名(SUM・COUNT・MIN・MAX の1列の式)の元列の論理名から組む。CASE・四則演算は組まない。"""
@@ -815,7 +831,7 @@ def _candidates(cols, hints):
                      (next((csv[k] for k in keys if csv.get(k)), ""), "csv_header"),
                      (next((doc[k] for k in keys if doc.get(k)), ""), "docstring"),
                      (ui_name, ui_src),
-                     (notes.get(c["alias"]), "api_type")])
+                     (_pair_note(notes.get(c["alias"]), c["expression"]), "api_type")])
     known = {}  # 元列の論理名の材料。別名ごとに取れた最初の名前(guess は材料にしない)
     for c, cs in zip(cols, rows):
         got = next((n for n, _ in cs if n), "")
@@ -1388,6 +1404,16 @@ def selftest():
     assert [(c["logical_name"], c["logical_name_source"]) for c in gs] == [("売上訂正金額(推定)", "ui_label_guess"), ("売上訂正件数(推定)", "ui_label_guess")], gs
     cs = _candidates([{"alias": a, "expression": a, "table": "", "column": a} for a in ("s_1", "s_5", "u")], {"ui": ui})
     assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("小計1(値引前)", "ui_label"), ("小計5(現金計)", "ui_label"), ("総売上", "ui_label")], cs
+    # T18: 型のコメントが「AとB」(2列をまとめた説明)のときは式の種類で分ける。count は A(数で終わるとき)、array_agg は B の「の一覧」。分けられなければ空
+    pc = [{"alias": "w_days", "expression": "count(*) FILTER (WHERE t.x > 0)::int", "table": "", "column": "", "logical_name": ""},
+          {"alias": "w_dates", "expression": "array_remove(array_agg(t.d ORDER BY t.d), NULL)", "table": "", "column": "", "logical_name": ""},
+          {"alias": "w_sum", "expression": "SUM(t.k)", "table": "", "column": "k", "logical_name": ""}]
+    pnote = "取込欠損の疑いがある日数と日付（現行の取込バグ）"
+    ptypes = [({"w_days", "w_dates", "w_sum"}, {"w_days": pnote, "w_dates": pnote, "w_sum": "金額と点数"})]
+    pcs = _candidates(pc, {"types": ptypes})
+    assert [(c["logical_name"], c["logical_name_source"]) for c in pcs] == [
+        ("取込欠損の疑いがある日数", "api_type"), ("日付の一覧", "api_type"), ("", "")], pcs
+    assert _pair_note("金額と点数", "SUM(t.k)") == "" and _pair_note("店舗名", "t.x") == "店舗名", "AとB の分け方"
     # F2: 日付の形式検査(from・to)の boundaries と、暦に無い日付を通すこと・大小比較が無いこと・共通エラー(except 節)
     src = ('import re\n_D = re.compile(r"^\\d{4}-\\d{2}-\\d{2}$")\nclass ValidationError(Exception):\n    pass\n'
            'def _req(p, k):\n    v = p.get(k)\n    if not isinstance(v, str) or not _D.match(v):\n        raise ValidationError(f"{k} は形式が違う")\n    return v\n'
