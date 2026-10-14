@@ -736,6 +736,111 @@ def _tag_end(text, i):
     return len(text) - 1
 
 
+def _open_stack(text, pos):
+    """text[:pos] を前から読み、まだ閉じていない ( と { を [(記号, 位置), ...] で返す。文字列・コメントの中は数えない。"""
+    st, quote, i = [], None, 0
+    while i < pos:
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c == "/" and text[i + 1:i + 2] == "/":
+            j = text.find("\n", i)
+            i = pos if j < 0 else j
+            continue
+        elif c == "/" and text[i + 1:i + 2] == "*":
+            j = text.find("*/", i + 2)
+            i = pos if j < 0 else j + 2
+            continue
+        elif c in "({":
+            st.append((c, i))
+        elif c in ")}" and st:
+            st.pop()
+        i += 1
+    return st
+
+
+def _top_q(s):
+    """s の深さ0の三項の `?` の位置(?. と ?? は除く)。無ければ -1。"""
+    depth, quote = 0, None
+    for i, c in enumerate(s):
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "?" and depth == 0 and s[i + 1:i + 2] not in (".", "?") and s[i - 1:i] != "?":
+            return i
+    return -1
+
+
+_COMP_DEF = re.compile(r"\b(?:function\s+([A-Z]\w*)\s*\(|const\s+([A-Z]\w*)\s*=\s*(?:async\s*)?\()")
+_MAP_PRE = re.compile(r"([\w$.]+)\.map$")
+
+
+def _enclosing_component(text, pos):
+    """pos を囲む、大文字で始まる関数(同じファイルの画面部品)を (名前, 開始, 終了) で返す。最も内側。無ければ None。"""
+    best = None
+    for m in _COMP_DEF.finditer(text, 0, pos):
+        sc = _scope_after_params(text, m.end() - 1)
+        if sc and sc[0] <= pos <= sc[1] and (best is None or sc[0] > best[1]):
+            best = (m.group(1) or m.group(2), sc[0], sc[1])
+    return best
+
+
+def _visible_chain(text, pos, depth=0):
+    """pos の要素を囲む表示条件の鎖を外側から順に [{cond, kind}] で返す(案 B4 a)。
+
+    kind: and(`cond && (`)/ ternary_then(`cond ? (`)/ ternary_else(`: (` の側、cond は深さ0の `?` の手前)/
+    map(`配列.map(`、cond は配列名)/ component(同じファイルの部品。呼出元の鎖を外側に連結し、callers が2以上なら呼出元のどれか)。
+    WHY: 要素が画面に出るかは囲む条件の積で決まる。直前の1段(visible_if)だけでは、入れ子の条件の外側を落とすため鎖で持つ。
+    ponytail: 直接の `cond && <el` の形(括弧なし)は、囲む要素の鎖では拾わない(整形ツールは括弧を付ける)。文字列は ' " ` のみ扱う。
+    """
+    st = _open_stack(text, pos)
+    local = []
+    for idx in range(len(st) - 1, -1, -1):
+        ch, o = st[idx]
+        if ch != "(":
+            continue
+        pre = text[:o].rstrip()
+        mm = _MAP_PRE.search(pre)
+        if mm:
+            local.append({"cond": mm.group(1), "kind": "map"})
+            continue
+        # WHY: JSX の式の中の ( だけを見る。関数本体の { の中の ( (return など)は条件ではない
+        if idx == 0 or st[idx - 1][0] != "{":
+            continue
+        b = st[idx - 1][1]
+        if text[:b].rstrip()[-1:] not in (">", "}", ""):
+            continue
+        if pre.endswith("&&"):
+            local.append({"cond": text[b + 1:len(pre) - 2].strip(), "kind": "and"})
+        elif pre.endswith("?"):
+            local.append({"cond": text[b + 1:len(pre) - 1].strip(), "kind": "ternary_then"})
+        elif pre.endswith(":"):
+            seg = text[b + 1:len(pre) - 1]
+            q = _top_q(seg)
+            if q >= 0:
+                local.append({"cond": seg[:q].strip(), "kind": "ternary_else"})
+    chain = list(reversed(local))
+    comp = _enclosing_component(text, pos)
+    if comp and depth < 3:
+        calls = [m.start() for m in re.finditer(rf"<{re.escape(comp[0])}\b", text)]
+        if calls:
+            outer = _visible_chain(text, calls[0], depth + 1)
+            chain = outer + [{"cond": "", "kind": "component", "name": comp[0], "callers": len(calls)}] + chain
+    return chain
+
+
 def jsx_elements(sources):
     """TSX の入力・操作系の要素(input/select/textarea/button)を {"jsx_elements": [...]} で返す(案 B2)。
 
@@ -761,7 +866,8 @@ def jsx_elements(sources):
                     vm = _VISIBLE_IF.search(text[max(0, m.start() - 200):m.start()])
                     out.append({
                         "id": f"JX{len(out) + 1:02d}", "tag": tag, "type": None, "label": "", "text": inner,
-                        "visible_if": vm.group(1) if vm else None, "item_type_hint": _DISPLAY_HINT[tag],
+                        "visible_if": vm.group(1) if vm else None, "visible_chain": _visible_chain(text, m.start()),
+                        "item_type_hint": _DISPLAY_HINT[tag],
                         "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, e) + 1}]})
                 continue
             ty = re.search(r"\btype=\"(\w+)\"", attrs)
@@ -784,10 +890,13 @@ def jsx_elements(sources):
             dis = re.search(r"\bdisabled=\{([^{}]*)\}", attrs)
             # WHY: select だけ選択肢の事実(options・map)を持つ。value と表示名の対が無いと、初期値 "register" を業務の表示名へ写せないため
             opts = _select_options(p, text, e) if tag == "select" else {}
+            chain = _visible_chain(text, m.start())
             out.append({
                 "id": f"JX{len(out) + 1:02d}", "tag": tag, "type": ty, "label": label,
                 "bind": bind.group(1) if bind else None, "on": _uniq(re.findall(r"\b(on[A-Z]\w*)=", attrs)),
-                "disabled": dis.group(1) if dis else None, "item_type_hint": hint, **opts,
+                "disabled": dis.group(1) if dis else None, "visible_chain": chain,
+                "disabled_chain": (chain + [{"cond": dis.group(1), "kind": "disabled"}]) if dis else None,
+                "item_type_hint": hint, **opts,
                 "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, e) + 1}]})
     return {"jsx_elements": out}
 
@@ -1410,6 +1519,79 @@ def selftest_initials():
     return 0
 
 
+_DERIVED_ARR = re.compile(r"\bconst\s+(\w+)\s*=\s*(?:useMemo\(\s*\(\)\s*=>\s*)?(\w+)\.(filter|map|slice|sort)\s*\(")
+
+
+def derived_arrays(sources):
+    """TSX の、配列から作る派生配列を {"derived_arrays": [{name, source, op, src}]} で返す(案 B4 c)。
+
+    呼出元: 配線は extract_react_draft 側(この関数は未接続)。useMemo の中の、または素の const の filter・map・slice・sort を拾う。
+    意味合い: 表示条件の鎖で `派生.length` と書かれた行数の元を読むための事実。元の名前は推測で埋めず、書かれたままを出す。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _DERIVED_ARR.finditer(text):
+            out.append({"name": m.group(1), "source": m.group(2), "op": m.group(3),
+                        "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1,
+                                 "line_end": text.count("\n", 0, m.end()) + 1}]})
+    return {"derived_arrays": out}
+
+
+def selftest_chain():
+    """表示条件の鎖(and・三項の then/else・map・同じファイルの部品の呼出元)と disabled_chain、derived_arrays を最小の TSX で assert する。"""
+    tsx = (
+        "function Row(props) {\n"
+        "  return <span>小計</span>;\n"
+        "}\n"
+        "export default function S() {\n"
+        "  const w = useMemo(() => rows.filter((r) => r.days > 0), [rows]);\n"
+        "  return (\n"
+        "    <div>\n"
+        "      {rows.length > 1 && (\n"
+        "        <span>合計</span>\n"
+        "      )}\n"
+        "      {rows.length > 2 && (\n"
+        "        <Row />\n"
+        "      )}\n"
+        "      {loading ? (\n"
+        "        <span>読込中…</span>\n"
+        "      ) : (\n"
+        "        <button disabled={!rows.length}>CSV</button>\n"
+        "      )}\n"
+        "      {w.map((r) => (\n"
+        "        <input type=\"checkbox\" checked={r.on} />\n"
+        "      ))}\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = jsx_elements([p])["jsx_elements"]
+            der = derived_arrays([p])["derived_arrays"]
+        sp = {g["text"]: g for g in got if g["tag"] == "span"}
+        bt = [g for g in got if g["tag"] == "button"][0]
+        ip = [g for g in got if g["tag"] == "input"][0]
+        assert sp["合計"]["visible_chain"] == [{"cond": "rows.length > 1", "kind": "and"}], sp["合計"]
+        assert sp["読込中…"]["visible_chain"] == [{"cond": "loading", "kind": "ternary_then"}], sp["読込中…"]
+        assert sp["小計"]["visible_chain"] == [{"cond": "rows.length > 2", "kind": "and"},
+                                           {"cond": "", "kind": "component", "name": "Row", "callers": 1}], sp["小計"]
+        assert bt["visible_chain"] == [{"cond": "loading", "kind": "ternary_else"}], bt
+        assert bt["disabled_chain"][-1] == {"cond": "!rows.length", "kind": "disabled"}, bt
+        assert ip["visible_chain"] == [{"cond": "w", "kind": "map"}] and ip["disabled_chain"] is None, ip
+        assert len(der) == 1 and (der[0]["name"], der[0]["source"], der[0]["op"]) == ("w", "rows", "filter"), der
+    except AssertionError as e:
+        print(f"[selftest NG] chain {e}")
+        return 1
+    print("[selftest OK] _react_facts.visible_chain/disabled_chain/derived_arrays")
+    return 0
+
+
 def selftest():
     """promise chain と try/catch の2形を最小の TSX で試し、失敗時の state と行番号を assert する。終了コード 0=OK / 1=NG。"""
     tsx = (
@@ -1464,6 +1646,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
