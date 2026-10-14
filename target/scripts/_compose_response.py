@@ -11,6 +11,8 @@ ORDER を 110 にする理由: 表示名の補完は論理名(_compose_db_facts.
      (検査 B14 が H3 へ戻す)
   b) response_items[].source.type が merged で、その API の db 操作が1本なら db にする
   c) response_to_screen_mapping[].screen_item_nth: 同じ名前の表示行が複数あるときだけ、表示行の nth を入れる
+  d) response_items[].data_type・nullable: キーが [] を含む行は、下書きの列の事実(式の ::型・COUNT・COALESCE・配列、DDL の型)で決める。
+     事実が無い欄はモデルの値を残す。モデルの値と食い違えば事実で上書きし、log に残す(H3 が index signature の union を写すのを止める)
 """
 import json
 import re
@@ -145,6 +147,103 @@ def _load_drafts(directory):
     return backend, specs
 
 
+# d) の型の対応(SQL の型名 → 設計書の型)。一般的な対応だけを持つ。ここに無い型(timestamp など)は決めず、モデルの値を残す
+_TYPE_WORDS = (
+    ("number", ("bigint", "int", "int2", "int4", "int8", "integer", "smallint", "numeric", "decimal", "real", "float", "float4", "float8", "double")),
+    ("string", ("text", "varchar", "char", "character", "bpchar", "citext", "uuid")),
+    ("boolean", ("bool", "boolean")),
+)
+
+
+def _is_array_type(t):
+    """設計書の型が配列か。「number | string | string[]」のような共用体は配列と見ない(index signature の写しを配列の印にしないため)。"""
+    s = str(t or "").strip()
+    return "|" not in s and (s.endswith("[]") or s.startswith(("array", "配列")))
+
+
+def _design_type(t):
+    """SQL の型名(小文字)を設計書の型へ。配列は "array" の印で返す。対応が無ければ None。"""
+    if t == "array":
+        return "array"
+    if t == "date":
+        return "date(YYYY-MM-DD)"
+    for design, words in _TYPE_WORDS:
+        if t in words:
+            return design
+    return None
+
+
+def _expr_fact(expr):
+    """SELECT 式の (SQL の型名, null 可) を式の形から読む。読めない欄は None。
+    取れる順: ARRAY_AGG(ARRAY_REMOVE で包んだものを含む)は array / 末尾の ::型(NULL::型 なら null 可)/ COUNT(...) は bigint・非 null /
+    COALESCE(...) は最後の引数が NULL でなければ非 null(型は見ない)。SUM(x) の無印などは推測しない。"""
+    e = str(expr or "").strip()
+    if re.match(r"(ARRAY_REMOVE\s*\(\s*)?ARRAY_AGG\s*\(", e, re.IGNORECASE):
+        return "array", None
+    t, null = None, None
+    m = re.search(r"::\s*(\w+)\s*$", e)
+    if m:
+        t, null = m.group(1).lower(), bool(re.match(r"NULL\s*::", e, re.IGNORECASE))
+    elif re.match(r"COUNT\s*\(", e, re.IGNORECASE):
+        t, null = "bigint", False
+    if re.match(r"COALESCE\s*\(", e, re.IGNORECASE) and not re.search(r",\s*NULL\s*\)", e, re.IGNORECASE):
+        null = False
+    return t, null
+
+
+def _column_facts(bd):
+    """backend 下書きの列ごとの事実 {別名: (SQL の型名, null 可)}。同じ別名が2通り以上の事実を持つとき(SQL ごとに型が違う)は決めない。"""
+    per = {}
+    for o in bd.get("db_operations") or []:
+        if not isinstance(o, dict):
+            continue
+        for c in o.get("columns") or []:
+            if isinstance(c, dict) and c.get("alias"):
+                per.setdefault(c["alias"], set()).add(_expr_fact(c.get("expression")))
+    ddl = {}
+    for f in bd.get("response_fields") or []:
+        if isinstance(f, dict) and f.get("index_signature") and f.get("path"):
+            ddl[_leaf(f["path"])] = (f.get("db_type"), f.get("db_nullable"))
+    out = {}
+    for alias, facts in per.items():
+        if len(facts) != 1:
+            continue
+        t, null = facts.pop()
+        dt, dn = ddl.get(alias, (None, None))
+        # fallback-ok: 式から型・null 可が読めない欄だけ、index signature の行の DDL の型で補う(式の事実を優先する)
+        t = t or dt
+        null = dn if null is None else null
+        if t is None and null is None:
+            continue
+        out[alias] = (t, null)
+    return out
+
+
+def _fill_types(api, bd, log):
+    """response_items の data_type・nullable を、backend 下書きの列の事実で決める(d)。
+    キーが [] を含む行(一覧の項目)だけを、同じ別名の列の事実で見る。事実が無い欄はモデルの値を残す。
+    WHY: TS の index signature(number | string | string[] | null)を H3 が写すと、SQL の型と食い違って毎回 verify_vs_source で止まるため。
+    SUM(...)::bigint は number・非 null。配列(ARRAY_AGG)は要素の型が分からなくても配列の印を付け、元が配列ならそのまま残す。"""
+    facts = _column_facts(bd)
+    for x in _list(api, "response_items"):
+        key = str(x.get("key") or "")
+        if "[]" not in key or _leaf(key) not in facts:
+            continue
+        t, null = facts[_leaf(key)]
+        old = (x.get("data_type"), x.get("nullable"))
+        d = _design_type(t)
+        if d == "array":
+            if not _is_array_type(x.get("data_type")):
+                x["data_type"] = "配列"
+        elif d:
+            x["data_type"] = d
+        if null is not None:
+            x["nullable"] = null
+        new = (x.get("data_type"), x.get("nullable"))
+        if new != old:
+            log.append(f"[型] api_spec[{api.get('action')}].response_items[{key}] を事実で決める: {old[0]}・null可 {old[1]} → {new[0]}・null可 {new[1]}")
+
+
 def fill(out, log):
     """api_spec の各行を補う。下書きが無い API は、下書きの db 操作の数が 0 なので b) は動かず、a) の列の参照も空になる。"""
     from _config_loader import INTERMEDIATE_DIR
@@ -156,6 +255,7 @@ def fill(out, log):
         _fill_display_names(out, api, cols, log)
         _fix_merged_source(api, len(dbs), log)
         _fill_screen_nth(api, specs, log)
+        _fill_types(api, bd, log)
 
 
 def _selftest():
@@ -202,6 +302,34 @@ def _selftest():
         {"api_field_path": "rows[].s9", "screen_item_name": "小計"}]}
     _fill_screen_nth(api3, specs, [])
     assert [m.get("screen_item_nth") for m in api3["response_to_screen_mapping"]] == [2, 3, None, None], api3
+
+    # d) 型の事実: SUM(...)::bigint は number・非 null(index signature の union を上書き)、COUNT は number、COALESCE は非 null、
+    #    ARRAY_AGG は配列(元が配列ならそのまま)、式が読めず DDL も無い列はモデルの値を残す、NULL::型 は null 可、DDL の型は式が読めない列だけ使う
+    bd = {"db_operations": [{"columns": [
+            {"alias": "sou", "expression": "SUM(p.sou)::bigint"},
+            {"alias": "n", "expression": "count(*)::bigint"},
+            # fallback-ok: COALESCE は式の形から非 null を読むことを確かめるテストの入力(既定値の切り替えではない)
+            {"alias": "nm", "expression": "COALESCE(s.name, '(不明)')"},
+            {"alias": "ds", "expression": "array_remove(array_agg(p.d ORDER BY p.d), NULL)"},
+            {"alias": "bare", "expression": "p.bare"},
+            {"alias": "nn", "expression": "NULL::text"}]}],
+          "response_fields": [{"path": "rows[].bare", "index_signature": True, "db_type": "date", "db_nullable": False}]}
+    fa = {"action": "a", "response_items": [
+        {"key": "rows[].sou", "data_type": "number | string | string[]", "nullable": True},
+        {"key": "rows[].n", "data_type": "number | string | string[]", "nullable": True},
+        {"key": "rows[].nm", "data_type": "string", "nullable": True},
+        {"key": "rows[].ds", "data_type": "string[]", "nullable": False},
+        {"key": "rows[].bare", "data_type": "string", "nullable": True},
+        {"key": "rows[].nn", "data_type": "string", "nullable": False},
+        {"key": "rows[].miss", "data_type": "number | string", "nullable": True},
+        {"key": "total", "data_type": "number | string", "nullable": True}]}
+    tlog = []
+    _fill_types(fa, bd, tlog)
+    got = {x["key"]: (x["data_type"], x["nullable"]) for x in fa["response_items"]}
+    assert got == {"rows[].sou": ("number", False), "rows[].n": ("number", False), "rows[].nm": ("string", False),
+                   "rows[].ds": ("string[]", False), "rows[].bare": ("date(YYYY-MM-DD)", False),
+                   "rows[].nn": ("string", True), "rows[].miss": ("number | string", True), "total": ("number | string", True)}, got
+    assert len(tlog) == 5, tlog
 
     # fill 全体: 一時の下書きを読み、表示名・出典・nth が入る。INTERMEDIATE_DIR は必ず戻す
     import json as _json

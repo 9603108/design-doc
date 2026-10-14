@@ -14,6 +14,7 @@
     - 応答の型を api.ts の型と照合する: 下書きの `apis[action].response_fields`(path・ts_base・nullable)に同じ path があれば、
       data_type は ts_base の語(string / number / boolean / `string[]` など。日付は date(YYYY-MM-DD) でもよい)に合わせ、
       `nullable`(true / false)は下書きの値をそのまま書く。型に `| null` がある項目は必ず `nullable: true`。下書きに無い key は nullable を書かない
+    - data_type・nullable は事実がある列では合成(_compose_response.py)が決める。TS の index signature(`number | string | string[] | null`)を写さない
 - action・key・name の字面は S2 も使う。ソースどおりに書く
 
 ## 書かない欄
