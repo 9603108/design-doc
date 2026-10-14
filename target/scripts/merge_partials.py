@@ -248,6 +248,12 @@ def _src_fact(sl_item: dict, env: dict, elements: list):
         # fallback-ok: 範囲の最初のタグが文言でないとき（<br /> から始まる等）は、タグを外して範囲の文言を取る
         if not text and not _is_array_use(r):
             text = _range_text(file, start, end, env)
+        # WHY(round12 V10): text_of_lines は範囲の最初の要素を閉じタグまで読むため、範囲の後ろの行（兄弟の項目）の文言が混ざることがある。
+        #   範囲の文言が前置きのときは範囲の文言に切る（IT61 の初期値に兄弟 IT62 の文言が入った）
+        elif text:
+            rt = _range_text(file, start, end, env)
+            if rt and len(rt) < len(text) and text.startswith(rt):
+                text = rt
     return {
         "active": {True: "非活性", False: "活性", None: "条件付き(式)"}[disabled_value(r["disabled_chain"], env)],
         "visible": chain_value(r["visible_chain"], env),
@@ -656,6 +662,40 @@ def _selftest_initialization() -> int:
         if sv != want_src:
             print(f"[selftest NG] src で結ぶ初期処理の表 {sv}")
             return 1
+    # 範囲が要素の途中で終わる形（範囲の開始の要素が閉じタグまで続き、兄弟の文言が範囲の後ろにある）。範囲の文言で切ること。
+    # WHY(round12 V10): 範囲の後ろの兄弟の文言が初期値に混ざった（IT61 に IT62 の文言）。要素全体の範囲は今までどおり
+    cut_tsx = (
+        "export default function S() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <p>\n"
+        "        注記の前半\n"
+        "      </p>\n"
+        "      <p>兄弟の文言</p>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        cut_path = str(Path(td) / "C.tsx")
+        Path(cut_path).write_text(cut_tsx, encoding="utf-8")
+        cl = cut_tsx.split("\n")
+
+        def line_of(s: str) -> int:
+            return next(i for i, x in enumerate(cl, 1) if x.strip() == s)
+
+        cut_screen = {"items": [
+            {"item_name": "前半で切る", "item_type": "Label",
+             "src": [{"file": cut_path, "line_start": line_of("<div>"), "line_end": line_of("注記の前半")}]},
+            {"item_name": "要素全体", "item_type": "Label",
+             "src": [{"file": cut_path, "line_start": line_of("<p>"), "line_end": line_of("</p>")}]},
+        ]}
+        cut_got = build_initialization(events, cut_screen, [], src_drafts)
+        cv = {i["item_name"]: i["initial_value"] for i in cut_got["items"]}
+    if cv != {"前半で切る": "注記の前半", "要素全体": "注記の前半"}:
+        print(f"[selftest NG] 範囲の後ろの行の文言が初期値に混ざる {cv}")
+        return 1
     print("[selftest OK] merge_partials.initialization")
     return 0
 
