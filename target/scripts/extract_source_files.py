@@ -434,13 +434,22 @@ def _imported_shared_modules(backend: list, root, actions: set) -> list:
 
 
 def _screen_actions(data: dict) -> set:
-    """画面の API の action 名（中間JSON の backend_processes[].endpoint.action）。
+    """画面の API の action 名の和集合（重複なし）。
 
-    2026-10-14 T11 再修正: _imported_shared_modules の起点（画面の API）を決める材料。
+    2026-10-14 U5: extract_source_files は backend_processes ができる前（migrate_v17_to_v18 より前）に
+    走るため、その時点で在る欄も読む。読む欄は backend_processes[].endpoint.action・
+    api_spec[].action・db_operations[].api_endpoint.action の3つ。
+    目的: _imported_shared_modules の起点（画面の API）を決める材料。
     接続情報: main が読む。無ければ空集合（何も足さない）。
     """
-    return {(bp.get("endpoint") or {}).get("action")
-            for bp in (data.get("backend_processes") or []) if (bp.get("endpoint") or {}).get("action")}
+    actions = {(bp.get("endpoint") or {}).get("action")
+               for bp in (data.get("backend_processes") or [])}
+    actions |= {sp.get("action") for sp in (data.get("api_spec") or [])}
+    actions |= {(db.get("api_endpoint") or {}).get("action")
+                for db in (data.get("db_operations") or [])}
+    actions.discard(None)
+    actions.discard("")
+    return actions
 
 def main():
     if not INTERMEDIATE_JSON.exists():
@@ -566,6 +575,18 @@ def selftest() -> int:
                 return 1
             if _imported_shared_modules(backend, root, set()) != []:
                 print("[NG] selftest: actions が空なのに足された", file=sys.stderr)
+                return 1
+            # U5: backend_processes が無い段（api_spec と db_operations だけ在る）でも画面の action を読む
+            early = {"api_spec": [{"action": "list_pos_account_report"}],
+                     "db_operations": [{"api_endpoint": {"action": "list_pos_account_report"}}]}
+            if _screen_actions(early) != {"list_pos_account_report"}:
+                print(f"[NG] selftest: backend_processes 無しの action が {sorted(_screen_actions(early))}", file=sys.stderr)
+                return 1
+            if _screen_actions({}) != set():
+                print("[NG] selftest: 欄が無いのに action が出た", file=sys.stderr)
+                return 1
+            if {b["path"] for b in _imported_shared_modules(backend, root, _screen_actions(early))} != want:
+                print("[NG] selftest: backend_processes 無しの段で定義元が足されない", file=sys.stderr)
                 return 1
             print("[OK] selftest: 画面の API の関数が使う名前の定義元だけ足す（db.py・unused_mod.py は足さない）")
             return 0
