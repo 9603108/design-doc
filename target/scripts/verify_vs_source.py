@@ -34,6 +34,19 @@ _JSX_TEXT = re.compile(r">((?:[^<>{}]|\{[^{}]*\})+)<")
 # WHY: 強調・コードなどのインライン要素は文の途中に入るが、文は1つなので、照合用にはタグを外す
 _INLINE_TAG = re.compile(r"</?(?:strong|em|b|i|code|span|small|a|kbd)\b[^>]*>")
 _HOLE = re.compile(r"\{[^{}\s]+\}")
+# WHY(round14 R2): JSX は、改行を含む空白がタグ・式の境界に接すると、その空白を捨てる(Babel の cleanJSXElementLiteralChild)。
+#   「こちらは⏎        <strong>POSが…」は画面で「こちらはPOSが…」と出る。norm は改行を空白1つにするので「こちらは POSが…」になり、
+#   画面どおりの全文(S1 が正しく書いた例示値)が1字の空白の差で WARN になった(run13 の IT63)。タグを外す前に、この空白を落とした版も作る
+_NL_WS = r"[ \t]*\r?\n\s*"
+_INLINE_TAG_RX = _INLINE_TAG.pattern
+
+
+def _jsx_faithful(text):
+    """TSX の本文から、改行を含む空白が強調・コード等のインライン要素の境界に接する所の空白を落とし、タグを外した文字列。
+    画面に出る字面(JSX の空白の規則)に近い版。呼出元: collect_source_strings(従来の版に足す。厳しくせず、通る例を増やす側だけ)。"""
+    t = re.sub(rf"{_NL_WS}(?=({_INLINE_TAG_RX}))", "", text)
+    t = re.sub(rf"({_INLINE_TAG_RX}){_NL_WS}", r"\1", t)
+    return _INLINE_TAG.sub("", t)
 
 
 def norm(s):
@@ -222,6 +235,8 @@ def collect_source_strings(files):
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(text))
             # WHY: <strong>や<code>の境界で文が切れている(「<strong>取込欠損の疑い</strong>：…」)ので、インライン要素のタグを外した版からも文を取る
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(_INLINE_TAG.sub("", text)))
+            # WHY(round14 R2): 画面は、改行の空白がタグに接する所で空白を持たない(JSX の規則)。その版の文も持つ(上の版は残す)
+            out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(_jsx_faithful(text)))
             # WHY: テンプレートと式の並びは、字面を穴で割った断片に加えて、穴を任意の値とみなす正規表現(_Pat)としても持つ
             out.update(_patterns(_INLINE_TAG.sub("", text)))
     out.discard("")
@@ -306,10 +321,29 @@ def _example_in_source(text, strings):
     return all(_pat_hit(part, strings) or _in_source(_EX_NUMBER.sub("{_}", part), strings) for part in whole.split(" / "))
 
 
+# WHY(round14 R2): チェックの状態(オン・オフ)と表の行数(22行(空欄項目を除くと16行))は、ソースに字面が無い導出の値。
+#   字面で照合すると S1 が「空欄項目も表示」「22」のように検査に合わせた不自然な例へ変えた(run13)。この2つの形だけ照合しない。
+_STATE_EXAMPLES = ("オン", "オフ", "ON", "OFF", "チェックあり", "チェックなし", "選択", "未選択")
+_ROW_COUNT_EX = re.compile(r"[0-9０-９]+\s*行(?:\s*[（(][^）)]*?[0-9０-９]+\s*行\s*[）)])?")
+
+
+def _derived_example(item):
+    """例示値が、ソースの字面を持たない導出の値の形か。Checkbox・RadioButton の状態語、Grid の行数(N行・N行(…を除くとM行))。
+    呼出元: check_examples。形が合うものだけ。他の語を足して通さない。"""
+    ex = norm(str(item.get("example") or ""))
+    kind = item.get("item_type")
+    if kind in ("Checkbox", "RadioButton"):
+        return ex in _STATE_EXAMPLES
+    if kind == "Grid":
+        return bool(_ROW_COUNT_EX.fullmatch(ex))
+    return False
+
+
 def check_examples(items, strings):
     """S1 の screen_layout.items[].example が、ソースの文字列に実在するか(D1 後半)。"""
     return [f"[WARN] [例示値] screen_layout.items[{i.get('item_name')}]: example「{i['example']}」がソースの文字列に無い → 差し戻し先 S1"
-            for i in items if isinstance(i, dict) and i.get("example") and not _wholly_runtime(i.get("src")) and not _example_in_source(norm(str(i["example"])), strings)]
+            for i in items if isinstance(i, dict) and i.get("example") and not _wholly_runtime(i.get("src")) and not _derived_example(i)
+            and not _example_in_source(norm(str(i["example"])), strings)]
 
 
 def _name_variants(names):
@@ -1463,6 +1497,23 @@ def selftest():
         assert check_examples([{"item_name": "エラー表示", "example": "Error: Failed to fetch", "src": line_at(7, 7)}], ps) == [], "まるごと実行時の項目を WARN にした"
         got = check_examples([{"item_name": "読込中表示", "example": "作り話の表示", "src": line_at(8, 8)}], ps)
         assert len(got) == 1 and got[0].startswith("[WARN] [例示値]"), got
+    # round14 R2: JSX は改行を含む空白がタグに接すると空白を捨てる。画面どおりの全文(こちらはPOSが…)を通す。空白を足した従来の形も通す。作り話は通さない
+    with tempfile.TemporaryDirectory() as td:
+        r2 = Path(td, "note.tsx")
+        r2.write_text('export default function P() {\n  return (\n    <div className="meta-note">\n'
+                      '        ソースは <code>pos_account_reports</code>（POS＝PowerDo の取込結果）。\n'
+                      '        売上レポートが受注から集計するのに対し、こちらは\n'
+                      '        <strong>POSが締めた金額そのまま</strong>で、金額は税込。\n'
+                      '        <br />\n    </div>\n  );\n}\n', encoding="utf-8")
+        rs = collect_source_strings([r2])
+        full = "ソースは pos_account_reports（POS＝PowerDo の取込結果）。 売上レポートが受注から集計するのに対し、こちらはPOSが締めた金額そのままで、金額は税込。"
+        assert check_examples([{"item_name": "注記", "example": full}], rs) == [], "画面どおりの全文(改行の空白が捨てられる形)を WARN にした"
+        assert check_examples([{"item_name": "注記", "example": full.replace("こちらは", "こちらは ")}], rs) == [], "従来の形(空白あり)を通さなくなった"
+        assert len(check_examples([{"item_name": "注記", "example": full.replace("POSが締めた", "POSが締めない")}], rs)) == 1, "作り話の全文を通した"
+        # チェックの状態と表の行数は導出の値。Label など他の種別は字面で照合する
+        chk = lambda t, e: check_examples([{"item_name": "x", "item_type": t, "example": e}], rs)
+        assert chk("Checkbox", "オフ") == [] and chk("Grid", "22行(空欄項目を除くと16行)") == [] and chk("Grid", "17行") == [], "導出の値を WARN にした"
+        assert len(chk("Label", "オフ")) == 1 and len(chk("Grid", "22行(作り話)")) == 1 and len(chk("Checkbox", "作り話")) == 1, "導出の形以外を通した"
     # 行範囲: 範囲の外の behavior(control_src だけが範囲に重なる)とは結ばない。範囲の中の表示切替に合う kind は通す
     bh16 = [{"id": "BH16", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(216), "control_src": []},
             {"id": "BH17", "kind": "enable_toggle", "cond": "!rows.length", "target": "", "src": sp(282), "control_src": sp(200, 232)}]

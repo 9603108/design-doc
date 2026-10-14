@@ -25,6 +25,8 @@ from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_e
 from _initial_eval import _value
 # WHY: 画面項目の src（TSX の行範囲）から、表示条件・活性・文言を位置で結ぶ（round10 T15）
 from _jsx_chain import resolve_for_lines, text_of_lines
+# WHY(round14 R2): 固定文の字面は、example を付ける _compose_fixed_example と同じ関数で取る(初期値と例示値を1字も違えない)
+from _compose_fixed_example import literal_screen_text
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -243,6 +245,10 @@ def _src_fact(sl_item: dict, env: dict, elements: list):
     if not attr and kind in ("Button", "Link"):
         # WHY: ボタンの名前は画面に出る文言（JSX の label）。label が無いときは範囲の文言で取る
         text = next((str(el["label"]) for el in elements if el.get("label")), None)
+    if not attr and kind == "Label":
+        # WHY(round14 R2): 固定文は、画面に出る字面(JSX の空白の規則)で取る。text_of_lines は改行の空白を空白1つにするので「こちらは POSが…」になり、
+        #   画面と、合成が example に付ける字面(「こちらはPOSが…」)が1字違った。文字列リテラルだけで決まる文言だけここで取り、式を含む文言は下の評価器に任せる
+        text = literal_screen_text(file, start, end)
     if not attr and kind in ("Label", "Button", "Link") and not text:
         text = (text_of_lines(file, start, end, lambda e: _text_value(e, env)) or "").strip()
         # fallback-ok: 範囲の最初のタグが文言でないとき（<br /> から始まる等）は、タグを外して範囲の文言を取る
