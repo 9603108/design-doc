@@ -24,6 +24,7 @@ v18 の呼ぶ側／呼ばれる側 体系（trigger_groups / front_processes / b
 """
 import functools
 import json
+import re
 import sys
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する
@@ -292,6 +293,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
 
     # それ以外の event_processes を F002 以降に
     csv_codes = _csv_trigger_codes()
+    step_facts = _step_facts()
     idx = 2
     for ep in event_processes:
         ev_code = ep.get("event_code", "")
@@ -306,7 +308,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
         event_to_id[ev_code] = process_id
 
         ev = event_map.get(ev_code, {})
-        steps = _build_event_steps(ep, ev, csv_codes)
+        steps = _build_event_steps(ep, ev, csv_codes, *step_facts)  # W9: 事実(fact の key・ハンドラの形)で種別を決める
 
         # v30: overview は override 優先、なければ _derive_short_overview で自動短縮
         # 意味合い: 業務目的1文に絞ることで「概要」と「steps」の重複を防ぐ
@@ -615,19 +617,105 @@ def _build_event_steps_by_text(ep: dict, ev: dict) -> list:
     return steps
 
 
-def _build_event_steps(ep: dict, ev: dict, csv_codes: frozenset = frozenset()) -> list:
-    """_build_event_steps_by_text の結果に、CSV 出力の事実を足す(V9 b)。
+@functools.lru_cache(maxsize=None)
+def _step_facts() -> tuple:
+    """react 下書きから、手順の種別を「事実」で決めるための2つの表を返す: ({文: fact の key}, {event_code: ハンドラの形})。下書きが無い・読めないときは ({}, {})。
+    WHY: 手順の種別(特に state_update と補足 note)を文面の語の当て推量でなく、下書きの事実で決めるため(新7(残))。
+         文は event_processes[].fact_lines[].text、key は start・success・failure・empty・csv.* など。
+         ハンドラの形は events[].source.handler を _handler_shape で "setter"(set<名前>( と preventDefault だけ)か "other" に分けたもの。
+    接続: _build_event_steps が読む(呼出元は build_front_processes)。読み元は _csv_trigger_codes と同じ下書き1本。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return {}, {}
+    try:
+        data = json.loads(draft.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, {}
+    texts = {}
+    for ep in data.get("event_processes") or []:
+        for f in (ep.get("fact_lines") or []) if isinstance(ep, dict) else []:
+            if isinstance(f, dict) and f.get("text") and f.get("key"):
+                texts.setdefault(str(f["text"]).strip(), str(f["key"]))
+    shapes = {}
+    for ev in data.get("events") or []:
+        if isinstance(ev, dict) and ev.get("event_code"):
+            handler = (ev.get("source") or {}).get("handler") if isinstance(ev.get("source"), dict) else None
+            shapes[ev["event_code"]] = _handler_shape(handler)
+    return texts, shapes
 
-    WHY: CSV 出力の手順は文面に CSV・ダウンロードの語が無いと既定の state_update に倒れる(例: 「直近に確定した期間の結果を表示する」)。
-         そのイベントが csv_codes(react 下書きの csv_exports[].trigger_events)に出るなら、既定に倒れた step だけ file_output にする。
-         語が当たった kind(branch など)と、CSV を出さないイベントの step は変えない。
-    csv_codes: CSV を出すイベントの event_code の集合(呼出元は build_front_processes。_csv_trigger_codes で読む)。
+
+def _handler_shape(handler) -> str:
+    """イベントのハンドラの文字列が「state の setter の呼出(と preventDefault)だけ」なら "setter"、それ以外は "other"。
+    WHY: setter だけのハンドラは、その最初の行が「state を更新する」だけの手順と決まる(規則3)。useEffect・関数名・取得を呼ぶ処理は決めない。
+    接続: _step_facts が events[].source.handler に当てる。"""
+    h = (handler or "").strip()
+    h = re.sub(r"^(async\s*)?(\([^)]*\)|\w+)\s*=>\s*", "", h)
+    if h.startswith("{") and h.endswith("}"):
+        h = h[1:-1]
+    stmts, depth, cur = [], 0, ""
+    for ch in h:  # トップレベルの ; で文に分ける(括弧の中の ; は分けない)
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == ";" and depth == 0:
+            stmts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    stmts.append(cur.strip())
+    stmts = [s for s in stmts if s]
+    ok = bool(stmts) and all(re.match(r"^set[A-Z]\w*\(", s) or re.match(r"^\w+\.preventDefault\(\)$", s) for s in stmts)
+    return "setter" if ok and any(s.startswith("set") for s in stmts) else "other"
+
+
+_NEGATIVE_ENDINGS = ("しない", "せず", "ない", "変わらない", "影響しない", "反映しない")
+
+
+def _ends_negative(text: str) -> bool:
+    """括弧の中を除いた文末が否定(しない・せず・ない・変わらない・影響しない・反映しない)なら True。
+    WHY: 「〜は変わらない」「〜に影響しない」は処理の手順ではなく補足(note)。括弧内の注記(「…(前の表示が残らない)」等)は文末として見ない。"""
+    t = re.sub(r"[（(][^（()）]*[）)]", "", text or "")
+    t = t.strip().rstrip("。.　 ")
+    return t.endswith(_NEGATIVE_ENDINGS)
+
+
+def _build_event_steps(ep: dict, ev: dict, csv_codes: frozenset = frozenset(), facts: dict = None, shapes: dict = None) -> list:
+    """_build_event_steps_by_text の結果の kind を、下書きの事実で決め直す(新7(残)。V9 b の CSV の既定は規則3に畳んだ)。
+
+    WHY: 文面の語だけで種別を決めると、状態を変えるだけの行・補足の行(「〜は変わらない」)が screen_update・calculation・state_update に散る。
+         事実(fact の key・ハンドラの形・CSV の出力)で決められるものは事実で決め、補足は新しい種別 note(docx では「補足」)にする。
+    規則(上から。data_load・backend_call・response_mapping の行は変えない):
+      1. 文が下書きの fact_lines の text と同じ: key が start・success・failure → state_update、empty → screen_update、csv.* → file_output。
+      2. 括弧の中を除いた文末が否定なら note。
+      3. 2 に当たらない最初の行: イベントが csv_codes にあれば file_output、ハンドラが setter だけなら state_update。
+      4. 2・3 に当たらない2行目以降は、by_text が既定の state_update に倒したものだけ note(語が当たった種別は残す)。
+    csv_codes: CSV を出すイベントの event_code の集合(_csv_trigger_codes)。facts・shapes: _step_facts の2つの表(無ければ事実なしで、規則2・4だけが動く)。
+    接続: 呼出元は build_front_processes。note は generate_docx.js が「補足」と表示する。
     """
+    facts = facts or {}
+    shapes = shapes or {}
     steps = _build_event_steps_by_text(ep, ev)
-    if ep.get("event_code") in csv_codes:
-        for s in steps:
-            if s["kind"] == "state_update":
+    code = ep.get("event_code")
+    for i, s in enumerate(steps):
+        if s["kind"] in ("data_load", "backend_call", "response_mapping"):
+            continue
+        key = facts.get(s["description"].strip())
+        if key in ("start", "success", "failure"):
+            s["kind"] = "state_update"
+        elif key == "empty":
+            s["kind"] = "screen_update"
+        elif key and key.startswith("csv."):
+            s["kind"] = "file_output"
+        elif _ends_negative(s["description"]):
+            s["kind"] = "note"
+        elif i == 0:
+            if code in csv_codes:
                 s["kind"] = "file_output"
+            elif shapes.get(code) == "setter":
+                s["kind"] = "state_update"
+        elif s["kind"] == "state_update":
+            s["kind"] = "note"
     return steps
 
 
@@ -1157,6 +1245,37 @@ def selftest() -> int:
         c2 = _build_event_steps(dict(det, event_code="EV11"), {}, frozenset({"EV10"}))
         assert [s["kind"] for s in c2] == ["state_update", "branch", "file_output"], c2
         assert [s["kind"] for s in _build_event_steps(dict(det, event_code="EV10"), {})] == ["state_update", "branch", "file_output"]
+        # W9: 種別を事実(fact の key・ハンドラの形・CSV)で決め、補足は note にする(新7(残))
+        facts = {"取得の開始時に、loading を true にする": "start", "取得に成功したときは、rows を置き換える": "success",
+                 "取得に失敗したときは、error を設定する": "failure", "0件のときは該当なしを表示する": "empty",
+                 "見出し行: 開始日": "csv.header", "データ行: 表示中の行ごと": "csv.row"}
+        shapes = {"EV20": "other", "EV21": "setter", "EV22": "other"}
+        w1 = _build_event_steps({"event_code": "EV20", "src": span(10, 20), "details": [
+            "・入力中の期間を確定する", "・取得の開始時に、loading を true にする", "・list_x をリクエストする",
+            "・取得に成功したときは、rows を置き換える", "・取得に失敗したときは、error を設定する", "・0件のときは該当なしを表示する",
+            "・入力の確認はせず、入力された値のまま確定する"]}, {}, frozenset(), facts, shapes)
+        assert [s["kind"] for s in w1] == ["state_update", "state_update", "backend_call", "state_update", "state_update",
+                                           "screen_update", "note"], w1
+        # setter だけのハンドラ: 1行目 state_update、否定の2行目 note
+        w2 = _build_event_steps({"event_code": "EV21", "src": span(10, 20), "details": [
+            "・入力された開始日を保持する", "・集計結果は「表示」を押すまで変わらない"]}, {}, frozenset(), facts, shapes)
+        assert [s["kind"] for s in w2] == ["state_update", "note"], w2
+        # CSV のイベント: 1行目 file_output、「影響しない」の2行目 note、csv.* は file_output
+        w3 = _build_event_steps({"event_code": "EV22", "src": span(10, 20), "details": [
+            "・表示中の結果を保存する", "・未確定の日付は保存する内容に影響しない", "・見出し行: 開始日", "・データ行: 表示中の行ごと"]},
+            {}, frozenset({"EV22"}), facts, shapes)
+        assert [s["kind"] for s in w3] == ["file_output", "note", "file_output", "file_output"], w3
+        # 括弧の中の否定は文末として見ない
+        assert not _ends_negative("反映する(変わらない)") and _ends_negative("反映しない(注記)。") and _ends_negative("確認はせず")
+        # 2行目以降: 語が当たった種別(branch)は残し、既定の state_update だけ note
+        w4 = _build_event_steps({"event_code": "EV20", "src": span(10, 20), "details": [
+            "・期間を確定する", "・店舗が指定された場合は絞り込む", "・結果の見せ方だけを変える"]}, {}, frozenset(), {}, {})
+        assert [s["kind"] for s in w4] == ["state_update", "branch", "note"], w4
+        # ハンドラの形
+        assert _handler_shape("(e) => { e.preventDefault(); setApplied({ from, to }); }") == "setter"
+        assert _handler_shape("(e) => setShopId(e.target.value === \"\" ? \"\" : Number(e.target.value))") == "setter"
+        assert _handler_shape("useEffect(マウント時)") == "other" and _handler_shape("exportCsv") == "other" and _handler_shape(None) == "other"
+        assert _handler_shape("(e) => { setX(1); load(); }") == "other"
     finally:
         _react_behaviors = real
 
