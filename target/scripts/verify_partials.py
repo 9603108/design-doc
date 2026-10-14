@@ -167,6 +167,7 @@ def selftest():
         assert [p for p in check_partial(todo, "受注入力") if p.startswith("[未記入]")], "未記入の印を検出しない"
 
         selftest_units()
+        selftest_warn()
         import verify_vs_source
         assert verify_vs_source.selftest() == 0
     except AssertionError as e:
@@ -380,6 +381,74 @@ def check_composed_gaps(composed, frags):
     return problems
 
 
+# 説明の要の語の判定に使う英数字の識別子(3字以上)。日本語は見ない(ソース内の表記が揺れるため)
+_KEY_TERM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+# 例示値の穴 {名前}。実行時に決まる値の書き方なので、例示値に残ると例として読めない
+_EX_HOLE = re.compile(r"\{[^{}]+\}")
+_DATE_EX = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+
+
+def _src_text(src):
+    """出典(file・line_start・line_end)の範囲の本文。読めなければ None。呼出元: check_explanation_warn。"""
+    try:
+        lines = Path(src["file"]).read_text(encoding="utf-8").splitlines()
+        return "\n".join(lines[src["line_start"] - 1:src["line_end"]])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def check_explanation_warn(frags):
+    """説明文の要の語が、出典の範囲のソース本文に1つも無い行を [WARN] で返す(終了コードには影響させない)。
+    理由: 出典が付いていても範囲が別の処理を指すと、説明は根拠の無い文のまま出典の印だけ付く。
+    英数字の識別子(3字以上・EV01 のような符号は除く)が説明に無い、または出典が読めないときは判定しない(誤検出を避ける)。
+    呼出元: main_units。接続: _src_rows の SRC_KEYS の行を見る。"""
+    found = []
+    for unit, frag in frags.items():
+        for r in _src_rows(frag):
+            if r.get("event_code") == "EV00" or not r.get("src"):
+                continue
+            text = " ".join(str(r.get(k) or "") for k in ("content", "description", "overview"))
+            terms = {t for t in _KEY_TERM.findall(text) if not re.fullmatch(r"[A-Z]+\d+", t)}
+            bodies = [_src_text(s) for s in r["src"] if isinstance(s, dict)]
+            if not terms or not bodies or any(b is None for b in bodies):
+                continue
+            body = "\n".join(bodies)
+            if not any(t in body for t in terms):
+                found.append((unit, r.get("event_code") or r.get("action") or r.get("item_name") or r.get("message_id") or "?"))
+    if not found:
+        return []
+    names = ", ".join(dict.fromkeys(n for _, n in found))
+    units = ", ".join(sorted({u for u, _ in found}))
+    return [f"[WARN] [根拠] 行 {len(found)} 件: 説明の要の語が出典の範囲に無い: {names} → 差し戻し先 {units}"]
+
+
+def check_example_format(frags):
+    """S1 の例示値の書式を見る。日付の項目(Calendar)の例示値が日付の書式(yyyy-mm-dd 等)に合わないものを ERROR で返す。
+    戻りは問題の文字列 list。ERROR は main_units の problems に入り終了コード 1 になる。{名前} の穴は check_example_warn が WARN で出す。呼出元: main_units。"""
+    bad_fmt = []
+    for it in ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        ex, name = str(it.get("example") or ""), str(it.get("item_name") or "?")
+        # 穴(例 {集計開始日})は書式の問題ではなく check_example_warn の WARN で扱う。ここで ERROR にすると WARN と二重になり、終了コードも 1 になる
+        if it.get("item_type") == "Calendar" and ex and not _EX_HOLE.search(ex) and not _DATE_EX.search(ex):
+            bad_fmt.append(f"{name}(例 {ex!r})")
+    out = []
+    if bad_fmt:
+        out.append(f"[例示値] screen_layout.items: 日付の項目の例示値が日付の書式に合わない: {', '.join(bad_fmt)} → 差し戻し先 S1")
+    return out
+
+
+def check_example_warn(frags):
+    """S1 の例示値に {名前} の穴が残るものを [WARN] で返す(終了コードには影響させない)。
+    実行時に決まる値の書き方が例示値に残ると、例として読めないため S1 へ戻す。呼出元: main_units。"""
+    holes = [str(it.get("item_name") or "?") for it in ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
+             if isinstance(it, dict) and _EX_HOLE.search(str(it.get("example") or ""))]
+    if not holes:
+        return []
+    return [f"[WARN] [例示値] screen_layout.items: 例示値に {{…}} の穴が残る: {', '.join(holes)} → 差し戻し先 S1"]
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -396,7 +465,7 @@ def main_units(directory, only=None):
         print(f"[入力不正] {directory} に _unit_*.json が無い", file=sys.stderr)
         return 2
     problems += _units.check_all(spec, frags, only)
-    extra = check_unit_extras(frags, directory)
+    extra = check_unit_extras(frags, directory) + check_example_format(frags)
     # 合成後の穴(画面への写しの欠け・400 の検査の漏れ)。project_config を渡して下書きの展開済み ID へ寄せた形で見る
     extra += check_composed_gaps(_units.compose(spec, frags, {}), frags)
     problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
@@ -405,7 +474,7 @@ def main_units(directory, only=None):
     # WARN は終了コードに影響しない(合成で機械的に補うため)
     for w in check_h2_logical_names(frags.get("H2") or {}):
         print(w)
-    for w in check_src_warn(frags):
+    for w in check_src_warn(frags) + check_explanation_warn(frags) + check_example_warn(frags):
         print(w)
     # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
     s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
@@ -574,6 +643,34 @@ def selftest_units():
     src_lack = {"H1": {"events": [{"event_code": "EV02"}]}, "S3": {"event_processes": [{"event_code": "EV00"}, {"event_code": "EV01", "src": []}]}}
     out = check_src_warn(src_lack)
     assert len(out) == 1 and out[0].startswith("[WARN] [出典]") and "行 2 件" in out[0] and "差し戻し先 H1, S3" in out[0], out
+
+
+def selftest_warn():
+    """説明の要の語が出典の範囲に無いときの [WARN]、例示値の {名前} の [WARN]、日付の例示値の書式の ERROR を assert する。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "h.py"
+        src.write_text("def save_order(x):\n    return x\n\ndef other():\n    pass\n", encoding="utf-8")
+        ok = {"H1": {"events": [{"event_code": "EV01", "content": "save_order で保存する",
+                                 "src": [{"file": str(src), "line_start": 1, "line_end": 2}]}]}}
+        assert check_explanation_warn(ok) == [], "根拠のある説明で WARN を出した"
+        ng = {"H1": {"events": [{"event_code": "EV01", "content": "delete_customer を消す",
+                                 "src": [{"file": str(src), "line_start": 4, "line_end": 5}]}]}}
+        out = check_explanation_warn(ng)
+        assert len(out) == 1 and out[0].startswith("[WARN] [根拠]") and out[0].endswith("差し戻し先 H1"), out
+        no_src = {"H1": {"events": [{"event_code": "EV01", "content": "save_order で保存する"}]}}
+        assert check_explanation_warn(no_src) == [], "出典が無い行は判定しない(WARN は別の check_src_warn)"
+    s1 = {"S1": {"screen_layout": {"items": [{"item_name": "総売上", "example": "{金額} 円", "item_type": "Label"},
+                                            {"item_name": "期間", "example": "2026-10", "item_type": "Calendar"}]}}}
+    assert [w for w in check_example_warn(s1) if "{…} の穴" in w and "総売上" in w], check_example_warn(s1)
+    fmt = check_example_format(s1)
+    assert len(fmt) == 1 and fmt[0].startswith("[例示値]") and "期間" in fmt[0], fmt
+    assert not check_example_format({"S1": {"screen_layout": {"items": [{"example": "2026-10-01", "item_type": "Calendar"}]}}}), "正しい日付で ERROR"
+    # 日付の項目の穴は ERROR にしない(WARN だけ出す。終了コードを変えない)
+    hole_cal = {"S1": {"screen_layout": {"items": [{"item_name": "集計開始日", "example": "{集計開始日}", "item_type": "Calendar"}]}}}
+    assert check_example_format(hole_cal) == [], "日付の穴を ERROR にした"
+    assert [w for w in check_example_warn(hole_cal) if "集計開始日" in w], "日付の穴を WARN にしない"
+    print("[selftest OK] verify_partials.warn")
 
 
 def main(argv=None):
