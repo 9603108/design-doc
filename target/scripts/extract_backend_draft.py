@@ -830,18 +830,37 @@ def _agg_units(sql, feats):
     scope が main なら本体 SELECT の GROUP BY、cte <名前> ならその CTE の本体の GROUP BY。group_by が空なら結果全体で1つ(unit は "全体")。
     なぜ要るか: count(*) AS days が「何を1と数えるか」(例: 店舗×レジ単位の日数)の取り違えを防ぐ。呼出元: extract()(db_operations の aggregate_units)。
     ponytail: GROUP BY が列でない式・番号のときは式の原文をそのまま出す。"""
-    ctes = {c["name"]: c["definition"] for c in _subqueries(sql)[0]}
-    cache = {}
+    cte_list, subs = _subqueries(sql)
+    ctes = {c["name"]: c["definition"] for c in cte_list}
+    flat = " ".join(sql.split())
 
-    def gb(scope):
-        if scope not in cache:
-            body = ctes.get(scope[4:], "") if scope.startswith("cte ") else sql
-            rows = _clauses(body)["group_by"] if body else []
-            cache[scope] = [(r["logical_table"] + "." if r["logical_table"] else "") + r["logical_column"] for r in rows]
-        return cache[scope]
+    def gb(body):
+        rows = _clauses(body)["group_by"] if body else []
+        return [(r["logical_table"] + "." if r["logical_table"] else "") + r["logical_column"] for r in rows]
 
-    return [{"func": a["func"], "arg": a["arg"], "alias": a["alias"], "scope": a["scope"], "group_by": gb(a["scope"]),
-             "unit": ", ".join(gb(a["scope"])) or "全体"} for a in feats["aggregates"]]
+    out = []
+    for a in feats["aggregates"]:
+        scope, alias, call = a["scope"], a["alias"], a["func"] + "(" + a["arg"] + ")"
+        body = ctes.get(scope[4:], "") if scope.startswith("cte ") else sql
+        if scope == "main":
+            # 括弧つき副問合せの中の集計は、外側の GROUP BY ではなくその副問合せ自身の GROUP BY で数える(features は CTE しか区別しない)
+            sub = next((s for s in subs if re.search(re.escape(call), s["definition"], re.IGNORECASE)), None)
+            if sub:
+                scope, body = "subquery " + sub["location"], sub["definition"]
+        if alias is None:
+            # array_remove(array_agg(..)) AS x のように集計が式の中に入っているとき、外側の式の別名を補う。取れなければ空文字(別名なしを None と区別して単位の取り違えを防ぐ)
+            i = flat.find(call)
+            alias, depth = "", 0
+            for k in range(i + len(call), len(flat)) if i >= 0 and not scope.startswith("subquery") else ():
+                depth += (flat[k] == "(") - (flat[k] == ")")
+                if depth < 0 and flat[k] == ")":  # 外側の式を閉じる括弧の直後に AS があれば、それが式全体の別名
+                    am = re.match(r"\s*(?:::\w+\s*)?AS\s+(\w+)", flat[k + 1:], re.IGNORECASE)
+                    if am:
+                        alias = am.group(1)
+                        break
+        g = gb(body)
+        out.append({"func": a["func"], "arg": a["arg"], "alias": alias, "scope": scope, "group_by": g, "unit": ", ".join(g) or "全体"})
+    return out
 
 
 def _merge_aggs(per):
@@ -1254,6 +1273,12 @@ def selftest():
     assert bu2[0]["unit"] == "全体" and bu2[0]["group_by"] == [], bu2
     mg = _merge_aggs([("group = register", _agg_units(bsql, _features(bsql, _mask(bsql)))), ("group = shop", bu2)])
     assert [(x["alias"], x.get("when")) for x in mg] == [("days", "group = register"), ("mk", "group = register"), ("n", "group = shop")], mg
+    # 副問合せの中の集計は外側の GROUP BY を継がず(scope=subquery、単位は全体)、式に入った集計は外側の別名を補う
+    qsql = ("SELECT s.name, array_remove(array_agg(p.d), NULL) AS warn_dates FROM p JOIN s ON s.id = p.m "
+            "WHERE p.d = (SELECT max(d) FROM p) GROUP BY s.name")
+    qu = _agg_units(qsql, _features(qsql, _mask(qsql)))
+    assert [(u["func"], u["alias"], u["scope"], u["unit"]) for u in qu] == [
+        ("array_agg", "warn_dates", "main", "s.name"), ("max", "", "subquery WHERE", "全体")], qu
     ce = _error_origins([{"errors": [{"code": "getattr(e, 'code', None) or 'validation_error'", "message": "str(e)"},
                                       {"code": "internal_error", "message": "f'{type(e).__name__}: {e}'"}]}])[0]["errors"]
     assert [(x["code_from"], x["code_default"], x["message_from"]) for x in ce] == [

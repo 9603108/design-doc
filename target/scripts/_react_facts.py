@@ -504,9 +504,16 @@ def _csv_rows(text, body, qn):
     out = {"function": ln, "row_param": rp, "value_separator": jm.group(1) if jm else None,
            "columns": [_csv_col(el, rp, qn) for el in _split_top(body[ao + 1:ae])]}
     if src:
-        sm = re.search(rf"\bconst\s+{re.escape(src.group(2))}\s*=\s*useMemo\(\s*\(\)\s*=>\s*(\w+)\.(filter|slice|sort)\b", text)
-        out["rows_array"] = {"name": src.group(2), "derived_from": sm.group(1) if sm else None,
-                             "op": sm.group(2) if sm else None, "filtered": bool(sm and sm.group(2) == "filter")}
+        name = src.group(2)
+        # WHY: 派生は useMemo を介さない素の `const x = y.filter(…)` も見る(useMemo は任意)。派生が見つからず、元配列が state でも props でもなければ、何で作られたか不明なので filtered は False と断定せず None にする
+        sm = re.search(rf"\bconst\s+{re.escape(name)}\s*=\s*(?:useMemo\(\s*\(\)\s*=>\s*)?(\w+)\.(filter|slice|sort)\b", text)
+        is_state = any(m.group(1) == name for m in _USESTATE.finditer(text))
+        is_prop = bool(re.search(rf"\bprops\.{re.escape(name)}\b|\(\s*\{{[^()]*\b{re.escape(name)}\b[^()]*\}}", text))
+        filtered = bool(sm and sm.group(2) == "filter")
+        if not sm and not (is_state or is_prop):
+            filtered = None
+        out["rows_array"] = {"name": name, "derived_from": sm.group(1) if sm else None,
+                             "op": sm.group(2) if sm else None, "filtered": filtered}
     pm = re.search(rf"(\w+)\.push\(\s*{re.escape(ln)}\(\s*null\s*,\s*(\w+)", body)
     if pm:
         tm = re.search(rf"\bconst\s+{re.escape(pm.group(2))}\s*=\s*useMemo\(\s*\(\)\s*=>\s*(.+?),\s*\[", text)
@@ -665,6 +672,51 @@ _VISIBLE_IF = re.compile(r"\{\s*([^{}?]+?)\s*(?:&&|\?(?!\.))\s*\(?\s*$")
 # 入力・操作系の要素 → 画面項目の item_type(案 B2 の表)。input は type で決まる
 _HINT = {"select": "ComboBox", "textarea": "TextArea", "button": "Button"}
 _INPUT_HINT = {"date": "Calendar", "checkbox": "Checkbox", "submit": "Button", "button": "Button"}
+_OPTION_OPEN = re.compile(r"<option\b")
+_MAP_OPEN = re.compile(r"\{\s*([\w$.]+)\s*\.map\(")
+_VALUE_ATTR = re.compile(r"\bvalue=(?:\"([^\"]*)\"|\{([^{}]*)\})")
+
+
+def _select_options(p, text, e):
+    """select の開きタグの `>` の位置 e から、選択肢の事実を {"options": [...], "map": {…} または None} で返す。
+
+    呼出元: jsx_elements()。options は value が引用符の定数の option → {"value", "text"}。value 属性の無い option は HTML の規則どおり文言を値にする。
+    map は `{配列.map(…)}` の中の option(value が式)の事実 → {"array", "array_origin", "value_expr", "label_expr", "src"}。
+    意味合い: 初期値 "register" を業務の表示名へ写すには value と表示名の対が事実として要る。map の値は配列の中身を見ないと決まらないので、
+    推測で埋めず、配列名と式の原文だけ出す(array_origin は配列が useState の state のときだけ "state")。
+    ponytail: map は最初の1件だけ見る。map の外の式の value は拾わない。
+    """
+    close = text.find("</select>", e)
+    body = text[e + 1:close if close >= 0 else len(text)]
+    mm = _MAP_OPEN.search(body)
+    mend = _end(body, mm.start()) if mm else -1
+    options, dyn = [], None
+    for om in _OPTION_OPEN.finditer(body):
+        oe = _tag_end(body, om.start())
+        oc = body.find("</option>", oe)
+        inner = "" if body[oe - 1] == "/" or oc < 0 else body[oe + 1:oc]
+        vm = _VALUE_ATTR.search(body[om.end():oe])
+        in_map = mm is not None and mm.start() < om.start() < mend
+        if in_map:
+            if dyn is None:
+                dyn = {"value_expr": vm.group(2).strip() if vm and vm.group(2) is not None else None,
+                       "label_expr": re.sub(r"\s+", " ", inner).strip()}
+            continue
+        plain = re.sub(r"<[^>]*>|\{[^{}]*\}", "", inner).strip()
+        if vm and vm.group(1) is not None:
+            options.append({"value": vm.group(1), "text": plain})
+        elif vm is None and "{" not in inner:
+            # WHY: HTML では value 属性が無い option の値は文言そのもの。推測ではなく仕様どおりに写す
+            options.append({"value": plain, "text": plain})
+    mp = None
+    if dyn:
+        arr = mm.group(1)
+        s, en = e + 1 + mm.start(), e + 1 + mend
+        mp = {"array": arr,
+              "array_origin": "state" if any(g.group(1) == arr for g in _USESTATE.finditer(text)) else None,
+              **dyn,
+              "src": {"file": str(p), "line_start": text.count("\n", 0, s) + 1, "line_end": text.count("\n", 0, en) + 1}}
+    return {"options": options, "map": mp}
 
 
 def _tag_end(text, i):
@@ -689,6 +741,7 @@ def jsx_elements(sources):
 
     呼出元: extract_react_draft.main()。意味合い: 画面項目(S1)がソースの画面部品と過不足なく対応するかを verify_vs_source.check_items が見る元。
     label: button は中の文言、checkbox は包む <label> の文言、それ以外は直前の <label>…</label>。item_type_hint は上の表。
+    select は options(value→表示名の定数)と map(配列から作る選択肢の式。_select_options を参照)を持つ。
     表示専用の要素(span・strong・h1・h2・a・table。文言が空のものは table 以外出さない)は text・visible_if(直前の `{cond && (`・三項)を持つ。
     ponytail: visible_if は直前の1段だけ(入れ子の外側の cond は見ない)。div・ul は拾わない。要れば _DISPLAY_HINT に足す。
     """
@@ -729,10 +782,12 @@ def jsx_elements(sources):
                 label = lm.group(1).strip() if lm else ""
             bind = re.search(r"\b(?:value|checked)=\{(\w+)\}", attrs)
             dis = re.search(r"\bdisabled=\{([^{}]*)\}", attrs)
+            # WHY: select だけ選択肢の事実(options・map)を持つ。value と表示名の対が無いと、初期値 "register" を業務の表示名へ写せないため
+            opts = _select_options(p, text, e) if tag == "select" else {}
             out.append({
                 "id": f"JX{len(out) + 1:02d}", "tag": tag, "type": ty, "label": label,
                 "bind": bind.group(1) if bind else None, "on": _uniq(re.findall(r"\b(on[A-Z]\w*)=", attrs)),
-                "disabled": dis.group(1) if dis else None, "item_type_hint": hint,
+                "disabled": dis.group(1) if dis else None, "item_type_hint": hint, **opts,
                 "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, e) + 1}]})
     return {"jsx_elements": out}
 
@@ -1085,6 +1140,51 @@ def selftest_jsx():
     return 0
 
 
+def selftest_select_options():
+    """select の定数 option(value="" を含む)・map の option(配列名・value の式・表示の式)・value 属性の無い option を最小の TSX で assert する。"""
+    tsx = (
+        "export default function S() {\n"
+        "  const [shops, setShops] = useState<Shop[]>([]);\n"
+        "  const [shopId, setShopId] = useState<number | \"\">(\"\");\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <label>店舗</label>\n"
+        "      <select value={shopId} onChange={(e) => setShopId(Number(e.target.value))}>\n"
+        "        <option value=\"\">- 全店 -</option>\n"
+        "        {shops.map((s) => (\n"
+        "          <option key={s.id} value={s.id}>\n"
+        "            {s.name}{s.registers > 1 ? `（レジ${s.registers}台）` : \"\"}\n"
+        "          </option>\n"
+        "        ))}\n"
+        "      </select>\n"
+        "      <label>集計単位</label>\n"
+        "      <select value={g}>\n"
+        "        <option value=\"register\">レジ別（現行と同じ）</option>\n"
+        "        <option>店舗別</option>\n"
+        "      </select>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = jsx_elements([p])["jsx_elements"]
+        a, b = got[0], got[1]
+        assert a["label"] == "店舗" and a["options"] == [{"value": "", "text": "- 全店 -"}], a
+        assert a["map"]["array"] == "shops" and a["map"]["array_origin"] == "state", a["map"]
+        assert a["map"]["value_expr"] == "s.id" and a["map"]["label_expr"].startswith("{s.name}"), a["map"]
+        assert a["map"]["src"]["line_start"] == 9, a["map"]
+        assert b["label"] == "集計単位" and b["bind"] == "g" and b["map"] is None, b
+        assert b["options"] == [{"value": "register", "text": "レジ別（現行と同じ）"}, {"value": "店舗別", "text": "店舗別"}], b
+    except AssertionError as e:
+        print(f"[selftest NG] select_options {e}")
+        return 1
+    print("[selftest OK] _react_facts.select_options")
+    return 0
+
+
 def selftest_calc():
     """calc の式・operands・funcs・guards・label・operand_labels・行番号を最小の TSX で assert する。"""
     tsx = (
@@ -1288,6 +1388,21 @@ def selftest_initials():
         assert [x["kind"] for x in c] == ["same", "ternary", "ternary", "ternary"], c
         assert c[1]["total_value"] == '"合計"' and c[1]["quoted"] and c[2]["total_value"] == '""' and not c[2]["quoted"], c
         assert {"target": "dates", "separator": " "} in cv["joins"] and {"target": "[…]", "separator": ","} in cv["joins"], cv["joins"]
+        # useMemo を介さない素の filter は派生として拾い、filtered は True
+        vis = ("const [rows, setRows] = useState<Row[]>([]);\n"
+               "const exportCsv = () => {\n"
+               "  const visible = rows.filter((r) => r.days > 0);\n"
+               "  const line = (r: Row | null, agg: Agg) => [r ? r.a : \"x\"].join(\",\");\n"
+               "  const lines = visible.map((r, i) => line(r, aggs[i]));\n"
+               "};\n")
+        assert _csv_rows(vis, vis[vis.find("{", vis.find("exportCsv")):], None)["rows_array"]["filtered"] is True
+        # 元配列が state でも props でもなく、派生も無い(makeRows() で作られた)なら filtered は None(不明)
+        nd = vis.replace("const visible = rows.filter((r) => r.days > 0);", "const data = makeRows();").replace("visible.map", "data.map")
+        assert _csv_rows(nd, nd[nd.find("{", nd.find("exportCsv")):], None)["rows_array"]["filtered"] is None
+        # 元配列が state そのものなら派生なし・filtered は False
+        sd = nd.replace("const data = makeRows();", "").replace("data.map", "rows.map")
+        assert _csv_rows(sd, sd[sd.find("{", sd.find("exportCsv")):], None)["rows_array"] == \
+            {"name": "rows", "derived_from": None, "op": None, "filtered": False}
     except AssertionError as e:
         print(f"[selftest NG] initials/csv_rows {e}")
         return 1
@@ -1349,6 +1464,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)

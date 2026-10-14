@@ -93,7 +93,8 @@ def _state_by_label(drafts: list) -> dict:
 def _option_texts(drafts: list) -> dict:
     """選択欄の名前 → {option の value: 表示名}。下書きの jsx_elements が options を持つものだけ入る。
     意味合い: 選択欄の初期値（例 "register"）を業務の表示名（例 レジ別）へ写すための事実。無ければ空にして、推測で言い換えない。
-    接続情報: 現状の react 下書きは options を書かないため、実運用では空になりうる（その場合は引用符を外した値を書く）。"""
+    接続情報: 下書きの jsx_elements（_react_facts.jsx_elements の select の options）が入る。map だけで作る選択肢は options が空なので入らず、
+              その場合は引用符を外した値を書く（表示名を推測で足さない）。"""
     out = {}
     for d in drafts:
         for el in d.get("jsx_elements") or []:
@@ -339,6 +340,41 @@ def _selftest_initialization() -> int:
     if got["db_operations_ref"] != ["db_op_a", "db_op_b"]:
         print(f"[selftest NG] db_operations_ref {got['db_operations_ref']}")
         return 1
+    # 実ソースの TSX から作った事実（_react_facts の jsx_elements・state_initials）でも、選択肢の表示名に置き換わること。
+    # WHY: 手書きの下書きだけ確かめると、下書きが options を出さない従来の形で空振りしても気づけないため
+    import tempfile
+    import _react_facts
+    tsx = (
+        "export default function S() {\n"
+        "  const [shopId, setShopId] = useState<number | \"\">(\"\");\n"
+        "  const [group, setGroup] = useState<PosGroup>(\"register\");\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <label>店舗</label>\n"
+        "      <select value={shopId} onChange={(e) => setShopId(Number(e.target.value))}>\n"
+        "        <option value=\"\">- 全店 -</option>\n"
+        "      </select>\n"
+        "      <label>集計単位</label>\n"
+        "      <select value={group} onChange={(e) => setGroup(e.target.value as PosGroup)}>\n"
+        "        <option value=\"register\">レジ別（現行と同じ）</option>\n"
+        "        <option value=\"shop\">店舗別（レジ合算）</option>\n"
+        "      </select>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tp = Path(td) / "S.tsx"
+        tp.write_text(tsx, encoding="utf-8")
+        real = [{"jsx_elements": _react_facts.jsx_elements([tp])["jsx_elements"],
+                 "state_initials": _react_facts.state_initials([tp])["state_initials"]}]
+    rb = build_initialization(events, {"items": [{"item_name": "店舗", "item_type": "ComboBox"},
+                                                 {"item_name": "集計単位", "item_type": "ComboBox"}]}, [], real)
+    rv = {i["item_name"]: i["initial_value"] for i in rb["items"]}
+    if rv != {"店舗": "- 全店 -", "集計単位": "レジ別（現行と同じ）"}:
+        print(f"[selftest NG] 実ソースの選択肢の表示名 {rv}")
+        return 1
+
     # 下書きが無いときは従来どおり Blank（既存値の項目を除く）と空の参照になる
     bare = build_initialization(events, screen, dbs, [])
     if {i["item_name"]: i["initial_value"] for i in bare["items"]}["集計単位"] != "Blank" or bare["db_operations_ref"] != []:
