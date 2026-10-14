@@ -171,6 +171,64 @@ def _fill_agg(op, dop):
             row["alias"] = al.pop()
 
 
+_RENAME_SOURCES = ("docstring", "comment", "csv_header", "ui_label")
+
+
+def _draft_names(drafts):
+    """backend 下書きの列の論理名のうち、出所が事実(_RENAME_SOURCES)のものを 別名 -> 論理名 にする。
+    WHY: 出所が推定(ui_label_guess・guess)の名前は寄せる根拠にしない。同じ別名の論理名が下書きごとに
+         食い違うときは、どれが正しいか事実が決まらないので載せない。"""
+    seen = {}
+    for d in drafts:
+        for a in (d.get("apis") or {}).values():  # fallback-ok: 下書きの apis は任意
+            for dop in (a or {}).get("db_operations") or []:  # fallback-ok: 下書きの欄は任意
+                for c in dop.get("columns") or []:  # fallback-ok: 列は任意
+                    if c.get("logical_name_source") in _RENAME_SOURCES and c.get("alias_name") and c.get("logical_name"):  # fallback-ok: 欄が無い列は対象外
+                        seen.setdefault(c["alias_name"], set()).add(c["logical_name"])
+    return {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
+
+
+def _rename_logical_names(out, drafts, log):
+    """logical_names の論理名を、事実の出所の名前へ寄せ、同じ旧名を使う句・応答の表示名も同じ置換にする。
+    WHY: H2 が付けた論理名と、ソースの型コメント・docstring の論理名が食い違うと、同じ列が表ごとに別名になる。
+         旧名が別の別名にも付いているときは、どの列の置換か決まらないので触らない。"""
+    names = _draft_names(drafts)
+    lns = out.get("logical_names") or []  # fallback-ok: logical_names は任意
+    aliases_of = {}
+    for r in lns:
+        if r.get("logical_column"):  # fallback-ok: 列名の無い行は対象外
+            aliases_of.setdefault(r["logical_column"], set()).add(r.get("alias_name"))  # fallback-ok: 別名の無い行も数える
+    renames = {}  # (論理表, 旧名) -> 新名
+    for r in lns:
+        alias, old = r.get("alias_name"), r.get("logical_column")  # fallback-ok: 欄が無い行は下で除く
+        new = names.get(alias)
+        if not old or not new or new == old:
+            continue
+        if len(aliases_of[old]) > 1:
+            log.append(f"WARN _compose_db_facts: 論理名 {old} が複数の別名に付くため {new} へ寄せない({alias})")
+            continue
+        r["logical_column"] = new
+        renames[(r.get("logical_table") or "", old)] = new  # fallback-ok: 表名の無い行は表を空として扱う
+        log.append(f"INFO _compose_db_facts: 論理名 {old} を {new} へ寄せる({alias})")
+    if not renames:
+        return
+
+    def _fix(rows):
+        for row in rows or []:  # fallback-ok: 句は任意
+            k = (row.get("logical_table") or "", row.get("logical_column") or "")  # fallback-ok: 欄が空の行は一致しない
+            if k in renames:
+                row["logical_column"] = renames[k]
+
+    for op in out.get("db_operations") or []:  # fallback-ok: db_operations は任意
+        for key in ("dataset", "where", "group_by", "order_by", "joins"):
+            _fix(op.get(key))
+    by_name = {old: new for (_t, old), new in renames.items()}
+    for spec in out.get("api_spec") or []:  # fallback-ok: api_spec は任意
+        for it in spec.get("response_items") or []:  # fallback-ok: 応答の項目は任意
+            if it.get("display_name") in by_name:  # fallback-ok: 表示名の無い項目は対象外
+                it["display_name"] = by_name[it["display_name"]]
+
+
 def _compose_db(out, drafts, log):
     ops = out.get("db_operations") or []  # fallback-ok: db_operations は任意(無い版は何もしない)
     lns = out.get("logical_names") or []  # fallback-ok: logical_names は任意
@@ -195,6 +253,7 @@ def _compose_db(out, drafts, log):
             _translate_row(row, pt2lt, lt2pt, col)
             if row.get("condition"):  # fallback-ok: 条件の無い joins は対象外
                 row["condition"] = _translate_condition(row["condition"], aliases, pt2lt, col)
+    _rename_logical_names(out, drafts, log)         # c0) 論理名を事実の出所の名前へ寄せる(下の(推定)の前)
     for r in lns:                                   # c) 論理表名の「(推定)」
         if r.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
             r["logical_table"] = _sfx(r["logical_table"])
@@ -319,6 +378,38 @@ def selftest():
                                           "value": "x"}]}]}
     _compose_db(out4, [], [])
     assert out4["db_operations"][0]["where"][0]["logical_column"] == "会計日", out4["db_operations"][0]["where"]
+    # T17: 論理名を事実の出所の名前へ寄せる(docstring・ui_label)。推定の出所は寄せない。旧名が複数の別名に付くときは触らない
+    drafts2 = [{"apis": {"x": {"db_operations": [{"id": "d1", "columns": [
+        {"alias_name": "shop_id", "logical_name": "店番号", "logical_name_source": "docstring"},
+        {"alias_name": "uri_cnt", "logical_name": "売上訂正点数", "logical_name_source": "ui_label"},
+        {"alias_name": "amb", "logical_name": "別名X", "logical_name_source": "comment"},
+        {"alias_name": "guess_col", "logical_name": "推定名(推定)", "logical_name_source": "ui_label_guess"},
+    ]}]}}}]
+    out5 = {"logical_names": [
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "mise_no", "logical_column": "店舗ID", "alias_name": "shop_id"},
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "uri_cnt", "logical_column": "売上訂正件数", "alias_name": "uri_cnt"},
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "amb", "logical_column": "旧名", "alias_name": "amb"},
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "g", "logical_column": "旧名", "alias_name": "other"},
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "gc", "logical_column": "推定元", "alias_name": "guess_col"},
+    ], "db_operations": [{"id": "x_op", "dataset": [
+        {"logical_table": "POS会計", "logical_column": "店舗ID", "alias_name": "shop_id"},
+        {"logical_table": "POS会計", "logical_column": "売上訂正件数", "alias_name": "uri_cnt"},
+    ], "where": [{"logical_table": "POS会計", "logical_column": "旧名"}]}],
+        "api_spec": [{"response_items": [{"display_name": "店舗ID"}, {"display_name": "売上訂正件数"}]}]}
+    log5 = []
+    _rename_logical_names(out5, drafts2, log5)
+    ln5 = out5["logical_names"]
+    assert ln5[0]["logical_column"] == "店番号", ln5[0]
+    assert ln5[1]["logical_column"] == "売上訂正点数", ln5[1]
+    assert ln5[2]["logical_column"] == "旧名" and ln5[3]["logical_column"] == "旧名", (ln5[2], ln5[3])
+    assert ln5[4]["logical_column"] == "推定元", ln5[4]
+    op5 = out5["db_operations"][0]
+    assert op5["dataset"][0]["logical_column"] == "店番号" and op5["dataset"][1]["logical_column"] == "売上訂正点数", op5["dataset"]
+    assert op5["where"][0]["logical_column"] == "旧名", op5["where"]
+    assert out5["api_spec"][0]["response_items"][0]["display_name"] == "店番号", out5["api_spec"]
+    assert out5["api_spec"][0]["response_items"][1]["display_name"] == "売上訂正点数", out5["api_spec"]
+    assert log5 and any("WARN" in x for x in log5), log5
+    print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
     print("[selftest OK] _compose_db_facts (B2: 物理列・when・句の論理名・(推定)・集計の別名・derived の除外)")
 
 
