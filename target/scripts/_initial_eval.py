@@ -244,20 +244,41 @@ def truth(expr: str, env: dict):
     return t
 
 
+def _any_of(chains: list, env: dict):
+    """呼出元（使用箇所）の鎖のどれかが表示かどうか。どれかが真なら True、全部偽なら False、他は None。
+    WHY: 呼出元のどれかで表示されるなら、その部品は初期表示で出る。全部偽のときだけ出ない。"""
+    results = [chain_value(c, env) for c in chains if isinstance(c, list)]
+    if not results:
+        return None
+    if any(r is True for r in results):
+        return True
+    if all(r is False for r in results):
+        return False
+    return None
+
+
 def chain_value(chain: list, env: dict):
     """表示条件の鎖（visible_chain）の評価。全部真なら True、どれか偽なら False、評価できない項があれば None。空の鎖は True。
     kind: and・ternary_then は cond が真、ternary_else は cond が偽、map は配列（cond が配列名）が1件以上。
-    component は呼出元の鎖が前側に連結済みなので cond を見ない。呼出元が2か所以上なら、どの呼出元かが決まらないので None。"""
+    component は呼出元の鎖が前側に連結済みなので cond を見ない。caller_chains（array_use も同じ）があれば、呼出元ごとの鎖のどれかで決める。caller_chains が無く呼出元が2か所以上なら None。"""
     result = True
     for item in chain or []:
         kind = item.get("kind")
         # fallback-ok: cond が無い項は空の式として扱い、評価できず None になる（推測で真偽を決めない）
         cond = item.get("cond") or ""
-        if kind == "component":
+        if kind in ("component", "array_use"):
+            # WHY: caller_chains があれば、呼出元（使用箇所）ごとの鎖で決める。callers の件数だけでは
+            #      どの呼出元かが分からず、1つ目が偽・2つ目が真のときに誤るため。
+            chains = item.get("caller_chains") or []
+            if chains:
+                r = _any_of(chains, env)
+            elif kind == "array_use":
+                r = None  # 使用箇所が無い配列は決められない（呼出側は found=False にする）
             # fallback-ok: callers が無い component は呼出元1か所とみなす（_react_facts は必ず callers を出す）
-            if (item.get("callers") or 1) < 2:
+            elif (item.get("callers") or 1) < 2:
                 continue
-            r = None
+            else:
+                r = None
         elif kind == "map":
             v = _value(cond, env)
             r = len(v) > 0 if isinstance(v, list) else None
@@ -360,6 +381,29 @@ def selftest() -> int:
         got = chain_value(chain, env)
         if got != want:
             print(f"[selftest NG] chain_value({chain}) = {got!r}, want {want!r}")
+            return 1
+    # caller_chains（呼出元ごとの鎖）は callers より優先する。どれかが真なら真、全部偽なら偽、他は None。
+    # WHY: 呼出元の件数だけでは「1つ目が偽・2つ目が真」を取り違えるため、呼出元ごとに評価する。
+    yes = [{"cond": "!loading", "kind": "and"}]
+    no = [{"cond": "rows.length > 1", "kind": "and"}]
+    unknown = [{"cond": "dyn", "kind": "and"}]
+    caller_cases = [
+        ([{"kind": "component", "name": "Card", "callers": 2, "caller_chains": [no, yes]}], True),
+        ([{"kind": "component", "name": "Card", "callers": 2, "caller_chains": [no, no]}], False),
+        ([{"kind": "component", "name": "Card", "callers": 2, "caller_chains": [no, unknown]}], None),
+        ([{"kind": "component", "name": "Card", "callers": 2, "caller_chains": []}], None),
+        ([{"kind": "array_use", "name": "LEFT", "caller_chains": [no, yes]}], True),
+        ([{"kind": "array_use", "name": "LEFT", "caller_chains": [no, no]}], False),
+        ([{"kind": "array_use", "name": "LEFT"}], None),
+        ([{"kind": "component", "name": "Row", "callers": 2, "caller_chains": [
+            [{"kind": "component", "name": "Inner", "callers": 2, "caller_chains": [no]}]]}], False),
+        ([{"kind": "component", "name": "Row", "callers": 2, "caller_chains": [
+            [{"kind": "component", "name": "Inner", "callers": 2, "caller_chains": [yes]}]]}], True),
+    ]
+    for chain, want in caller_cases:
+        got = chain_value(chain, env)
+        if got != want:
+            print(f"[selftest NG] chain_value(caller_chains) = {got!r}, want {want!r}: {chain}")
             return 1
     if disabled_value(None, env) is not False:
         print("[selftest NG] disabled_value(None)")
