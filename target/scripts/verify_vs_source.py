@@ -970,6 +970,72 @@ def check_forbidden_words(data):
     return problems
 
 
+# --- V7: 表示切替の画面ルール(VL)と CSV の実際の動き・CSV の整形の有無の照合(新5・新9。ERROR。差し戻し先は各行の末尾) ---
+# WHY: 文面と処理の実際の動きが食い違う所だけを止める。言い換えは見ない。CSV の整形は下書きの formats_numbers(false のときだけ)で判定する
+_CSV_FORMAT_WORDS = ("桁区切り", "整形", "書式")
+
+
+def _state_changes(failure_effects):
+    """イベントごとに、処理で値が変わる state の名前の集合(failure_effects の before_call・in_finally・on_success・on_failure)。
+    記録の無いイベント(CSV 出力など)は含めない。呼出元: check_state_setters。"""
+    out = {}
+    for f in failure_effects or []:
+        if not isinstance(f, dict) or not f.get("event"):
+            continue
+        names = {str(s).split("=")[0].strip() for s in list(f.get("before_call") or []) + list(f.get("in_finally") or [])}
+        names |= {str(s).strip() for s in list(f.get("on_success") or []) + list(f.get("on_failure") or [])}
+        out.setdefault(f["event"], set()).update(n for n in names if n)
+    return out
+
+
+def check_state_setters(validations, behaviors, failure_effects, csv_exports):
+    """表示切替の画面ルール(VL)の文面に CSV の処理が出るのに、CSV 出力は画面の条件の state を変えない場合を ERROR にする(新5)。
+    対: kind=表示切替 の VL で、src が表示切替の behavior と重なり、rule・applied_when に「CSV」があり、field に CSV が無いもの。
+    state: behavior の cond の語のうち、取得の処理で変わるもの(_state_changes)。CSV の trigger_events のどれも、その state を変えないときだけ ERROR。
+    WHY: 「読込中…」は取得の処理中だけ出る。CSV 出力は loading を立てないので、CSV の処理中に読込中と出すのは画面と食い違う(run11 の VL13)。
+    記録の無いイベントは state を変えないとみなす。呼出元: main。behaviors・csv_exports が無ければ何も言わない。"""
+    if not behaviors or not csv_exports:
+        return []
+    changes = _state_changes(failure_effects)
+    known = set().union(*changes.values()) if changes else set()
+    csv_events = [e for c in csv_exports if isinstance(c, dict) for e in c.get("trigger_events") or []]
+    if not csv_events:
+        return []
+    problems = []
+    for v in validations or []:
+        if not isinstance(v, dict) or v.get("kind") != "表示切替" or not v.get("src") or "CSV" in str(v.get("field") or ""):
+            continue
+        if "CSV" not in " ".join(str(v.get(k) or "") for k in ("rule", "applied_when")):
+            continue
+        for b in behaviors:
+            if not isinstance(b, dict) or b.get("kind") != "display_toggle" or not _overlap(v["src"], b.get("src") or []):
+                continue
+            states = set(re.findall(r"[A-Za-z_]\w*", str(b.get("cond") or ""))) & known
+            if not states or any(states & changes.get(e, set()) for e in csv_events):
+                continue
+            who = sorted(e for e, s in changes.items() if states & s)
+            problems.append(f"[ERROR] [状態] validations[{v.get('no') or v.get('field')}]: 文面に CSV の処理が出るが、CSV 出力は {'・'.join(sorted(states))} を変えない(変えるのは {'・'.join(who)})。文面から外す → 差し戻し先 H4")
+    return problems
+
+
+def check_cl_csv_format(common_logic, csv_exports):
+    """CSV が数値を整形しない(csv_exports の formats_numbers が全部 false)のに、共通ロジックの文が「CSV」と整形の語(桁区切り・整形・書式)を同じ文に書くものを ERROR にする(新9)。
+    文は「。」と改行で切る。formats_numbers が null・欄なしのときは読み飛ばす(判定できない)。
+    WHY: 画面の整形と CSV の値を1文に混ぜると、CSV も整形すると読まれる(run11 の CL2)。呼出元: main。"""
+    fmt = {c.get("formats_numbers") for c in csv_exports or [] if isinstance(c, dict)} - {None}
+    if fmt != {False}:
+        return []
+    problems = []
+    for c in common_logic or []:
+        if not isinstance(c, dict):
+            continue
+        texts = [str(c.get(k) or "") for k in ("name", "description", "expression")] + [str(s.get("description") or "") for s in c.get("processing_steps") or [] if isinstance(s, dict)]
+        sents = [x for t in texts for x in re.split(r"[。\n]", t)]
+        if any("CSV" in x and any(w in x for w in _CSV_FORMAT_WORDS) for x in sents):
+            problems.append(f"[ERROR] [CSV整形] common_logic[{c.get('no') or c.get('name')}]: CSV の値を整形すると書いているが、CSV 出力は数値を整形しない(formats_numbers=false)。画面だけの整形と書き分ける → 差し戻し先 S1")
+    return problems
+
+
 def selftest():
     # 事実(別名・集計・CTE・副問合せ・例外の code)の照合
     col = lambda al, kind, real_c="", src=(), expr="x": {"alias": al, "alias_name": al, "kind": kind, "real_column": real_c, "source_columns": list(src),
@@ -1306,6 +1372,28 @@ def selftest():
     assert len(check_item_remarks_units(dd_item, dd_api, None, set())) == 1, "説明文の日数を拾わない(項目)"
     dd_item["screen_layout"]["items"][0]["example"] = "作り話の副題（14日）"
     assert len(check_item_remarks_units(dd_item, dd_api, None, set())) == 1, "例示値を見て指摘の数が変わった"
+    # V7(新5・新9): 表示切替の文面に CSV の処理が出て、CSV が state を変えないときだけ ERROR。CSV が整形しないのに「CSV」と整形の語を同じ文に書いたものだけ ERROR
+    vsp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
+    v7_vl = {"no": "VL13", "field": "読込中…", "rule": "取得の処理中(loading)だけ「読込中…」を表示する", "applied_when": "表示や CSV の取得の処理が続いているあいだ、「読込中…」を出す", "kind": "表示切替", "src": vsp(285)}
+    v7_beh = [{"id": "BH04", "kind": "display_toggle", "cond": "loading", "target": "読込中…", "src": vsp(285), "control_src": []}]
+    v7_fe = [{"event": "EV00", "before_call": ["loading=true", "error=null"], "in_finally": ["loading=false"], "on_success": ["rows"], "on_failure": ["error"]}]
+    v7_csv = [{"function": "exportCsv", "trigger_events": ["EV07"], "formats_numbers": False}]
+    got = check_state_setters([v7_vl], v7_beh, v7_fe, v7_csv)
+    assert len(got) == 1 and got[0].startswith("[ERROR] [状態] validations[VL13]") and "loading" in got[0] and "EV00" in got[0] and "差し戻し先 H4" in got[0], got
+    # 負例: CSV の処理が state を変えるなら通す / field に CSV があれば通す / 文面に CSV が無ければ通す / src が重ならなければ通す / CSV が無ければ通す
+    assert check_state_setters([v7_vl], v7_beh, v7_fe + [{"event": "EV07", "before_call": ["loading=true"]}], v7_csv) == []
+    assert check_state_setters([dict(v7_vl, field="CSV出力")], v7_beh, v7_fe, v7_csv) == []
+    assert check_state_setters([dict(v7_vl, rule="読込中を表示する", applied_when="取得が続くあいだ")], v7_beh, v7_fe, v7_csv) == []
+    assert check_state_setters([dict(v7_vl, src=vsp(300))], v7_beh, v7_fe, v7_csv) == []
+    assert check_state_setters([v7_vl], v7_beh, v7_fe, []) == [] and check_state_setters([], v7_beh, v7_fe, v7_csv) == []
+    # V7(新9): 整形しない CSV の文に「CSV」と整形の語が同じ文にあれば ERROR。画面の整形と CSV の文を分けて書いたもの・判定できない形は通す
+    v7_cl = [{"no": "CL2", "name": "金額・点数の数値化", "expression": "表示・CSV出力で使う値が空のときは0として扱い、3桁区切りの日本式で整形する(例 1,234,500)", "processing_steps": [{"description": "表示・CSV出力で使う値が空のときは0として扱い、3桁区切りの日本式で整形する"}]}]
+    got = check_cl_csv_format(v7_cl, [{"formats_numbers": False}])
+    assert len(got) == 1 and got[0].startswith("[ERROR] [CSV整形] common_logic[CL2]") and "差し戻し先 S1" in got[0], got
+    assert check_cl_csv_format(v7_cl, [{"formats_numbers": True}]) == [] and check_cl_csv_format(v7_cl, [{}]) == [] and check_cl_csv_format(v7_cl, []) == []
+    assert check_cl_csv_format(v7_cl, [{"formats_numbers": False}, {"formats_numbers": True}]) == [], "整形する CSV が1つでもあれば読み飛ばす"
+    ok_cl = [{"no": "CL9", "expression": "画面の表示は3桁区切りで整形する。CSVの合計行は2行以上のときだけ足す"}]
+    assert check_cl_csv_format(ok_cl, [{"formats_numbers": False}]) == [], "文を分けた書き分けを拾った"
     print("selftest OK")
     return 0
 
@@ -1376,7 +1464,10 @@ def main(argv=None):
     forbidden_problems = check_forbidden_words(data)
     new_problems = db_problems + remark_problems + enum_problems + literal_problems + forbidden_problems
     front_problems = check_front_rules(data)
-    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems
+    # V7: 表示切替の文面と CSV の動き(新5)、CSV の整形の有無と文(新9)。判定の材料は react 下書きの failure_effects・csv_exports
+    state_problems = check_state_setters(data.get("validations") or data.get("validations_frontend"), beh, rd_all.get("failure_effects"), rd_all.get("csv_exports"))
+    csv_format_problems = check_cl_csv_format(data.get("common_logic"), rd_all.get("csv_exports"))
+    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems + state_problems + csv_format_problems
     for p in all_lines:
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
@@ -1394,6 +1485,7 @@ def main(argv=None):
     print(f"[INFO] DB 名・数え方・選択肢・SQL の文字列・禁止語の照合: {len(new_problems)} 件(すべて ERROR。差し戻し先は各行の末尾)")
     # U12: FR の手順に画面規則を書いていないか(ERROR。差し戻し先 S3)
     print(f"[INFO] 画面規則の照合(FR の手順に押せ・活性などを書いた行): ERROR {len(front_problems)} 件")
+    print(f"[INFO] 表示切替の文面と CSV の動き・CSV の整形の照合: ERROR {len(state_problems) + len(csv_format_problems)} 件")
     # WHY: 終了コードは、WARN の接頭辞が無い行(ERROR)が1件でもあれば 1。WARN だけでは止めない
     return 1 if any(not p.startswith("[WARN]") for p in all_lines) else 0
 
