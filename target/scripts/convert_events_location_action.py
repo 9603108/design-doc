@@ -241,6 +241,40 @@ def load_draft_actions(feature: str) -> dict:
             if isinstance(e, dict) and e.get("event_code") and e.get("action")}
 
 
+# 2026-10-14 第14回 R4: 項目名に付いた種別の語を、screen_layout の item_name の字面へ直す。
+# WHY: H1 が trigger に「空欄項目も表示のチェックボックス」「空欄項目も表示のチェッ」のように種別の語を付けると、
+#      location の末尾要素が item_name「空欄項目も表示」と一致せず、verify_intermediate のルール18が差し戻す。
+#      run12・run13 で同じ揺れが毎回出て止まったので、モデルに直させず合成で機械的に直す。
+# 意味合い: 直すのは「item_name + (の) + 種別の語（途中で切れたものを含む）」の形だけ。語尾の揺れは字面の問題で、
+#           どの項目かはソースと screen_layout が決めている。item_name が1つに決まらなければ直さず、従来どおり差し戻す(推測で選ばない)。
+# 接続情報: main() が parse_trigger の後に呼ぶ。trigger の文(H1 の文面)は表示用なので触らない
+#           （_units.py の [項目名] 検査は item_name の部分一致で通る）。
+ITEM_KIND_WORDS = [
+    'チェックボックス', 'チェック', 'ボタン', 'ラジオボタン', 'ラジオ', 'セレクトボックス', 'セレクト',
+    'プルダウン', 'ドロップダウン', 'テキストボックス', '入力欄', '入力', '欄',
+]
+
+
+def snap_location_to_item_names(location: list, item_names: set, authority: set) -> list:
+    """location の各要素が権威語彙に無く、末尾の種別の語（と「の」）を除くと item_name に一致するなら、item_name の字面にする。
+    一致する item_name が1つに決まらない（0件または2件以上）ときは、その要素を直さない。"""
+    out = []
+    for elem in location:
+        if elem in authority or not isinstance(elem, str):
+            out.append(elem)
+            continue
+        hits = set()
+        for n in item_names:
+            if not elem.startswith(n):
+                continue
+            rest = elem[len(n):].lstrip('の')
+            # 途中で切れた種別の語（「チェッ」など）も、種別の語の前方一致として受ける
+            if rest == '' or any(w.startswith(rest) for w in ITEM_KIND_WORDS):
+                hits.add(n)
+        out.append(next(iter(hits)) if len(hits) == 1 else elem)
+    return out
+
+
 def main():
     if not INTERMEDIATE.exists():
         raise FileNotFoundError(f"中間JSON が見つからない: {INTERMEDIATE}")
@@ -253,9 +287,19 @@ def main():
     failed = 0
     samples = []
 
+    # R4: screen_layout の語彙（画面名・area_name・item_name）を権威として、種別の語付きの項目名を直す
+    sl = d.get("screen_layout") or {}
+    item_names = {it.get("item_name") for it in sl.get("items") or [] if it.get("item_name")}
+    authority = item_names | {a.get("area_name") for a in sl.get("areas") or [] if a.get("area_name")}
+    try:
+        authority.add(get_screen_name(FEATURE_NAME))
+    except FileNotFoundError:
+        pass
+
     for e in events:
         trigger = e.get("trigger", "")
         result = parse_trigger(trigger)
+        result["location"] = snap_location_to_item_names(result["location"], item_names, authority)
         result["action"] = fill_action(result["action"], e.get("event_code", ""), draft_actions)
         e["location"] = result["location"]
         e["action"] = result["action"]
@@ -305,6 +349,18 @@ def selftest() -> int:
         assert fill_action("", "EV01", {"EV01": "クリック"}) == "クリック"
         assert fill_action("押下", "EV01", {"EV01": "クリック"}) == "押下"
         assert fill_action("", "EV09", {"EV01": "クリック"}) == ""
+        # R4: 種別の語（途中で切れたものを含む）付きの項目名は item_name の字面へ直す
+        names, auth = {"空欄項目も表示", "表示"}, {"空欄項目も表示", "表示", "サンプル画面"}
+        snap = lambda loc: snap_location_to_item_names(loc, names, auth)
+        assert snap(["サンプル画面", "空欄項目も表示のチェックボックス"]) == ["サンプル画面", "空欄項目も表示"]
+        assert snap(["空欄項目も表示のチェッ"]) == ["空欄項目も表示"]
+        assert snap(["空欄項目も表示チェック"]) == ["空欄項目も表示"]
+        assert snap(["空欄項目も表示"]) == ["空欄項目も表示"]  # 既に一致なら触らない
+        assert snap(["空欄項目も表示のヘルプ"]) == ["空欄項目も表示のヘルプ"]  # 種別の語でない末尾は直さない
+        assert snap(["別の項目ボタン"]) == ["別の項目ボタン"]  # 一致なしは直さない(差し戻しへ)
+        # 一致が1つに決まらないときは直さない（「金額」+「チ」と「金額チ」の両方が当たる）
+        amb = snap_location_to_item_names(["金額チ"], {"金額", "金額チ"}, set())
+        assert amb == ["金額チ"], amb
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
