@@ -13,7 +13,8 @@ Phase 1 の LLM は業務語彙の文面だけを書く。events と API の対�
       {機能名}.json の event_processes[].details の呼出の行を、下書きの並びと数で保証する。
       details が空なら下書きの呼出の行(「・<action> をリクエストする」)を入れる。LLM が書いた業務語彙の文は残し、
       呼出の行の数(「API」「呼出」「リクエスト」等を含む行)が下書きと同じことだけを確かめる。
-      事実の行(fact_lines)は position(before_calls・after_calls・end)どおりに入れ、match の語を含む同趣旨の行は落とす(B6)
+      事実の行(fact_lines)は position(before_calls・after_calls・end)どおりに入れ、match の語を含む同趣旨の行は落とす(B6)。
+      CSV 見出し行の事実には、件数の列(backend 下書きの count(*))の集計単位の文を末尾に足す(backend 下書きが在るとき)
 
 【意味合い】
 - 既存の値と下書きが食い違うときは上書きしない。「[種別] 場所: 内容」を1行1件で出し、終了コード 1 にする
@@ -130,7 +131,7 @@ def apply_backend(bdraft, backend):
     return changed
 
 
-def apply_details(draft, merged):
+def apply_details(draft, merged, backend=None):
     """merged(中間JSON)の event_processes[].details を、下書きの呼出の並びと数に揃え、事実の行を機械で入れる。
 
     戻り: (書いた event_processes の件数, 食い違いの list)。merged は破壊的に更新する。
@@ -139,7 +140,9 @@ def apply_details(draft, merged):
     食い違いのあるイベントは触らない(上書きしない。人が決める)。
     """
     want_by = {p.get("event_code"): p.get("details") or [] for p in draft.get("event_processes") or []}
-    facts_by = {p.get("event_code"): p.get("fact_lines") or [] for p in draft.get("event_processes") or []}
+    units = _csv_header_units(draft, backend)
+    facts_by = {p.get("event_code"): _with_csv_units(p.get("fact_lines") or [], units)
+                for p in draft.get("event_processes") or []}
     changed, conflicts = 0, []
     for ep in merged.get("event_processes") or []:
         code = ep.get("event_code")
@@ -165,6 +168,54 @@ def apply_details(draft, merged):
             ep["details"] = new
             changed += 1
     return changed, conflicts
+
+
+CSV_HEADER_KEY = "csv.header"
+
+
+def _csv_header_units(draft, backend):
+    """CSV 見出し行の件数の列へ足す、集計単位の文(「「日数」は集計単位ごとの行数」等)を返す。無ければ ""。
+
+    WHY: 見出しの「日数」は表示中の1行の値ではなく、集計単位(GROUP BY の1行)ごとの件数である。
+    その事実は backend 下書きの式に現れるので、機械で決める。式が count(*) のときは「行数」、
+    FILTER 付きのときは「条件に合う行数」。count(DISTINCT …) などは行数ではないので足さない。
+    結ぶ方法: 下書きの csv_exports の見出し(固定列)と行の列を位置で結び、行の列の row_value(r.<別名>)の
+    別名を backend 下書きの columns の alias で引く。CSV 出力が2つ以上・backend 下書きが無いときは足さない。
+    """
+    exports = draft.get("csv_exports") or []
+    if not backend or len(exports) != 1:
+        return ""
+    exp = exports[0]
+    fixed = (exp.get("header") or {}).get("fixed") or []
+    cols = (exp.get("row_builder") or {}).get("columns") or []
+    exprs = {}
+    for api in (backend.get("apis") or {}).values():
+        for op in (api or {}).get("db_operations") or []:
+            for col in op.get("columns") or []:
+                if col.get("alias"):
+                    exprs.setdefault(col["alias"], set()).add(str(col.get("expression") or "").strip())
+    parts = []
+    for i, col in enumerate(cols[:len(fixed)]):
+        m = re.fullmatch(r"r\.(\w+)", str(col.get("row_value") or ""))
+        es = exprs.get(m.group(1)) if m else None
+        if not es or not all(re.match(r"count\(\*\)", e, re.I) for e in es):
+            continue
+        filtered = {"FILTER" in e.upper() for e in es}
+        if len(filtered) != 1:
+            continue
+        unit = "集計単位ごとの条件に合う行数" if filtered.pop() else "集計単位ごとの行数"
+        parts.append(f"「{fixed[i]}」は{unit}")
+    return "、".join(parts)
+
+
+def _with_csv_units(facts, units):
+    """CSV 見出し行の事実(key=csv.header)の末尾へ units を「。」で足した新しい list を返す。units が空なら変えない。
+
+    WHY: 下書きの事実の欄は書き換えない(draft は読むだけ)。足すのは details へ入れる文だけ。
+    """
+    if not units:
+        return facts
+    return [dict(f, text=f"{f['text']}。{units}") if f.get("key") == CSV_HEADER_KEY else f for f in facts]
 
 
 def _place_facts(lines, facts):
@@ -231,7 +282,7 @@ def main(argv=None):
     p.add_argument("feature", nargs="?", help="機能名(省略時は環境変数 FEATURE_NAME)")
     p.add_argument("--stage", choices=["partial", "merge"], help="partial=merge_partials の前 / merge=merge_partials の後")
     p.add_argument("--draft", help="下書きJSONのパス(省略時は target/intermediate/{機能名}_react_draft.json)")
-    p.add_argument("--backend-draft", help="extract_backend_draft の出力JSON(partial のみ・任意)。空欄の欄だけ埋める")
+    p.add_argument("--backend-draft", help="extract_backend_draft の出力JSON(任意)。partial は空欄の欄だけ埋める。merge は CSV 見出しの件数の単位に使う(省略時は {機能名}_backend_draft.json があれば読む)")
     p.add_argument("--selftest", action="store_true", help="組込みの検査を走らせる")
     args = p.parse_args(argv)
     if args.selftest:
@@ -263,7 +314,15 @@ def main(argv=None):
         data = _load(target)
         if data is None:
             return 2
-        changed, conflicts = apply_details(draft, data)
+        # WHY: merge の実行行(AFTER)は --backend-draft を渡さない。下書きが在れば既定の場所から読み、
+        # CSV 見出しの件数の単位を足す(無ければ従来どおり)
+        bpath = Path(args.backend_draft) if args.backend_draft else INTERMEDIATE_DIR / f"{feature}_backend_draft.json"
+        backend = None
+        if args.backend_draft or bpath.exists():
+            backend = _load(bpath)
+            if backend is None:
+                return 2
+        changed, conflicts = apply_details(draft, data, backend)
     if changed:
         _save(target, data)
     for c in conflicts:
@@ -381,6 +440,38 @@ def selftest():
             "CSV の見出し行に、固定列と項目名を並べる", "データ行は表示中の行ごとに並べる", "合計行を最後に足す",
             "値は二重引用符で囲む", "BOM 付きの Blob にする", "ファイル名 pos_account_report.csv で保存する"], f"CSV の並び: {mcsv['event_processes'][0]['details']}"
         assert apply_details(csv_draft, mcsv) == (0, []), "CSV の再実行は何もしない"
+        # (h) CSV 見出しの件数の単位: 件数の列(count(*)・FILTER 付き)の見出しへ集計単位の文を足す(再実行は何もしない)。
+        #     式が count(*) でない列・backend 下書きが無い・CSV が2つ以上のときは足さない(事実の文は従来どおり)
+        udraft = {"csv_exports": [{"header": {"fixed": ["店舗", "日数", "取込欠損疑い日数"]},
+                                   "row_builder": {"columns": [{"kind": "ternary", "row_value": "r.shop_name"},
+                                                               {"kind": "ternary", "row_value": "r.days"},
+                                                               {"kind": "ternary", "row_value": "r.warn_days"}]}}],
+                  "event_processes": [{"event_code": "EV07", "details": [], "fact_lines": [
+                      {"key": "csv.header", "text": "見出し行: 店舗、日数、取込欠損疑い日数の順に並べる",
+                       "position": "seq", "seq": 1, "match": ["見出し"]}]}]}
+        ubackend = {"apis": {"a1": {"db_operations": [{"columns": [
+            {"alias": "shop_name", "expression": "s.name"},
+            {"alias": "days", "expression": "count(*)::bigint"},
+            {"alias": "warn_days", "expression": "count(*) FILTER (WHERE p.x = 0)::int"}]}]}}}
+        plain = ["見出し行: 店舗、日数、取込欠損疑い日数の順に並べる"]
+        um = {"event_processes": [{"event_code": "EV07", "details": ["見出しは項目名を並べる"]}]}
+        n, bad = apply_details(udraft, um, ubackend)
+        assert n == 1 and not bad, f"CSV の単位: {n} {bad}"
+        assert um["event_processes"][0]["details"] == [
+            "見出し行: 店舗、日数、取込欠損疑い日数の順に並べる。「日数」は集計単位ごとの行数、「取込欠損疑い日数」は集計単位ごとの条件に合う行数"
+        ], f"CSV の単位の文: {um['event_processes'][0]['details']}"
+        assert apply_details(udraft, um, ubackend) == (0, []), "CSV の単位の再実行は何もしない"
+        ub2 = copy.deepcopy(ubackend)
+        ub2["apis"]["a1"]["db_operations"][0]["columns"][1]["expression"] = "count(DISTINCT p.reji_no)::int"
+        um2 = {"event_processes": [{"event_code": "EV07", "details": []}]}
+        apply_details(udraft, um2, ub2)
+        assert um2["event_processes"][0]["details"] == [
+            "見出し行: 店舗、日数、取込欠損疑い日数の順に並べる。「取込欠損疑い日数」は集計単位ごとの条件に合う行数"
+        ], f"DISTINCT の列は足さない: {um2['event_processes'][0]['details']}"
+        um3 = {"event_processes": [{"event_code": "EV07", "details": []}]}
+        apply_details(udraft, um3, None)
+        assert um3["event_processes"][0]["details"] == plain, "backend 下書きが無いときは足さない"
+        assert _csv_header_units(dict(udraft, csv_exports=udraft["csv_exports"] * 2), ubackend) == "", "CSV が2つ以上は足さない"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
