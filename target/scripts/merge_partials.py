@@ -24,7 +24,7 @@ from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_e
 # WHY: JSX の {式} の値を、初期処理の評価器で決める（式の評価を二重に持たない）
 from _initial_eval import _value
 # WHY: 画面項目の src（TSX の行範囲）から、表示条件・活性・文言を位置で結ぶ（round10 T15）
-from _jsx_chain import chain_for_lines, text_of_lines
+from _jsx_chain import resolve_for_lines, text_of_lines
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -217,15 +217,6 @@ def _range_text(file: str, start: int, end: int, env: dict) -> str:
     return re.sub(r"\s+", " ", _TAG.sub("", s)).strip()
 
 
-def _enclosing_open_line(file: str, start: int):
-    """範囲の前にある最後の開始タグ（行頭が <Name の行）の行番号。属性の行が囲まれる要素を探すために使う。無ければ None。"""
-    lines = Path(file).read_text(encoding="utf-8").split("\n")
-    for n in range(start - 1, 0, -1):
-        if re.match(r"\s*<[A-Za-z]", lines[n - 1]):
-            return n
-    return None
-
-
 def _is_array_use(r: dict) -> bool:
     """鎖が配列の使用箇所から来ているか（その行は配列の要素で、画面の文言ではない）。"""
     chain = r["visible_chain"]
@@ -241,17 +232,12 @@ def _src_fact(sl_item: dict, env: dict, elements: list):
     # fallback-ok: 終了行が無い src は開始行だけの1行とみなす（行範囲は src が常に持つ想定）
     start, end = int(s["line_start"]), int(s.get("line_end") or s["line_start"])
     file = str(s["file"])
-    r = chain_for_lines(file, start, end)
-    attr = False
-    if not r["found"]:
-        # WHY: 属性の行（Card の subtitle など）は文言ではなく、囲む要素の開始タグの条件で表示が決まる
-        n = _enclosing_open_line(file, start)
-        if n is None:
-            return None
-        r = chain_for_lines(file, n, n)
-        if not r["found"]:
-            return None
-        attr = True
+    # WHY: 結び方は _jsx_chain.resolve_for_lines に1か所化(検査 verify_intermediate と同じ規則で引く)。
+    #   範囲に要素が無い属性の行は、囲む要素の開始タグの条件で表示が決まる(attr=True)
+    res = resolve_for_lines(file, start, end)
+    if res is None:
+        return None
+    r, attr = res
     kind = str(sl_item.get("item_type") or "")
     text = None
     if not attr and kind in ("Button", "Link"):
@@ -650,6 +636,12 @@ def _selftest_initialization() -> int:
             {"item_name": "読込中表示", "item_type": "Label", "src": [at("{loading && <span>")]},
             {"item_name": "CSV出力", "item_type": "Button", "src": [at("<button disabled")]},
             {"item_name": "店舗数", "item_type": "Label", "src": [at('{ label: "店舗数" }')]},
+            # WHY(round11 U1): src が配列の宣言の全体(const LEFT = [ から ]; まで)を指す項目も、使用箇所で結ぶ
+            {"item_name": "店舗数全体", "item_type": "Label", "src": [{
+                "file": tsx_path,
+                "line_start": at("const LEFT")["line_start"],
+                "line_end": at("];")["line_end"],
+            }]},
         ]}
         got_src = build_initialization(events, src_screen, [], src_drafts)
         sv = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in got_src["items"]}
@@ -659,6 +651,7 @@ def _selftest_initialization() -> int:
             "読込中表示": ("活性", "非表示", "Blank"),    # {loading && …} は初期が偽
             "CSV出力": ("非活性", "表示", "CSV出力"),     # disabled={!rows.length} は非活性。ボタンの文言
             "店舗数": ("活性", "非表示", "Blank"),        # 配列の行は使用箇所（rows.length > 1 の中）で決まる
+            "店舗数全体": ("活性", "非表示", "Blank"),    # 宣言の全体の範囲（定義行を含む）も使用箇所で決まる（round11 U1）
         }
         if sv != want_src:
             print(f"[selftest NG] src で結ぶ初期処理の表 {sv}")

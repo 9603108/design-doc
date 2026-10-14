@@ -162,11 +162,13 @@ def _array_use(text, start, end):
     """範囲が const NAME = [ … ] の中にあるとき、NAME の JSX の { } 内の使用箇所を返す。無ければ None。
 
     WHY: 画面の行は配列の要素(const LEFT: Spec[] = [...])で、画面に出るのは使用箇所({render(LEFT)})の側。
+    WHY(round11 U1): 範囲が配列の定義行(const X = [)や閉じ括弧(];)を含むときも配列の範囲とみなす。
+    定義行を含む範囲(src が宣言の全体を指す項目)を、重なりで判定しないと found=False に落ちて仮埋めになる。
     """
-    for m in reversed(list(_ARRAY_DEF.finditer(text, 0, start))):
+    for m in reversed(list(_ARRAY_DEF.finditer(text, 0, end))):
         b = m.end() - 1
         close = _end(text, b)
-        if not (b < start and close >= end - 1):
+        if not (m.start() < end and close >= start):
             continue
         name = m.group(1)
         usages = []
@@ -209,6 +211,38 @@ def chain_for_lines(file, line_start, line_end):
     if arr:
         return arr
     return {"found": False, "visible_chain": [], "disabled_chain": None}
+
+
+def _enclosing_open_line(file, start):
+    """範囲の前にある最後の開始タグ（行頭が <Name の行）の行番号。属性の行が囲まれる要素を探すために使う。無ければ None。
+
+    WHY(round11 U1): merge_partials から移した。項目の結びと検査(verify_intermediate)が同じ規則で引けるように1か所に置く。
+    """
+    lines = Path(file).read_text(encoding="utf-8").split("\n")
+    for n in range(start - 1, 0, -1):
+        if re.match(r"\s*<[A-Za-z]", lines[n - 1]):
+            return n
+    return None
+
+
+def resolve_for_lines(file, line_start, line_end):
+    """画面項目の行範囲を、表示条件の鎖の元の位置に結ぶ。結べなければ None。
+
+    戻り値: (r, attr)。r は chain_for_lines と同じ形。attr は「範囲に要素が無く、囲む要素の開始タグから引いた」ときの True。
+    手順: まず範囲そのもの(JSX の要素・配列の定義を含む範囲)で chain_for_lines。found=False なら、
+    範囲の前にある最後の開始タグの行で引き直す(属性の行の救済)。それも found=False なら None(推測しない)。
+    WHY: 結べない項目を名前での結びに落とすと、仮埋め(活性・表示)のまま誰も止めない(round10 の 6)。
+    """
+    r = chain_for_lines(file, line_start, line_end)
+    if r["found"]:
+        return r, False
+    n = _enclosing_open_line(file, line_start)
+    if n is None:
+        return None
+    r = chain_for_lines(file, n, n)
+    if not r["found"]:
+        return None
+    return r, True
 
 
 def text_of_lines(file, line_start, line_end, eval_expr=None):
@@ -395,6 +429,16 @@ def _selftest():
         r = chain_for_lines(f, n, n)
         assert r["found"] and r["visible_chain"][0]["kind"] == "array_use", r
         assert r["visible_chain"][0]["caller_chains"][0][0]["name"] == "render", r
+        # WHY(round11 U1): 範囲が配列の定義行から閉じ括弧までの全体(src が宣言の全体を指す項目)でも、使用箇所で結ぶ。
+        #   定義行を含むと旧版は found=False になり、仮埋め(活性・表示)に落ちた(run10 の IT17・IT18)
+        a, z = _line_of(_SRC_ARRAY, "const LEFT"), _line_of(_SRC_ARRAY, "];")
+        r = chain_for_lines(f, a, z)
+        assert r["found"] and r["visible_chain"][0]["kind"] == "array_use", r
+        res = resolve_for_lines(f, a, z)
+        assert res is not None and res[1] is False and res[0]["found"], res
+        # 要素も配列も無い行(関数の宣言行)は結べない。推測で結ばない
+        plain = _write(tmp, "plain.tsx", _SRC_ARROW)
+        assert resolve_for_lines(plain, 1, 1) is None
 
         f = _write(tmp, "arrow.tsx", _SRC_ARROW)
         n = _line_of(_SRC_ARROW, "<i>a")
