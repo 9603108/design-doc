@@ -61,7 +61,9 @@ from _config_loader import (
 # 意味合い: _config_loader.resolve_feature_name() は sys.argv を見ないので、第1引数だけで
 #           渡された機能名をアクセサへ届けるには、ここで解決した値を明示で渡す必要がある。
 # 接続情報: INTERMEDIATE_JSON(main の読み書き先)と、main 内の load_screen_config(FEATURE_NAME) が使う。
-FEATURE_NAME = get_feature_name_from_argv()
+# WHY: --selftest は機能名を取らない(argv[1] を機能名にすると画面設定の読込で落ちる)。selftest のときだけ機能名を仮の値にする。
+SELFTEST_MODE = "--selftest" in sys.argv
+FEATURE_NAME = "selftest" if SELFTEST_MODE else get_feature_name_from_argv()
 INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 
@@ -77,7 +79,8 @@ def backup_v48(intermediate_json: Path) -> Path:
 
 
 def build_item_lookup(data: dict) -> dict:
-    """screen_layout.items[] から (area_no, item_name) → item_no 逆引き辞書を構築。
+    """screen_layout.items[] から (area_no, item_name) → item_no の一覧(出現順)の逆引き辞書を構築。
+    値は no のリスト(同名が複数あるとき、表示行の番目 screen_item_nth で選ぶ)。
 
     意味合い: response_to_screen_mapping の (screen_area_no, screen_item_name) ペアから
               対応する画面項目の no（IT#）を逆引き付与するための辞書。
@@ -90,10 +93,11 @@ def build_item_lookup(data: dict) -> dict:
         name = it.get("item_name", "")
         no = it.get("no", "")
         if name:
-            lookup[(area_no, name)] = no
+            # WHY: 同名の項目(「小計」等)が複数あるので、出現順の一覧で持つ。1件だけだと後の項目が最初の項目へ寄り、
+            #      表示行の番目(screen_item_nth)で選べない。
+            lookup.setdefault((area_no, name), []).append(no)
             # area 指定なしフォールバックも入れる（area 不明時の最後の手段）
-            if name not in lookup:
-                lookup[name] = no
+            lookup.setdefault(name, []).append(no)
     return lookup
 
 
@@ -107,12 +111,20 @@ def find_item_no(mapping_entry: dict, item_lookup: dict) -> str:
     name = mapping_entry.get("screen_item_name") or ""
     if not name:
         return ""
-    # (area_no, name) 完全一致
-    if (area_no, name) in item_lookup:
-        return item_lookup[(area_no, name)]
-    # name のみ
-    if name in item_lookup:
-        return item_lookup[name]
+    # (area_no, name) 完全一致を先に、無ければ name のみ
+    cands = item_lookup.get((area_no, name)) or item_lookup.get(name) or []
+    if not cands:
+        return ""
+    # WHY: 同名の表示行が複数あるときは、表示行の番目(screen_item_nth・1始まり)で結ぶ。番号が無ければ最初の1件。
+    #      範囲外の番号は別の項目へ寄せず空で返す(後段の検査で止まる)。
+    try:
+        nth = int(mapping_entry.get("screen_item_nth") or 0)  # fallback-ok: 番号を持たない従来の入力は最初の1件に結ぶ(従来どおり)。数値でない値も0扱い
+    except (TypeError, ValueError):
+        nth = 0  # fallback-ok: 数値に直せない番号は無いものとして最初の1件に結ぶ(従来どおり)
+    if nth == 0:
+        return cands[0]
+    if 1 <= nth <= len(cands):
+        return cands[nth - 1]
     return ""
 
 
@@ -143,6 +155,9 @@ def migrate_response_to_screen_mapping(data: dict, item_lookup: dict) -> int:
                 "screen_item_name": m.get("screen_item_name", ""),
                 "transform": m.get("transform", "")
             }
+            # WHY: 同名の表示行の番目を残す。前段(_compose_response)が入れたもので、移動後も find_item_no と同じ番号で結べるように持つ
+            if m.get("screen_item_nth"):
+                entry["screen_item_nth"] = m["screen_item_nth"]
             enriched.append(entry)
         backend_to_mapping[bid] = enriched
         # 元エントリを削除（責務移譲）
@@ -306,6 +321,60 @@ def fill_meta_source_html_path(data: dict, screen_config: dict) -> bool:
     return False
 
 
+def selftest() -> int:
+    """組込みの検査(B10): 同名の画面項目を、表示行の番目(screen_item_nth)で IT に結ぶ。
+
+    WHY: 「小計」が3つあると名前だけでは結ぶ先が決まらず、最初の IT に寄っていた。
+    意味合い: 番号の無い従来の入力は最初の1件のまま。範囲外の番号は空で返す(別の IT へ寄せない)。
+    終了コード: 0=OK / 1=NG
+    """
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    items = [
+        {"no": "IT41", "area_ref": "AR1", "item_name": "小計"},
+        {"no": "IT46", "area_ref": "AR1", "item_name": "小計"},
+        {"no": "IT47", "area_ref": "AR1", "item_name": "小計"},
+        {"no": "IT50", "area_ref": "AR1", "item_name": "合計"},
+    ]
+    lookup = build_item_lookup({"screen_layout": {"items": items}})
+    base = {"screen_area_no": "AR1", "screen_item_name": "小計"}
+    check(find_item_no(base, lookup) == "IT41", "nth なしは最初の IT(IT41)")
+    check(find_item_no({**base, "screen_item_nth": 2}, lookup) == "IT46", "nth=2 は IT46")
+    check(find_item_no({**base, "screen_item_nth": 3}, lookup) == "IT47", "nth=3 は IT47")
+    check(find_item_no({**base, "screen_item_nth": 9}, lookup) == "", "範囲外の nth は空(別の IT へ寄せない)")
+    check(find_item_no({"screen_area_no": "AR1", "screen_item_name": "合計"}, lookup) == "IT50", "同名が1件なら従来どおり")
+
+    # 移動の流れ: response_mapping step に nth を残し、移動後も同じ IT に結ぶ
+    data = {
+        "screen_layout": {"items": items},
+        "backend_processes": [{"process_id": "BE1", "response_spec": {"response_to_screen_mapping": [
+            {"api_field_path": "rows[].syoukei_5", "screen_area_no": "AR1", "screen_item_name": "小計",
+             "screen_item_nth": 2, "transform": ""},
+        ]}}],
+        "front_processes": [{"process_id": "FR1", "steps": [
+            {"kind": "backend_call", "backend_call": {"backend_id": "BE1"}},
+        ]}],
+    }
+    migrate_response_to_screen_mapping(data, lookup)
+    steps = data["front_processes"][0]["steps"]
+    check(len(steps) == 2 and steps[1].get("kind") == "response_mapping", f"response_mapping step が入る: {steps}")
+    if len(steps) == 2:
+        m = steps[1]["response_mapping"]["mappings"][0]
+        check(m.get("item_ref_no") == "IT46", f"移動後の行が IT46 を指す: {m}")
+        check(m.get("screen_item_nth") == 2, f"移動後の行に screen_item_nth=2 が残る: {m}")
+
+    if fails:
+        for f in fails:
+            print(f"[selftest NG] {f}", file=sys.stderr)
+        return 1
+    print("[selftest OK] migrate_v48_to_v49 (B10: 同名項目を screen_item_nth で IT に結ぶ)")
+    return 0
+
+
 def main():
     if not INTERMEDIATE_JSON.exists():
         print(f"[ERROR] 中間JSONが見つかりません: {INTERMEDIATE_JSON}", file=sys.stderr)
@@ -352,4 +421,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(selftest())
     main()
