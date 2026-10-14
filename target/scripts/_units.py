@@ -486,24 +486,6 @@ def _react_draft_facts():
     return init, actions
 
 
-def _origin_error_codes():
-    """backend 下書きの common_errors(_error_origins の出どころ)から、式の code → 既定の code(code_default)の対応を取る。
-    呼出元: _fix_message_codes。意味合い: 例外の code は、ソースの式 getattr(e, 'code', None) or 'validation_error' のまま
-    メッセージに書かれやすい。式の中の既定の文字列(validation_error)が実際の code なので、そこへ寄せる。下書きが無ければ {}。"""
-    from _config_loader import INTERMEDIATE_DIR
-    out = {}
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        for c in d.get("common_errors") or []:
-            for e in c.get("errors") or []:
-                if isinstance(e, dict) and e.get("code") and e.get("code_default"):
-                    out.setdefault(str(e["code"]), e["code_default"])
-    return out
-
-
 def _event_code_map(events):
     """events の行から (旧コード → 現行の番号の対応, 現行の番号の集合) を取る。
     呼出元: _normalize_event_refs・_fill_initial_db_triggers。意味合い: 現行の番号は、行の no が「EV<数字>」の形ならその no
@@ -593,23 +575,6 @@ def _fill_initial_db_triggers(out, log=None):
                     log.append(f"[初期表示] db_operations[{op.get('id')}].trigger_events に {c} を足す({api.get('action')})")
 
 
-def _fix_message_codes(out, log=None):
-    """messages_backend の code が式のまま(getattr(e, 'code', None) or 'validation_error' など)のとき、
-    下書きの _error_origins(common_errors の code_default)の実際の code へ置き換える。
-    呼出元: compose(_fill_initial_db_triggers の後)。意味合い: 単位が式を code に写すと、検査は通っても実際の code と食い違う。
-    事実(下書きの code_default)を正とし、置き換えた旨を log に残す。対応が無い code は触らない(推測しない)。"""
-    origins = _origin_error_codes()
-    if not origins:
-        return
-    for m in _rows(out, "messages_backend"):
-        c = m.get("code")
-        if not isinstance(c, str) or re.fullmatch(r"\w+", c) or c not in origins:
-            continue
-        m["code"] = origins[c]
-        if log is not None:
-            log.append(f"[正規化] messages_backend[{m.get('message_id')}].code: {c} → {origins[c]}")
-
-
 def compose(spec, frags, project_config=None, log=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
@@ -678,10 +643,9 @@ def compose(spec, frags, project_config=None, log=None):
     _fill_src(out)
     _fill_db_op_facts(out)
     _fill_initial_values(out)
-    # 参照の正規化は events を正として行う。順序: 旧コードを現行へ写す → 初期表示の発火を足す → code を下書きの実際の値へ寄せる
+    # 参照の正規化は events を正として行う。順序: 旧コードを現行へ写す → 初期表示の発火を足す。code は書き換えない(messages の code は MSE 番号。API の code は condition の code= に書く)
     _normalize_event_refs(out, log)
     _fill_initial_db_triggers(out, log)
-    _fix_message_codes(out, log)
     _fill_logical_names(out)
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
@@ -866,7 +830,7 @@ def _selftest_compose_facts():
                              {"id": "DB2", "api_endpoint": {"action": "list_a"}},
                              {"id": "DB3", "api_endpoint": {"action": "list_b"}}],
            "screen_layout": {"items": [{"item_name": "店舗", "event_code": "EV01"}]},
-           "messages_backend": [{"message_id": "MSE1", "code": "getattr(e, 'code', None) or 'validation_error'", "message": "str(e)"}]}
+           "messages_backend": [{"message_id": "MSE1", "code": "MSE1", "message": "str(e)"}]}
     log = []
     old = _config_loader.INTERMEDIATE_DIR
     with tempfile.TemporaryDirectory() as td:
@@ -876,17 +840,17 @@ def _selftest_compose_facts():
         try:
             _normalize_event_refs(out, log)
             _fill_initial_db_triggers(out, log)
-            _fix_message_codes(out, log)
         finally:
             _config_loader.INTERMEDIATE_DIR = old
     assert out["common_logic"][0]["used_in"] == ["EV1", "EV2"], out["common_logic"]
     assert out["screen_layout"]["items"][0]["event_code"] == "EV2", out["screen_layout"]
     got = [op["api_endpoint"].get("trigger_events") for op in out["db_operations"]]
     assert got == [["EV2", "EV1"], ["EV1"], None], got
-    assert out["messages_backend"][0]["code"] == "validation_error", out["messages_backend"]
+    # messages の code は書き換えない(MSE 番号のまま。API の code は condition の code= に書く)
+    assert out["messages_backend"][0]["code"] == "MSE1" and not any("messages_backend" in x for x in log), (out["messages_backend"], log)
     assert any("EV09" in x and "削除" in x for x in log), log
     assert any("EV00 → EV1" in x or "EV00" in x for x in log), log
-    print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers / _fix_message_codes")
+    print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers")
 
 
 if __name__ == "__main__":

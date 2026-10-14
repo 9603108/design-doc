@@ -380,14 +380,6 @@ def _sq_head(s):
     return re.sub(r"filter\(.*", "", _sq(s))
 
 
-def _code_for_status(status, common_errors):
-    """status を返す共通エラー(例外処理)の code の既定値。1つに決まらなければ None。status が式(getattr(…) or 400)のものは式の中の数字で当てる。"""
-    s = str(status)
-    codes = {e["code_default"] for c in common_errors or [] for e in c.get("errors") or []
-             if e.get("code_default") and (str(e.get("status_code")) == s or (not isinstance(e.get("status_code"), int) and re.search(rf"\b{re.escape(s)}\b", str(e.get("status_code")))))}
-    return next(iter(codes)) if len(codes) == 1 else None
-
-
 def check_backend_facts(data, apis, common_errors):
     """設計書(data)を backend 下書きの事実(apis[action].db_operations の columns・ctes・subqueries・aggregate_units と common_errors)と突き合わせる(ERROR)。
     [別名]: 物理列として書いた名前が SQL の別名(実列に無い) / 集計の別名が null なのにソースは AS を持つ。差し戻し先 H2
@@ -395,8 +387,8 @@ def check_backend_facts(data, apis, common_errors):
     [CTE]: ソースに CTE が無いのに CTE と書く / 定義が空の CTE を参照 / 絞り込みのある CTE を空・条件なしと書く / 本体の集計と書いた別名が CTE の集計。差し戻し先 S2・H2
     [副問合せ]: 別名の無い集計が副問合せの中の集計なのに本体の集計(aggregate)として書いてある。差し戻し先 H2
     [集計単位]: count の説明の「日数」が、数える単位(GROUP BY)に日付の列が無い・日付以外の列も含むのと合わない(WARN)。差し戻し先 S2
-    [エラーcode]: messages・messages_backend の code が、その文言を返す例外処理の code(code_default)と違う / api_spec の error_patterns の ID 風の code がソースに無い。差し戻し先 H4・S2
-    呼出元: main(下書きがあるとき)。apis が空なら何も言わない。差し戻し先は units.json の owns に合わせた(dataset・aggregate は H2、expression・説明は S2、messages_backend は H4)。"""
+    [エラーcode]: api_spec の error_patterns の condition に書いた code=<値> が、ソースの例外処理の code_default のどれでもない(差し戻し先 S2)。messages の code は見ない(MSE 番号が正。形は verify_intermediate.py)
+    呼出元: main(下書きがあるとき)。apis が空なら何も言わない。差し戻し先は units.json の owns に合わせた(dataset・aggregate は H2、expression・説明・error_patterns は S2)。"""
     ops = {act: a.get("db_operations") or [] for act, a in (apis or {}).items()}
     problems, alias_only, real = [], {}, set()
     for olist in ops.values():
@@ -488,23 +480,15 @@ def check_backend_facts(data, apis, common_errors):
                         unit_seen.add((a.get("action"), r["key"]))
                         why = "日付の列が無い" if not dates else f"日付の列以外({'・'.join(others)})も数える単位に含まれ、行数が日数と合わない"
                         problems.append(f"[WARN] [集計単位] api_spec[{a.get('action')}].response_items[{r['key']}]: 「日数」と書くが count の単位は {u.get('unit')} で{why} → 差し戻し先 S2")
-    # (4) エラー code
-    errs = {e["id"]: e for a in (apis or {}).values() for e in a.get("error_patterns") or [] if e.get("id")}
+    # (4) エラー code: API のエラー code は api_spec の error_patterns の condition に code=<値> と書く(スキーマに専用の欄は無い。最も近い既存の欄)。
+    # WHY: messages・messages_backend の code は message_id と同じ MSE 番号で、API の code ではない(形は verify_intermediate.py が見る)。
+    #      ここでは condition の code= だけを common_errors の code_default と照合する
     known = {e.get("code_default") for c in common_errors or [] for e in c.get("errors") or [] if e.get("code_default")}
-    # messages・messages_backend のどちらも、code 欄を持つ文言だけを見る(code が無い文言は照合しない。message_id は MSE 番号のままで正しい)
-    for key in ("messages", "messages_backend"):
-        for m in data.get(key) or []:
-            if not isinstance(m, dict) or "code" not in m:
-                continue
-            e = errs.get(m.get("message_id"))
-            want = _code_for_status(e.get("status_code"), common_errors) if e else None
-            if want and m.get("code") != want:
-                problems.append(f"[エラーcode] {key}[{m.get('message_id')}].code: 「{m.get('code')}」だがソースの例外処理は status {e['status_code']} に code={want} を返す → 差し戻し先 H4")
     for a in data.get("api_spec") or []:
         for ep in a.get("error_patterns") or []:
-            codes = re.findall(r"code\s*[=＝]\s*([A-Za-z_]\w*)", str(ep.get("condition"))) + ([str(ep["code"])] if ep.get("code") else [])
+            codes = re.findall(r"code\s*[=＝]\s*([A-Za-z_]\w*)", str(ep.get("condition")))
             problems += [f"[エラーcode] api_spec[{a.get('action')}].error_patterns: code「{c}」はソースの例外処理の code({'・'.join(sorted(known))})に無い → 差し戻し先 S2"
-                         for c in codes if known and c not in known and re.fullmatch(r"[A-Za-z]{2,4}\d{3,}", c)]
+                         for c in codes if known and c not in known]
     return problems
 
 
@@ -566,18 +550,16 @@ def selftest():
     assert len(got) == 1 and got[0].startswith("[WARN] [集計単位]") and "t.mise_no" in got[0], got
     bapis2["act"]["db_operations"][0]["aggregate_units"][0]["group_by"] = ["t.kai_date"]
     assert check_backend_facts(bad, bapis2, ces) == [], check_backend_facts(bad, bapis2, ces)
-    # エラー code: MSE0000x は ERROR(ソースは validation_error)。api_spec の ID 風 code も ERROR
+    # エラー code: condition の code= は common_errors の code_default と照合する。messages の code は照合しない(MSE 番号が正)
     bad = json.loads(json.dumps(good))
     bad["messages_backend"][0]["code"] = "MSE00001"
-    bad["api_spec"][0]["error_patterns"] = [{"condition": "不正 (code=MSE00001)"}]
-    got = check_backend_facts(bad, bapis, ces)
-    assert [g.split(" ")[0] for g in got] == ["[エラーcode]"] * 2 and "validation_error" in got[0] and "差し戻し先 H4" in got[0] and "差し戻し先 S2" in got[1], got
-    # messages(設計側の文言)の code も同じ照合。code 欄が無い文言は見ない
-    bad = json.loads(json.dumps(good))
     bad["messages"] = [{"message_id": "MSE00001", "code": "MSE00001"}, {"message_id": "MSE00001", "message": "code 欄なし"}]
+    bad["api_spec"][0]["error_patterns"] = [{"condition": "不正 (code=validation_error)"}, {"condition": "不正 (code=MSE00001)"}]
     got = check_backend_facts(bad, bapis, ces)
-    assert len(got) == 1 and got[0].startswith("[エラーcode] messages[MSE00001].code") and "差し戻し先 H4" in got[0], got
-    bad["messages"] = [{"message_id": "MSE00001", "code": "validation_error"}]
+    assert len(got) == 1 and got[0].startswith("[エラーcode] api_spec[act].error_patterns") and "MSE00001" in got[0] and "差し戻し先 S2" in got[0], got
+    # messages の code が validation_error でも MSE 番号でも、この検査は見ない(形は verify_intermediate.py の検査)
+    bad["messages_backend"][0]["code"] = "validation_error"
+    bad["api_spec"][0]["error_patterns"] = [{"condition": "不正 (code=validation_error)"}]
     assert check_backend_facts(bad, bapis, ces) == [], check_backend_facts(bad, bapis, ces)
     # F2: 境界値の語が rule に無い・共通エラーの status が api_spec に無いと WARN
     bs = [{"param": "shop_id", "check": "v <= 0", "compare": ["v <= 0"]},
@@ -771,8 +753,8 @@ def main(argv=None):
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
     print(f"[INFO] 下書きの事実(別名・CTE・副問合せ・集計の単位・エラー code)の照合: ERROR {len(fact_errors)} 件・WARN {len(fact_problems) - len(fact_errors)} 件")
-    n_code = sum(1 for k in ("messages", "messages_backend") for m in data.get(k) or [] if isinstance(m, dict) and "code" in m)
-    print(f"[INFO] エラー code の照合: code 欄のある文言 {n_code} 件(messages・messages_backend。0 件なら code の照合は効いていない)")
+    n_code = sum(1 for a in data.get("api_spec") or [] for e in a.get("error_patterns") or [] if isinstance(e, dict) and "code=" in str(e.get("condition")))
+    print(f"[INFO] エラー code の照合: api_spec の condition に code= と書いた行 {n_code} 件(common_errors の code_default と照合。0 件なら照合は効いていない)")
     print(f"[INFO] 境界値・DB 例外の照合: 下書きの boundaries {n_bound} 件・WARN {len(bound_problems)} 件")
     null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
     print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件・SQL の型の手掛かりつきの欄 {n_sql} 件")
