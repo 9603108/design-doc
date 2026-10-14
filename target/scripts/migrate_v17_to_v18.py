@@ -242,7 +242,8 @@ def build_front_processes(event_processes: list, events: list, initialization: d
                 "called_by_triggers": [
                     {"group_kind": "auto", "group_category": "画面表示時", "trigger_no": 1}
                 ],
-                "steps": _renumber_init_steps(_with_fetch_order(ip.get("steps", []) or [])),
+                # B9 c: 取得の開始時・失敗時の事実(EV00 の failure_effects)を backend_call の前後に入れてから番号を振る
+                "steps": _renumber_init_steps(_with_init_fact_steps(_with_fetch_order(ip.get("steps", []) or []), _ev00_failure_effects())),
                 "validation_refs": [],
                 "calculation_refs": [],
                 "common_logic_refs": [],
@@ -373,6 +374,54 @@ def _renumber_init_steps(steps: list) -> list:
     return result
 
 
+def _ev00_failure_effects() -> list:
+    """react 下書きの failure_effects のうち EV00(初期表示)の分を、ソース順で返す。下書きが無ければ空。
+    WHY: 初期処理の取得の開始時・失敗時の事実を、EV00 の取得の並び(1件 = 1回の取得)から出すため(B9 c)。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return []
+    try:
+        data = json.loads(draft.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [f for f in (data.get("failure_effects") or []) if isinstance(f, dict) and f.get("event") == "EV00"]
+
+
+def _with_init_fact_steps(steps: list, ev00_failures: list) -> list:
+    """初期処理の steps の各 backend_call の前後に、EV00 の事実の行(開始時・失敗時)を state_update の step として足した写しを返す。
+
+    WHY: EV00 は apply_react_draft(B6)が強制しない(EV00 以外が対象)ため、初期処理の取得の事実はここで入れる。
+    対応: EV00 の failure_effects(1件 = 1回の取得、ソース順)と、steps の backend_call(出現順)を1対1で取る。
+          件数が合わなければ何もしない(推測で対応させない)。
+    位置: 開始時は呼出の前、失敗時は呼出の後。同じ趣旨の step が既にあれば足さない(extract_react_draft._FACT_MATCH の語で判定)。
+    文面: extract_react_draft._event_facts と同じ文を使う(下書き側と文が割れないように)。state 名は下書きのまま(画面項目名への言い換えは無い)。
+    """
+    idx = [i for i, s in enumerate(steps) if s.get("kind") == "backend_call" or s.get("backend_call")]
+    if not ev00_failures or len(idx) != len(ev00_failures):
+        return steps
+    from extract_react_draft import _event_facts, _FACT_MATCH  # 遅延 import: 下書きの文面を使うため
+
+    texts = {}  # (取得の番号, key) → 文
+    for k, fe in enumerate(ev00_failures):
+        for f in _event_facts({"empty": []}, [fe], {}):
+            if f["key"] in ("start", "failure"):
+                texts[(k, f["key"])] = f["text"]
+
+    def _present(key: str) -> bool:
+        return any(m in str(s.get("description") or "") for s in steps for m in _FACT_MATCH[key])
+
+    pos = {i: k for k, i in enumerate(idx)}
+    out = []
+    for i, s in enumerate(steps):
+        k = pos.get(i)
+        if k is not None and texts.get((k, "start")) and not _present("start"):
+            out.append({"kind": "state_update", "description": texts[(k, "start")]})
+        out.append(dict(s))
+        if k is not None and texts.get((k, "failure")) and not _present("failure"):
+            out.append({"kind": "state_update", "description": texts[(k, "failure")]})
+    return out
+
+
 # F1: 文面より react 下書きの事実(behavior の種別)を優先する。絞り込み・表示切替の behavior は入力検査ではない。
 DISPLAY_BEHAVIOR_KINDS = {"data_filter", "display_toggle", "enable_toggle"}
 
@@ -450,6 +499,10 @@ def _guess_step_kind(text: str, react_kinds: frozenset = frozenset()) -> str:
         return "calculation"
     if any(kw in t for kw in ["再描画", "テーブル描画", "バナー表示", "バナーを消", "活性化", "非活性"]):
         return "screen_update"
+    # B9: ファイル出力(ダウンロード・CSV・文字コード・見出し行・合計行・区切り)。branch より前に置く(「場合」を含むファイル出力の文を branch にしない)。
+    # WHY: 「CSV出力ボタンが活性化する」等の画面の状態の文は file_output にしない(活性・押せの語を含む文は除く)。
+    if any(kw in t for kw in ["ダウンロード", "ファイル", "CSV", "文字コード", "見出し行", "合計行", "区切り"]) and not any(kw in t for kw in ["活性", "押せ"]):
+        return "file_output"
     if any(kw in t for kw in ["なら", "ならば", "場合", "閲覧モード", "編集モード"] + extra_keywords.get("branch", [])):
         return "branch"
     return "state_update"
@@ -781,6 +834,10 @@ def build_backend_processes(api_spec: list, db_operations: list) -> tuple:
                     "insert_values": db_op.get("insert_values", []),
                     "update_values": db_op.get("update_values", []),
                     "cte_definitions": db_op.get("cte_definitions", []),
+                    # B9: 共通表式(WITH)と副問合せを docx へ届ける(generate_docx.js の renderDbOperationDetail が描く)
+                    # WHY: 届けないと WITH 節と副問合せが docx から落ちる(cte_definitions とは別の欄)
+                    "ctes": db_op.get("ctes", []),
+                    "subqueries": db_op.get("subqueries", []),
                     "remarks": db_op.get("remarks", ""),
                     "error_message_id": db_op.get("error_message_id", ""),
                     "src": db_op.get("src", [])  # ソース出典(A3)。合成の _fill_src が付けた値を落とさず届ける
@@ -1020,7 +1077,38 @@ def selftest() -> int:
         assert [s["kind"] for s in s4] == ["screen_update"], s4
     finally:
         _react_behaviors = real
+
+    # B9 b: file_output(ファイル出力)。活性・押せの文は file_output にしない。branch より前
+    assert _guess_step_kind("結果をCSVファイルとしてダウンロードする") == "file_output"
+    assert _guess_step_kind("ダウンロード先を選ぶ場合は区切りを指定する") == "file_output"
+    assert _guess_step_kind("CSV出力ボタンを活性化する") == "screen_update"
+    assert _guess_step_kind("CSV出力ボタンを押せない") != "file_output"
+    assert _guess_step_kind("店舗が指定された場合は絞り込む") == "branch"
+
+    # B9 a: build_backend_processes が db_op_detail に ctes・subqueries を渡す
+    bps, _ids = build_backend_processes(
+        [{"action": "load", "method": "GET", "path": "/a", "description": "一覧を取得する。", "related_db_operations": ["DB1"]}],
+        [{"id": "DB1", "api_endpoint": {"action": "load"}, "operation_type": "select",
+          "ctes": [{"name": "c1"}], "subqueries": [{"clause": "where"}]}])
+    det = next(p for p in bps[0]["processing"] if p["kind"] == "db_operation")["db_op_detail"]
+    assert det["ctes"] == [{"name": "c1"}] and det["subqueries"] == [{"clause": "where"}], det
+
+    # B9 c: 初期処理の backend_call の前後に EV00 の開始時・失敗時の step を入れる(件数が合うときだけ)
+    fe = {"event": "EV00", "call": "load", "before_call": ["loading=true", "error=null"], "on_success": ["rows"],
+          "on_failure": ["error"], "in_finally": ["loading=false"], "untouched_on_failure": ["rows"],
+          "failure_text": "String(e)", "failure_state": "error", "src": [{"file": "x", "line_start": 1, "line_end": 1}]}
+    base = [{"kind": "backend_call", "description": "店舗一覧を取得する", "backend_call": {"backend_id": "B001"}}]
+    out = _with_init_fact_steps(base, [fe])
+    assert [s["kind"] for s in out] == ["state_update", "backend_call", "state_update"], out
+    assert "取得の開始時に" in out[0]["description"] and "取得に失敗したときは" in out[2]["description"], out
+    assert _with_init_fact_steps(base, []) == base
+    assert _with_init_fact_steps(base, [fe, fe]) == base
+    # 既に同じ趣旨の文があれば足さない
+    pre = [{"kind": "state_update", "description": "取得の開始時に、loading を true にする"}] + base
+    assert len(_with_init_fact_steps(pre, [fe])) == 3
     print("[selftest OK] migrate_v17_to_v18.step_kind")
+    print("[selftest OK] migrate_v17_to_v18.db_op_detail_ctes")
+    print("[selftest OK] migrate_v17_to_v18.init_fact_steps")
     return 0
 
 
