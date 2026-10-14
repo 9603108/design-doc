@@ -293,8 +293,11 @@ def _excerpt_chunks(used, funcs):
     return "\n\n".join(parts) + "\n"
 
 
-def analyze_sources(source_files, api_call_functions):
-    """TSX を解析し、(links, unresolved) を返す。
+def analyze_sources(source_files, api_call_functions, info=None):
+    """TSX を解析し、(links, unresolved, excerpt) を返す。
+
+    info(省略可): dict を渡すと info["used"](画面が使う API 関数の名前の集合)と info["funcs"](名前 → (path, text, 開始, 終了))を入れる。
+    WHY(W7): client_error_templates が excerpt と同じ used・funcs から API の throw を辿る(_client_error_templates)。戻り値の形は変えない。
 
     契約(出力側 build_draft が依存する形):
       links: 先頭は attr="mount" の1件(EV00 初期表示。マウント時に走る useEffect 全部の呼出を、ソースの出現順に集める)。
@@ -381,6 +384,8 @@ def analyze_sources(source_files, api_call_functions):
         if key not in seen_u:
             seen_u.add(key)
             uniq.append(u)
+    if info is not None:
+        info["used"], info["funcs"] = set(ctx["used"]), funcs
     return links, uniq, _excerpt_chunks(ctx["used"], funcs)
 
 
@@ -1011,7 +1016,10 @@ def _row_specs(body, count, path=None, text=None, base=0):
         # WHY: 複数行の文字列連結(note: "a" + "b")は連結して1つの文にする。note が無ければ null
         nm = note_re.search(ob)
         note = "".join(re.findall(r"['\"]([^'\"]*)['\"]", nm.group(1))) if nm else None
+        # WHY(W7): unit は spec の単位(「点」「人」)。画面は単位なしの spec に既定の「円」を足す(`s.unit ?? "円"`)ので、
+        #   合成(_compose_mapping)が表示行の transform の単位を spec ごとに決められるよう、リテラルをそのまま出す(無ければ null)
         specs.append({"label": label, "csv": attr("csv"), "kin": attr("kin"), "cnt": attr("cnt"),
+                      "unit": attr("unit"),
                       "nth": count[label], "dead": ("dead: true" in ob) or ("dead:true" in ob),
                       "note": note,
                       "src": [_span(path, text, base + om.start(), base + om.end())] if path is not None else []})
@@ -1030,6 +1038,7 @@ def _display_rows(sources):
         if p.suffix not in (".tsx", ".jsx"):
             continue
         t = p.read_text(encoding="utf-8")
+        first_row = len(rows)
         for m in re.finditer(r"^const\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*\[", t, re.M):
             end = _close(t, m.end() - 1)
             labels = [x.group(1) for x in re.finditer(r"\b(?:label|header|title)\s*:\s*['\"]([^'\"]+)['\"]", t[m.end():end])]
@@ -1037,7 +1046,236 @@ def _display_rows(sources):
                 # 目的: 表示行の出典(配列の宣言の範囲)。接続: build_draft ではなく main() の display_rows に出る
                 rows.append({"array": m.group(1), "labels": labels, "src": [_span(p, t, m.start(), end)],
                              "specs": _row_specs(t[m.end():end], count, p, t, m.end())})
+        if len(rows) > first_row:
+            # WHY(W7): セルの書式は「その配列の行を描く所」の事実で、配列ごとではなくファイルの描画コードで決まる。
+            #   同じファイルの配列には同じ値を付ける(合成 _compose_mapping が transform の書式を作るときに読む)
+            import copy
+            cf = _cell_format(p, t, sources)
+            for r in rows[first_row:]:
+                r["cell_format"] = copy.deepcopy(cf)
     return rows
+
+
+_TR = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S)
+_TD = re.compile(r"<td\b[^>]*>(.*?)</td>", re.S)
+
+
+def _decl_text(name, sources):
+    """全 TSX の中の `const|let|var|function <name>` の宣言の本体の文字列(最初の1件)。無ければ None。呼出元: _cell_format()。"""
+    for sp in sources:
+        if Path(sp).suffix not in (".tsx", ".jsx"):
+            continue
+        st = Path(sp).read_text(encoding="utf-8")
+        m = re.search(rf"\b(?:const|let|var|function)\s+{re.escape(name)}\b", st)
+        if m:
+            return _decl_body(st, m.end())
+    return None
+
+
+def _call_wrap(expr):
+    """`F(…)` が式の全体なら (F, 引数の文字列)、そうでなければ None。`fmt(a) + fmt(b)` のような式は None。"""
+    m = re.match(r"([A-Za-z_$][\w$]*)\s*\(", expr)
+    if not m:
+        return None
+    po = m.end() - 1
+    if _close(expr, po) != len(expr) - 1:
+        return None
+    return m.group(1), expr[po + 1:-1].strip()
+
+
+def _td_cell(inner, before, sources, fmt_names):
+    """1つの <td> の中身から、書式 F の事実を作る。`{F(引数)} 末尾` の形でなければ None。
+
+    before は <tr> より前のファイルの文字(`const unit = …`・`const kin = …` の定義を、直近のものから引く先)。
+
+    呼出元: _cell_format()。意味合い: 値の整形(桁区切り)・null の扱い・末尾の単位が、画面のどの関数・どの文字から来るかを事実にする。
+    grouping と null_as_zero は判定できなければ null(False と言い切らない)。
+    """
+    s = inner.strip()
+    if not s.startswith("{"):
+        return None
+    e = _close(s, 0)
+    wrap = _call_wrap(s[1:e].strip())
+    if not wrap:
+        return None
+    fn, arg = wrap
+    rest = s[e + 1:].strip()
+    # 末尾: リテラルの文字 / {識別子}(単位の変数) / 無し。それ以外(別の式が混ざる)は決められない
+    suffix, from_unit, unit_default = None, False, None
+    um = re.fullmatch(r"\{\s*([A-Za-z_$][\w$]*)\s*\}", rest)
+    if um:
+        dm = list(re.finditer(rf"\bconst\s+{re.escape(um.group(1))}\b[^=\n]*=", before))
+        for dm_ in dm[-1:]:
+            expr = before[dm_.end():_expr_end(before, dm_.end())]
+            if re.search(r"\.unit\b", expr):
+                from_unit = True
+                dflt = re.search(r"\?\?\s*([\"'])([^\"']*)\1", expr)
+                unit_default = dflt.group(2) if dflt else None
+            else:
+                lit = re.fullmatch(r"\s*([\"'])([^\"']*)\1\s*", expr)
+                suffix = lit.group(2) if lit else None
+    elif rest and not re.search(r"[{}<>]", rest):
+        suffix = rest
+    elif rest:
+        return None
+    # grouping: F が整形の関数(V5 の formats_numbers と同じ判定)か。宣言が見つからない(import)なら null
+    if fn in fmt_names:
+        grouping = True
+    else:
+        grouping = False if _decl_text(fn, sources) is not None else None
+    # null_as_zero: 値の取り出し(G(...)・直の ?? 0・識別子の定義)が `?? 0` を通るか。分岐(三項)の中の値は決められず null
+    null_as_zero = _null_as_zero(arg, before, sources)
+    return {"suffix": suffix, "suffix_from_unit": from_unit, "unit_default": unit_default,
+            "grouping": grouping, "null_as_zero": null_as_zero}
+
+
+def _null_as_zero(arg, ctx_text, sources, depth=0):
+    """F の引数の式が、値が null のとき 0 にするか。True・False、決まらないとき None。呼出元: _td_cell()。"""
+    arg = arg.strip()
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", arg) and depth < 2:
+        ms = list(re.finditer(rf"\bconst\s+{re.escape(arg)}\b[^=\n]*=", ctx_text))
+        if not ms:
+            return None
+        expr = ctx_text[ms[-1].end():_expr_end(ctx_text, ms[-1].end())]
+        if _split_ternary(expr):
+            return None
+        return _null_as_zero(expr, ctx_text, sources, depth + 1)
+    wrap = _call_wrap(arg)
+    if wrap:
+        body = _decl_text(wrap[0], sources)
+        if body is None:
+            return None
+        return bool(re.search(r"\?\?\s*0\b", body))
+    return bool(re.search(r"\?\?\s*0\b", arg))
+
+
+def _cell_format(path, text, sources):
+    """spec の配列を描く <tr>(cnt の td を持つ行)から、セルの書式 {cnt, kin, single} を作る。決まらなければ None。
+
+    呼出元: _display_rows()(同じファイルの配列に同じ値を付ける)。意味合い: 画面は点数・金額・単独セルを同じ関数で整形し末尾に単位を付ける。
+    その事実(末尾・単位の出どころ・桁区切り・null→0)を機械で出し、合成(_compose_mapping)が表示行の transform を作る根拠にする。
+    役割の決め方: cnt = `.cnt` を参照する td、kin = その次の値の td、single = それ以外の値の td。描く <tr> が複数あって形が違う、
+    役割のどれかが決まらない、single が複数で形が違うときは None(誤った書式を断定しない)。画面ごとの決め打ちの名前は持たない。
+    """
+    fmt_names = _formatter_names(sources)
+    results = []
+    for tm in _TR.finditer(text):
+        before = text[:tm.start()]
+        tds = [(x.group(1), x.start(), x.end()) for x in _TD.finditer(text, tm.start(1), tm.end(1))]
+        ci = next((i for i, (inner, _s, _e) in enumerate(tds) if re.search(r"\.cnt\b", inner)), None)
+        if ci is None:
+            continue
+        roles, singles = {}, []
+        kin_i = None
+        for i, (inner, s0, e0) in enumerate(tds):
+            cell = _td_cell(inner, before, sources, fmt_names)
+            if cell is not None:
+                cell["src"] = [_span(path, text, s0, e0)]
+            if i == ci:
+                roles["cnt"] = cell
+            elif cell is None:
+                continue
+            elif i > ci and kin_i is None:
+                kin_i = i
+                roles["kin"] = cell
+            else:
+                singles.append(cell)
+        if roles.get("cnt") is None or roles.get("kin") is None or not singles:
+            return None
+        key = lambda c: {k: v for k, v in c.items() if k != "src"}
+        if any(key(c) != key(singles[0]) for c in singles):
+            return None
+        roles["single"] = dict(singles[0])
+        roles["single"]["src"] = [sp for c in singles for sp in c["src"]]
+        results.append(roles)
+    if not results:
+        return None
+    for r in results[1:]:
+        if any({k: v for k, v in r[x].items() if k != "src"} != {k: v for k, v in results[0][x].items() if k != "src"}
+               for x in ("cnt", "kin", "single")):
+            return None
+    out = results[0]
+    for x in out:
+        out[x]["src"] = [sp for r in results for sp in r[x]["src"]]
+    return out
+
+
+def _split_ternary(expr):
+    """式の深さ0の三項演算子 `c ? a : b` を (c, a, b) に割る。無ければ None。`?.`・`??` は三項と見なさない。
+
+    呼出元: _error_branches()・_null_as_zero()。文字列・テンプレートの中は _walk が飛ばすので `?` `:` を誤って拾わない。
+    """
+    q, nest = None, 0
+    for i, c, d in _walk(expr, 0):
+        if d != 0:
+            continue
+        if c == "?":
+            if expr[i + 1:i + 2] in (".", "?") or expr[i - 1:i] == "?":
+                continue
+            if q is None:
+                q = i
+            else:
+                nest += 1
+        elif c == ":" and q is not None:
+            if nest:
+                nest -= 1
+            else:
+                return expr[:q].strip(), expr[q + 1:i].strip(), expr[i + 1:].strip()
+    return None
+
+
+def _error_branches(expr):
+    """`new Error(…)` の式を、三項演算子の枝ごとの式の並びにする(枝が入れ子ならさらに割る)。呼出元: _client_error_templates()。"""
+    expr = expr.strip()
+    while expr.startswith("(") and _close(expr, 0) == len(expr) - 1:
+        expr = expr[1:-1].strip()
+    t = _split_ternary(expr)
+    if not t:
+        return [expr]
+    return _error_branches(t[1]) + _error_branches(t[2])
+
+
+def _client_error_templates(used, funcs):
+    """画面が使う API 関数から、同じファイルの関数を名前で辿り(fetchX → call → unwrap)、`new Error(式)` の式を出す。
+
+    呼出元: main()(draft["client_error_templates"])。意味合い: 画面の catch が表示する取得エラーの文面(クライアント側で作るもの)を、
+    throw の形の事実として出す。合成(_compose_error_example, W8)が backend のエラーの文と組み合わせて例示値を作る。
+    各行: {template, placeholders, kind, src}。kind は template(テンプレート文字列。バッククォートを除いた中身)・literal(文字列リテラル)・
+    expression(それ以外の式。そのまま。placeholders は空)。三項演算子は枝ごとに別の行にする。
+    """
+    seen, todo = set(), sorted(used)
+    while todo:
+        name = todo.pop()
+        if name in seen or name not in funcs:
+            continue
+        seen.add(name)
+        path, text, s, e = funcs[name]
+        for ident, _i in _idents(text, s, e):
+            if ident in funcs and funcs[ident][0] == path and ident not in seen:
+                todo.append(ident)
+    out, keys = [], set()
+    for name in seen:
+        path, text, s, e = funcs[name]
+        for m in re.finditer(r"\bnew\s+Error\s*\(", text[s:e]):
+            po = s + m.end() - 1
+            pe = _close(text, po)
+            sp = _span(path, text, s + m.start(), pe + 1)
+            for br in _error_branches(" ".join(text[po + 1:pe].split())):
+                tm = re.fullmatch(r"`([^`]*)`", br)
+                lm = re.fullmatch(r"([\"'])(.*)\1", br)
+                if tm:
+                    row = {"template": tm.group(1), "placeholders": [x.strip() for x in re.findall(r"\$\{([^}]*)\}", tm.group(1))],
+                           "kind": "template"}
+                elif lm and lm.group(1) not in lm.group(2):
+                    row = {"template": lm.group(2), "placeholders": [], "kind": "literal"}
+                else:
+                    row = {"template": br, "placeholders": [], "kind": "expression"}
+                key = (str(path), sp["line_start"], row["template"])
+                if key not in keys:
+                    keys.add(key)
+                    row["src"] = [sp]
+                    out.append((str(path), sp["line_start"], row))
+    return [r for _p, _l, r in sorted(out, key=lambda x: (x[0], x[1]))]
 
 
 def _continuous_ops(links, sources=()):
@@ -1117,7 +1355,8 @@ def main(argv=None):
         print(f"[入力不正] source_files が空か、無いファイルがある: {missing}", file=sys.stderr)
         return 2
 
-    links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
+    api_info = {}
+    links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []), api_info)
     # 目的: 取得失敗時に変える state・残る state を下書きに足し(既存キーは変えない)、details の失敗時の行にも使う。接続: _react_facts.extract
     facts = _react_facts.extract(links, sources)
     # 目的: 画面部品の名前(bind された state の画面項目名)を、開始時・成功時の文の言い換えに使う。接続: _state_names
@@ -1153,6 +1392,9 @@ def main(argv=None):
     draft.update(_react_facts.derived_arrays(sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
+    # 目的(W7): 画面が使う API 関数が throw する Error の文面の形(client_error_templates)を足す。接続: 合成 _compose_error_example(W8)が
+    #   backend の error_patterns と組んで、取得エラーの表示の例示値を作る。display_rows[].cell_format・specs[].unit は _display_rows で付く(_compose_mapping(W6)が読む)
+    draft["client_error_templates"] = _client_error_templates(api_info.get("used", set()), api_info.get("funcs", {}))
     draft["continuous_operation"] = _continuous_ops(links, sources)
     # 目的: CSV と連続操作の事実の行を、trigger の event_processes[].fact_lines に入れる(案 B5 b・c)
     # 目的: CSV の処理順(seq 1〜6)を、表示行の全項目(dead を含む)とファイル名の式の画面項目名で組む。接続: _csv_fact_map
@@ -1440,6 +1682,111 @@ def _selftest_v5():
     return 0
 
 
+def _selftest_w7():
+    """セルの書式(cell_format)・spec の unit・API のエラーの形(client_error_templates)を、一時の TSX・api.ts で assert する。
+
+    呼出元: selftest()。意味合い: spec の配列を map して描く <tr> から cnt・kin・single の書式が事実で出ること、描く所が2か所で形が違うと null になること、
+    API 関数から call → unwrap と辿った `new Error(…)` が三項演算子の枝ごとに出ることを確かめる。終了コード 0=OK / 1=NG。
+    """
+    import tempfile
+    row_a = (
+        '        return (\n'
+        '          <tr key={i}>\n'
+        '            <th>{s.label}</th>\n'
+        '            {s.cnt ? (\n'
+        '              <>\n'
+        '                <td>{fmt(num(agg[s.cnt]))} 点</td>\n'
+        '                <td>{fmt(kin)} 円</td>\n'
+        '              </>\n'
+        '            ) : (\n'
+        '              <td colSpan={2}>\n'
+        '                {fmt(kin)} {unit}\n'
+        '              </td>\n'
+        '            )}\n'
+        '          </tr>\n'
+        '        );\n'
+    )
+    # fallback-ok: 実画面(PosReport.tsx)の `num = Number(v ?? 0)`・`s.unit ?? "円"` を再現する試験の入力。cell_format が事実として拾うかの確認
+    head = (
+        'type Spec = { label: string; cnt?: string; kin?: string; unit?: string };\n'
+        'const A: Spec[] = [{ label: "売上", cnt: "u_cnt", kin: "u_kin" }];\n'
+        'const B: Spec[] = [{ label: "点数", kin: "ten", unit: "点" }, { label: "金額", kin: "k" }];\n'
+        'const num = (v: unknown) => Number(v ?? 0);\n'  # fallback-ok: 同上(試験の入力)
+        'const fmt = (v: number) => v.toLocaleString("ja-JP");\n'
+        'function Card({ agg }: { agg: Record<string, number> }) {\n'
+        '  const render = (specs: Spec[]) => specs.map((s, i) => {\n'
+        '    const kin = s.calc ? s.calc(agg) : num(agg[s.kin!]);\n'
+        '    const unit = s.unit ?? "円";\n'  # fallback-ok: 同上(試験の入力)
+    )
+    api_src = (
+        'export function fetchX() {\n'
+        '  return call<number>("x", {});\n'
+        '}\n'
+        'async function call<T>(action: string, p: object): Promise<T> {\n'
+        '  const res = await fetch("/api");\n'
+        '  return unwrap<T>(res);\n'
+        '}\n'
+        'async function unwrap<T>(res: Response): Promise<T> {\n'
+        '  const body = await res.json();\n'
+        '  if (!body.success) {\n'
+        '    throw new Error(body?.error ? `${body.error.code}: ${body.error.message}` : `HTTP ${res.status}`);\n'
+        '  }\n'
+        '  return body.data;\n'
+        '}\n'
+        'export function other() {\n'
+        '  throw new Error("使われない");\n'
+        '}\n'
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d)
+            tsx = dp / "Card.tsx"
+            tsx.write_text(head + row_a + '  });\n  return <button onClick={() => fetchX()}>go</button>;\n}\n', encoding="utf-8")
+            (dp / "api.ts").write_text(api_src, encoding="utf-8")
+            srcs = [tsx, dp / "api.ts"]
+            rows = _display_rows(srcs)
+            assert [r["array"] for r in rows] == ["A", "B"], rows
+            cf = rows[0]["cell_format"]
+            assert rows[1]["cell_format"] == cf, "同じファイルの配列に同じ cell_format が付く"
+            assert cf["cnt"]["suffix"] == "点" and cf["cnt"]["grouping"] is True and cf["cnt"]["null_as_zero"] is True, cf["cnt"]
+            assert cf["kin"]["suffix"] == "円" and cf["kin"]["grouping"] is True and cf["kin"]["suffix_from_unit"] is False, cf["kin"]
+            assert cf["kin"]["null_as_zero"] is None, "kin は三項(calc か否か)で決まらないので null_as_zero は null"
+            sg = cf["single"]
+            assert sg["suffix"] is None and sg["suffix_from_unit"] is True and sg["unit_default"] == "円" and sg["grouping"] is True, sg
+            assert cf["cnt"]["src"][0]["file"] == str(tsx) and cf["cnt"]["src"][0]["line_start"] == 15, cf["cnt"]["src"]
+            units = {s["label"]: s["unit"] for s in rows[1]["specs"]}
+            assert units == {"点数": "点", "金額": None}, units
+            # 描く <tr> が2か所で形が違えば null
+            row_b = row_a.replace("点</td>", "件</td>")
+            tsx.write_text(head + row_a + '  });\n  const r2 = (specs: Spec[]) => specs.map((s, i) => {\n' + row_b
+                           + '  });\n  return null;\n}\n', encoding="utf-8")
+            assert _display_rows(srcs)[0]["cell_format"] is None, "描く所が2か所で形が違うのに cell_format が出た"
+            # 同じ形が2か所なら出る
+            tsx.write_text(head + row_a + '  });\n  const r2 = (specs: Spec[]) => specs.map((s, i) => {\n' + row_a
+                           + '  });\n  return null;\n}\n', encoding="utf-8")
+            assert _display_rows(srcs)[0]["cell_format"]["cnt"]["suffix"] == "点", "同じ形が2か所のとき出ない"
+            # 整形の関数が整形をしなければ grouping は False(宣言があり整形が無い)
+            tsx.write_text((head + row_a + '  });\n  return null;\n}\n').replace('v.toLocaleString("ja-JP")', "String(v)"), encoding="utf-8")
+            assert _display_rows(srcs)[0]["cell_format"]["cnt"]["grouping"] is False
+            # API のエラー: fetchX → call → unwrap。unwrap の三項の2枝が2行、使われない other は出ない
+            tsx.write_text(head + row_a + '  });\n  return <button onClick={() => fetchX()}>go</button>;\n}\n', encoding="utf-8")
+            info = {}
+            analyze_sources(srcs, ["call"], info)
+            tpls = _client_error_templates(info["used"], info["funcs"])
+            assert [t["template"] for t in tpls] == ["${body.error.code}: ${body.error.message}", "HTTP ${res.status}"], tpls
+            assert tpls[0]["placeholders"] == ["body.error.code", "body.error.message"] and tpls[1]["placeholders"] == ["res.status"], tpls
+            assert all(t["kind"] == "template" and t["src"][0]["line_start"] == 11 for t in tpls), tpls
+        assert _split_ternary('a ? b : c') == ("a", "b", "c") and _split_ternary("a?.b ?? c") is None
+        assert _error_branches('x ? "p" : y ? "q" : "r"') == ['"p"', '"q"', '"r"']
+    except AssertionError as e:
+        print(f"[selftest NG] W7 {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] W7 例外: {e!r}")
+        return 1
+    return 0
+
+
 def selftest():
     """最小の api.ts と TSX(ラッパー経由・useEffect 連鎖・解決不能の1件)で、解析と組立の期待値を assert する。
 
@@ -1513,6 +1860,8 @@ def selftest():
     if _selftest_u6():
         return 1
     if _selftest_v5():
+        return 1
+    if _selftest_w7():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0
