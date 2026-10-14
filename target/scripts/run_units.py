@@ -28,6 +28,7 @@ COMMON = SKILL / "prompts" / "_共通.md"
 
 # 検査が差し戻し先を示す行の形: "... → 差し戻し先 S1"(複数は , 、 / で並ぶ)
 SENDBACK_RE = re.compile(r"→ 差し戻し先 (\S+)")
+UNIT_LIST_RE = re.compile(r"[A-Za-z0-9_,、/]+")  # 差し戻し先の直後の単位名の並び(説明の括弧は含めない)
 DIAGRAM_MARK = "(構成図)"
 
 # 後段コマンド列。順序は SKILL.md「実行順序」と units_prompts.json の after に従う。
@@ -184,7 +185,11 @@ def parse_sendbacks(text, units=None):
     for line in text.splitlines():
         m = SENDBACK_RE.search(line)
         if m:
-            targets = [u for u in re.split(r"[,、/]", m.group(1)) if u]
+            # WHY(2026-10-14 run12): 「→ 差し戻し先 S1（出典の行範囲を…に直す）」のように単位名の直後に説明の括弧が続く行は、
+            # \S+ が括弧の中まで取って単位名が「S1（出典…」になり unknown に落ちた。先頭の単位名の並びだけを取る。
+            # 単位名の並びで始まらない(「担当外の側」など)ときは従来どおり丸ごと取って unknown に残す。
+            lead = UNIT_LIST_RE.match(m.group(1))
+            targets = [u for u in re.split(r"[,、/]", lead.group(0) if lead else m.group(1)) if u]
             if units is not None:
                 targets = [u if u in units else "unknown" for u in targets]
                 targets = list(dict.fromkeys(targets))
@@ -291,6 +296,12 @@ def selftest():
     assert parse_sendbacks("[WARN] x → 差し戻し先 S0", units) == {"unknown": ["[WARN] x → 差し戻し先 S0"]}
     assert sorted(parse_sendbacks("x → 差し戻し先 S0,S1,H9", units)) == ["S1", "unknown"]
     assert list(parse_sendbacks("x → 差し戻し先 S0")) == ["S0"]
+    # 2026-10-14 run12: 単位名の直後に説明の括弧が続く行は、括弧を単位名に含めない(S1（…）→ S1)。括弧の無い複数もそのまま
+    s = parse_sendbacks("  [ERROR] initialization.items[62](注記): 初期値に項目 63 の初期値が含まれる → 差し戻し先 S1（出典の行範囲を、その項目の文言だけに直す）", units)
+    assert list(s) == ["S1"], s
+    assert sorted(parse_sendbacks("x → 差し戻し先 H2,H3（説明）", units)) == ["H2", "H3"]
+    # 単位名で始まらない差し戻し先(担当外の側)は従来どおり丸ごと unknown に残す
+    assert list(parse_sendbacks("[重複] x: 同じ欄を書いた → 差し戻し先 担当外の側", units)) == ["unknown"]
     # retry は units 表に無い単位で KeyError にせず、分かる文言で終了コード 2
     import contextlib
     import io

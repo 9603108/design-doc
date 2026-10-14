@@ -1479,6 +1479,7 @@ def check_initialization_items(merged: dict, drafts: list = None) -> list:
           固定文 = react 下書きの jsx_elements のうち文字列リテラルだけの要素（text があり label が無い）に、
           項目の名前か example の文言が一致する項目。見えるか = visible_chain（無ければ visible_if）を初期値で評価して真。
           初期表示で見えない固定文（読込中・エラーなど）の Blank は正しいので対象外。
+          見えるかは画面項目の位置ごとに持つ（同じ名前の別の項目、例えば隠れた行の印「空」と凡例の「空」を混ぜない）。
     WHY: merge_partials.build_initialization は評価できない項目を仮埋めの「活性/表示」で出す。
          後段の検査が無いと、その仮埋めのまま docx に出ても止まらないため。
          固定文の判定は example の形（{…} の有無）では行わない。実行時の値（総売上など）を固定文と誤認するため。
@@ -1497,15 +1498,22 @@ def check_initialization_items(merged: dict, drafts: list = None) -> list:
     env = build_env([si for d in drafts for si in d.get("state_initials") or [] if isinstance(si, dict)],
                     [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)])
     literal = literal_text_elements(drafts)
-    visible_fixed = set()
-    for s in sl_items:
+    # WHY(2026-10-14 run12): 見えるかは項目の位置（画面項目の並び）で持つ。名前の集合で持つと、同じ名前の別の項目
+    #      （Card の中の隠れた印「空」と、凡例の「空」）の一方が見えるだけで、隠れた方まで Blank を ERROR にした。
+    visible_fixed_pos = set()
+    visible_fixed_name = set()
+    for k, s in enumerate(sl_items):
         linked = _fixed_for_item(s, literal)
         if any(visible_initially(el, env) is True for el in linked):
-            visible_fixed.add(str(s.get("item_name") or "").strip())
-    for i in init_items:
+            visible_fixed_pos.add(k)
+            visible_fixed_name.add(str(s.get("item_name") or "").strip())
+    for k, i in enumerate(init_items):
         name = str(i.get("item_name") or "").strip()
-        if name in visible_fixed and str(i.get("initial_value") or "") == "Blank":
-            issues.append(("ERROR", f"initialization.items[{i.get('no') or '?'}]({name}): 初期表示で見える固定文の初期値が Blank（画面に書かれた文言を初期値に入れる）"))
+        # 同じ位置の画面項目と名前が合えば、その位置の判定。合わない（並びがずれた）ときだけ名前で見る
+        paired = k < len(sl_items) and str(sl_items[k].get("item_name") or "").strip() == name
+        fixed = (k in visible_fixed_pos) if paired else (name in visible_fixed_name)
+        if fixed and str(i.get("initial_value") or "") == "Blank":
+            issues.append(("ERROR", f"initialization.items[{i.get('no') or '?'}]({name}): 初期表示で見える固定文の初期値が Blank（画面に書かれた文言を初期値に入れる）→ 差し戻し先 S1（項目の出典 src を、その文言を描く JSX の行範囲に直す）"))
     return issues
 
 
@@ -1595,6 +1603,7 @@ def check_initialization_dup(merged: dict) -> list:
     判定ルール:
       initialization.items の i≠j で、j の初期値が 12 字以上・Blank でなく、i の初期値に含まれ、
       かつ i の初期値の方が長いとき、i を ERROR（差し戻し先 S1）。同じ文言の2項目は重複とみなさない。
+      ただし j の出典（TSX の行範囲）が i の出典の行範囲の中に収まる入れ子（段落の中の強調など）は、画面に出る文のとおりなので見ない。
     WHY: 出典の行範囲が兄弟の項目の文言まで取ると、初期値に別の項目の文言が重複して入る（round12 の IT61・IT62 で再現）。
          12 字未満の語は別の文言に偶然含まれやすいので見ない。
     接続情報: 入力 = merged['initialization']['items'] / 出力 = [(level, message), ...] / 呼出元 = main()
@@ -1602,11 +1611,30 @@ def check_initialization_dup(merged: dict) -> list:
     issues = []
     items = (merged.get("initialization") or {}).get("items") or []
     vals = [str(i.get("initial_value") or "").strip() for i in items]
+    # WHY(2026-10-14 run12): j の出典の行範囲が i の出典の行範囲の中に収まるときは、段落の中の強調（<strong> 等）のような入れ子で、
+    #      i の文言に j の文言が入るのは画面に出る文のとおり。範囲の外の文言まで取った重複（round12 の IT61・IT62）だけを止める。
+    sl_items = (merged.get("screen_layout") or {}).get("items") or []
+
+    def _span(k: int):
+        """initialization.items[k] と同じ位置・同じ名前の画面項目の、最初の TSX/JSX の出典 (file, 開始行, 終了行)。無ければ None。"""
+        if k >= len(sl_items) or len(sl_items) != len(items):
+            return None
+        if str(sl_items[k].get("item_name") or "").strip() != str(items[k].get("item_name") or "").strip():
+            return None
+        for s in _tsx_src_of(sl_items[k]):
+            ls, le = s.get("line_start"), s.get("line_end")
+            if isinstance(ls, int) and isinstance(le, int):
+                return (str(s.get("file") or ""), ls, le)
+        return None
+
     for a, ia in enumerate(items):
         va = vals[a]
         for b, ib in enumerate(items):
             vb = vals[b]
             if a == b or len(vb) < 12 or vb == "Blank" or len(vb) >= len(va) or vb not in va:
+                continue
+            sa, sb = _span(a), _span(b)
+            if sa and sb and sa[0] == sb[0] and sa[1] <= sb[1] and sb[2] <= sa[2]:
                 continue
             issues.append(("ERROR", f"initialization.items[{ia.get('no') or '?'}]({str(ia.get('item_name') or '').strip()}): 初期値に項目 {ib.get('no') or '?'}({str(ib.get('item_name') or '').strip()}) の初期値が含まれる（出典の範囲が兄弟の項目の文言まで取っている）→ 差し戻し先 S1（出典の行範囲を、その項目の文言だけに直す）"))
     return issues
@@ -1755,6 +1783,22 @@ def _selftest() -> int:
     if any("固定文" in m for _, m in check_initialization_items(pos_init, lit_pos)):
         print("[selftest NG] 項目の位置で隠れた印を、別の位置の凡例で固定文の ERROR にした")
         return 1
+    # 2026-10-14 run12: 同じ名前の2項目(隠れた行の印「空」・見える凡例「空」)。隠れた方の Blank は正しく、凡例の Blank だけを ERROR にする
+    two_sl = {"items": [{"item_name": "空", "item_type": "Label", "example": "空", "src": [card_src]},
+                        {"item_name": "空", "item_type": "Label", "example": "空", "src": [legend_src]}]}
+    two_ok = {"initialization": {"items": [
+        {"no": 1, "item_name": "空", "active": "活性", "visible": "非表示", "initial_value": "Blank"},
+        {"no": 2, "item_name": "空", "active": "活性", "visible": "表示", "initial_value": "空"}]}, "screen_layout": two_sl}
+    if any("固定文" in m for _, m in check_initialization_items(two_ok, lit_pos)):
+        print("[selftest NG] 同じ名前の凡例が見えるだけで、隠れた印の Blank を固定文の ERROR にした")
+        return 1
+    two_bad = {"initialization": {"items": [
+        {"no": 1, "item_name": "空", "active": "活性", "visible": "非表示", "initial_value": "Blank"},
+        {"no": 2, "item_name": "空", "active": "活性", "visible": "表示", "initial_value": "Blank"}]}, "screen_layout": two_sl}
+    two_msgs = [m for _, m in check_initialization_items(two_bad, lit_pos) if "固定文" in m]
+    if not (len(two_msgs) == 1 and "items[2]" in two_msgs[0] and "→ 差し戻し先 S1" in two_msgs[0]):
+        print(f"[selftest NG] 見える凡例の Blank だけを固定文の ERROR にしない: {two_msgs}")
+        return 1
     # src が無い項目は従来どおり名前で結ぶ(凡例の「空」が初期表示で見える → ERROR)
     no_src = {"initialization": pos_init["initialization"],
               "screen_layout": {"items": [{"item_name": "空", "item_type": "Label", "example": "空"}]}}
@@ -1859,6 +1903,21 @@ def _selftest() -> int:
         {"no": 2, "item_name": "語", "initial_value": "表示できません。"}]}}
     if check_initialization_dup(dup_same) or check_initialization_dup(dup_short):
         print("[selftest NG] 同じ文言の2項目、または12字未満の語を重複として ERROR にした")
+        return 1
+    # 2026-10-14 run12: 段落の中の強調(出典の範囲が段落の範囲の中に収まる入れ子)は、画面に出る文のとおりなので ERROR にしない。
+    # 範囲の外(次の行以降)の文言まで取った重複は ERROR のまま
+    em = "強調して書く大事な文言そのもの"
+    para = f"前の文 {em} 後ろの文。"
+    nest_sl = [{"item_name": "注記", "src": [{"file": "/x/S.tsx", "line_start": 10, "line_end": 14}]},
+               {"item_name": "強調", "src": [{"file": "/x/S.tsx", "line_start": 12, "line_end": 12}]}]
+    nest_in = [{"no": 1, "item_name": "注記", "initial_value": para}, {"no": 2, "item_name": "強調", "initial_value": em}]
+    if check_initialization_dup({"initialization": {"items": nest_in}, "screen_layout": {"items": nest_sl}}):
+        print("[selftest NG] 段落の中の強調(出典が段落の範囲の中)を重複として ERROR にした")
+        return 1
+    out_sl = [{"item_name": "注記", "src": [{"file": "/x/S.tsx", "line_start": 10, "line_end": 11}]},
+              {"item_name": "強調", "src": [{"file": "/x/S.tsx", "line_start": 12, "line_end": 12}]}]
+    if len([1 for lvl, _ in check_initialization_dup({"initialization": {"items": nest_in}, "screen_layout": {"items": out_sl}}) if lvl == "ERROR"]) != 1:
+        print("[selftest NG] 出典の範囲の外の文言まで取った重複を ERROR にしない")
         return 1
     print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)・出典の無い項目・初期値の重複")
     return 0
