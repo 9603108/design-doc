@@ -1137,9 +1137,30 @@ def _null_as_zero(arg, ctx_text, sources, depth=0):
         if not ms:
             return None
         expr = ctx_text[ms[-1].end():_expr_end(ctx_text, ms[-1].end())]
-        if _split_ternary(expr):
-            return None
         return _null_as_zero(expr, ctx_text, sources, depth + 1)
+    # WHY(W6 の指摘): `c ? A : B` は枝ごとに判定する。全部の枝が null を 0 にするときだけ True、1つでも決まらなければ None、
+    #   決まった枝が全部 False なら False(混在は None)。画面の `const kin = s.calc ? s.calc(agg) : num(…)` を決められるようにする
+    tern = _split_ternary(arg)
+    if tern and depth < 4:
+        res = [_null_as_zero(b, ctx_text, sources, depth + 1) for b in tern[1:]]
+        if any(r is None for r in res):
+            return None
+        return True if all(res) else (False if not any(res) else None)
+    # 値を obj.fn(…) の関数プロパティ(spec の `calc: (r) => …`)で作る枝: 全ての定義が式の中で `?? 0` を通すときだけ True。
+    #   定義が見つからない・通さない定義がある(null のとき 0 になると言えない)ときは None
+    mc = re.fullmatch(r"[\w$.!?]+\.([A-Za-z_$][\w$]*)\s*\(.*\)", arg, re.S)
+    if mc:
+        defs = []
+        for sp in sources:
+            if Path(sp).suffix not in (".tsx", ".jsx"):
+                continue
+            st = Path(sp).read_text(encoding="utf-8")
+            for pm in re.finditer(rf"\b{re.escape(mc.group(1))}\s*:\s*(?=\(|[A-Za-z_$])", st):
+                end = next((j for j, c, d in _walk(st, pm.end()) if d < 0 or (c == "," and d == 0)), len(st))
+                defs.append(st[pm.end():end])
+        if defs and all(re.search(r"\?\?\s*0\b", x) for x in defs):
+            return True
+        return None
     wrap = _call_wrap(arg)
     if wrap:
         body = _decl_text(wrap[0], sources)
@@ -1751,6 +1772,21 @@ def _selftest_w7():
             assert cf["cnt"]["suffix"] == "点" and cf["cnt"]["grouping"] is True and cf["cnt"]["null_as_zero"] is True, cf["cnt"]
             assert cf["kin"]["suffix"] == "円" and cf["kin"]["grouping"] is True and cf["kin"]["suffix_from_unit"] is False, cf["kin"]
             assert cf["kin"]["null_as_zero"] is None, "kin は三項(calc か否か)で決まらないので null_as_zero は null"
+            # 三項は枝ごと: 全枝が ?? 0 を通せば True、calc の定義が ?? 0 を通さない・見つからない枝があれば None、通さない枝だけなら False
+            # fallback-ok: 次の2行は実画面の `num = Number(v ?? 0)`・`calc: (r) => …` を再現する試験の入力(null を 0 にする式の判定の確認)
+            num_def = 'const num = (v: unknown) => Number(v ?? 0);\nconst raw = (v: unknown) => Number(v);\n'
+            calc_zero = 'const S = [{ label: "x", calc: (r) => (r.a ?? 0) - (r.b ?? 0) }];\n'  # fallback-ok: 同上(試験の入力)
+            ctx = "const kin = s.calc ? s.calc(agg) : num(agg[s.kin!]);\n"
+            tsx2 = dp / "Calc.tsx"
+            tsx2.write_text(num_def + calc_zero, encoding="utf-8")
+            assert _null_as_zero("kin", ctx, [tsx2]) is True, "全枝が 0 にする三項"
+            tsx2.write_text(num_def + 'const S = [{ label: "x", calc: (r) => r.a - r.b }];\n', encoding="utf-8")
+            assert _null_as_zero("kin", ctx, [tsx2]) is None, "calc の定義が 0 にしない枝は決まらない"
+            tsx2.write_text(num_def, encoding="utf-8")
+            assert _null_as_zero("kin", ctx, [tsx2]) is None, "calc の定義が無い"
+            assert _null_as_zero("kin", "const kin = c ? num(a) : num(b);\n", [tsx2]) is True
+            assert _null_as_zero("kin", "const kin = c ? raw(a) : raw(b);\n", [tsx2]) is False, "全枝が 0 にしない"
+            assert _null_as_zero("kin", "const kin = c ? raw(a) : num(b);\n", [tsx2]) is None, "混在"
             sg = cf["single"]
             assert sg["suffix"] is None and sg["suffix_from_unit"] is True and sg["unit_default"] == "円" and sg["grouping"] is True, sg
             assert cf["cnt"]["src"][0]["file"] == str(tsx) and cf["cnt"]["src"][0]["line_start"] == 15, cf["cnt"]["src"]
