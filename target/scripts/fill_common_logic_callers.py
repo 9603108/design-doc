@@ -24,6 +24,8 @@ runs_on が「サーバー」「データベース」を含む行は、結んだ
 src が1件も無い CL には BE を足さず WARN を出す(round13 W3。src は S1 が必ず書き、verify_partials が止める)。
 runs_on が「ブラウザ」の CL は、src の関数・定数を TSX で使う箇所(useMemo の依存・state を変えるイベント・CSV の
 起点のイベント)から呼出元の FR を引く(_front_callers。react 下書き <機能名>_react_draft.json を読む)。
+  出典の項目が「旗: true」(dead: true 等)を持ち、描画側が旗で項目を落とす条件(showDead || !s.dead)を持つときは、
+  その条件の state を変えるイベント(空欄項目の表示切替)も呼出元に入れる(round14 R3。dead の項目の計算は条件が真のときだけ走る)。
 WHY: 候補が無くても、定数や補助関数の参照で BE を絞れる。候補と行が重ならない共通ロジックで「全部足す」に
 倒れると、別の BE まで呼出元に入る(run10 の CL4・CL5 は BE1 が誤って入っていた)。
 WHY: サーバー・DB で動くロジックは、呼ぶ FR が呼ぶ BE の中で動くため、呼出元の鎖として BE も示す。
@@ -305,7 +307,13 @@ def _name_of_api(tok, idx):
 # derived_arrays・csv_exports・state_initials)と TSX の行だけで、画面名・関数名は決め打ちしない。
 _FRONT_EXT = (".tsx", ".jsx", ".ts", ".js")
 _RE_TOP_FUNC = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)")
-_RE_TOP_CONST = re.compile(r"^(?:export\s+)?const\s+(\w+)\s*=")
+# WHY(round14 R3): `const RIGHT: Spec[] = [` のように型注釈が付く直下の定数も宣言として拾う。拾えないと、CL の出典が
+# 型注釈つきの配列の中の1行(PosReport.tsx の LEFT / RIGHT の spec)のとき、囲む宣言の名前が引けず、使用箇所の鎖が
+# 1歩も進まなかった(run13 の CL1〜CL4 は _front_callers が空を返し、呼出元が S1 の語だけになっていた)。
+# 型注釈は「:」から最初の「=」まで(型の中に「=」が入る関数型は直下の定数では稀なので扱わない)。
+_RE_TOP_CONST = re.compile(r"^(?:export\s+)?const\s+(\w+)\s*(?::[^=]*)?=")
+_RE_JS_IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_RE_TRUE_FLAG = re.compile(r"(?<![A-Za-z0-9_$])(\w+)\s*:\s*true\b")
 _RE_MEMO_DECL = re.compile(r"^\s*(?:const|let)\s+(\w+)\s*=\s*use(?:Memo|Callback)\(")
 _RE_MEMO_DEPS = re.compile(r"\[([^\[\]]*)\]\s*\)\s*;?\s*$")
 
@@ -343,11 +351,51 @@ def _memo_regions(lines):
     return out
 
 
+def _spec_flags(lines, ls, le):
+    """CL の出典の行(1始まり ls〜le)にある「<名前>: true」の旗の名前を返す(例: dead: true)。
+    出典が1項目(オブジェクトの { ...)の先頭の行だけで、閉じる } が次の行以降にあるときは、波括弧が釣り合うまで
+    10行を上限に読み足す。"""
+    end = min(max(le, ls), len(lines))
+    text = "\n".join(lines[max(ls, 1) - 1: end])
+    while text.count("{") > text.count("}") and end < min(len(lines), max(ls, 1) + 10):
+        end += 1
+        text += "\n" + lines[end - 1]
+    return _RE_TRUE_FLAG.findall(text)
+
+
+def _gate_names(lines, flags, chain_lines, blocks):
+    """旗で項目を落とす絞り込み(`!<変数>.<旗>` を含む行。例: .filter((s) => showDead || !s.dead))があれば、
+    その行に現れる識別子(絞り込みの変数と旗の名前を除く)と、その識別子を JSX の属性 `名前={式}` で渡している式の識別子を返す。
+    絞り込みの行は、CL の使用箇所(chain_lines)を含む直下の宣言(コンポーネント)の中にあるものだけ採る。
+    WHY: 項目の絞り込みが別の宣言にあるなら、その CL の項目が絞り込まれる描画とは関係が無い。"""
+    out = []
+    for flag in flags:
+        pat = re.compile(r"!\s*(\w+)\s*\.\s*" + re.escape(flag) + r"(?![A-Za-z0-9_$])")
+        for n, ln in enumerate(lines, 1):
+            m = pat.search(ln)
+            if not m:
+                continue
+            blk = [b for b in blocks if b["start"] <= n <= b["end"] and b["name"]]
+            if not blk or not any(blk[0]["start"] <= c <= blk[0]["end"] for c in chain_lines):
+                continue
+            for t in _RE_JS_IDENT.findall(ln):
+                if t in (m.group(1), flag) or t in out:
+                    continue
+                out.append(t)
+                # 属性で渡される名前(コンポーネントの props)なら、渡している式の側の識別子も足す
+                for ln2 in lines:
+                    for am in re.finditer(r"(?<![A-Za-z0-9_$])" + re.escape(t) + r"\s*=\s*\{([^{}]*)\}", ln2):
+                        out.extend(x for x in _RE_JS_IDENT.findall(am.group(1)) if x not in out)
+    return out
+
+
 def _front_callers(cl, data, react_draft, idx, cache=None):
     """ブラウザで動く CL の呼出元の FR の ID を返す(新しく足せるものだけでなく、辿れた全部。重複の除去は呼出側)。
     1. CL の src の行にあるモジュール直下の宣言(function / const)と useMemo の変数を defs にする
     2. 同じファイルで defs を参照する行を探し、useMemo の中なら変数を defs に足し(推移)、依存を state に引き直す
     3. 参照の行がイベントの範囲(events[].src・csv_exports[].src)に入れば、そのイベントを呼出元にする
+    3b. 出典の項目が「旗: true」(dead: true 等)を持ち、描画側が `showDead || !s.dead` で旗の項目を落とすなら、
+        表示の条件の state(props で渡されるなら渡す元の state)も依存の state にする(round14 R3)
     4. 依存の state を変えるイベント(failure_effects の on_success・ハンドラの set<State>( )も呼出元にする
     5. event_code → idx の ev_to_name → fr_by_name で FR の ID に写す
     react 下書きが無い・src に画面のファイルが無いときは空。"""
@@ -419,6 +467,7 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                     for code in ce.get("trigger_events") or []:  # fallback-ok: 起点のイベントが無ければ足さない
                         ev_ranges.append((r.get("line_start", 0), r.get("line_end", 0), code))  # fallback-ok: 同上
         done, todo = set(), list(defs)
+        chain_lines = []  # 鎖の中の名前を参照している行(1始まり)。下の「表示の条件」の判定で、描画する宣言を特定する
         while todo:
             name = todo.pop()
             if name in done:
@@ -432,6 +481,7 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
             for n, ln in enumerate(lines, 1):
                 if not _word_in(name, ln) or any(a <= n <= b for a, b in own):
                     continue
+                chain_lines.append(n)
                 for a, b, code in ev_ranges:
                     if a <= n <= b:
                         add_ev(code)
@@ -446,6 +496,12 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                     if blk and blk[0]["name"] not in done:
                         # 別の直下の関数・定数の中で使われる(補助関数の連鎖)。コンポーネントなら参照先が無く止まる
                         todo.append(blk[0]["name"])
+        # WHY(round14 R3): 出典の項目が「旗: true」(例: dead: true)を持ち、描画側が `showDead || !s.dead` のように旗で項目を
+        # 落としているなら、その項目の計算(calc)は表示の条件の state が真のときだけ描かれる(走る)。条件の state は
+        # 依存の state に入れ、下の 4. でその state を変えるイベント(例: 「空欄項目も表示」のチェック)を呼出元にする。
+        # 旗が無い項目(常に描かれる)には何も足さない。CL1〜CL3(dead でない項目)の呼出元は変わらない。
+        for g in _gate_names(lines, _spec_flags(lines, ls, le), chain_lines, blocks):
+            resolve_state(g, memos, set())
     # 4. 依存の state を変えるイベント
     for fe in react_draft.get("failure_effects") or []:  # fallback-ok: 欄が無ければ足さない
         if any(st in (fe.get("on_success") or []) for st in dep_states):
@@ -676,6 +732,66 @@ def _selftest_front():
         fill(data2, pn, [], {}, None)
         assert data2["common_logic"][0]["used_by_processes_ids"] == [], data2["common_logic"][0]
     print("[selftest OK] fill_common_logic_callers front")
+    _selftest_front_gate()
+
+
+def _selftest_front_gate():
+    """round14 R3: 型注釈つきの配列の中の項目(dead: true)の calc は、旗で項目を落とす表示の条件の state を変えるイベントも呼出元にする。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "Page.tsx"
+        tsx.write_text("\n".join([
+            "const SPECS: Spec[] = [",                                              # 1
+            '  { label: "a", kin: "a" },',                                          # 2
+            '  { label: "b", calc: (r) => r.x - r.y, dead: true,',                  # 3
+            '    note: "n" },',                                                     # 4
+            "];",                                                                   # 5
+            "",                                                                     # 6
+            "function Card({ showDead }: { showDead: boolean }) {",                 # 7
+            "  const rows = SPECS.filter((s) => showDead || !s.dead).map((s) => s.label);",  # 8
+            "  return rows;",                                                       # 9
+            "}",                                                                    # 10
+            "",                                                                     # 11
+            "export default function Page() {",                                     # 12
+            "  const [show, setShow] = useState(false);",                           # 13
+            "  const [other, setOther] = useState(0);",                             # 14
+            "  return <Card showDead={show} />;",                                   # 15
+            "}",                                                                    # 16
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+        rd = {
+            "state_initials": [{"state": "show", "setter": "setShow"}, {"state": "other", "setter": "setOther"}],
+            "events": [
+                {"event_code": "EV10", "source": {"handler": "(e) => setShow(e.target.checked)"}, "src": [{"file": f, "line_start": 30, "line_end": 30}]},
+                {"event_code": "EV11", "source": {"handler": "(e) => setOther(1)"}, "src": [{"file": f, "line_start": 31, "line_end": 31}]},
+            ],
+        }
+        data = {
+            "events": [{"no": c, "event_code": c} for c in ("EV10", "EV11")],
+            "front_processes": [{"process_id": "FR1", "name": "表示切替", "steps": []},
+                                {"process_id": "FR2", "name": "別の入力", "steps": []}],
+            "backend_processes": [],
+            "common_logic": [
+                # 項目の1行目だけが出典(閉じる } は次の行): 旗 dead: true を読み取れる
+                {"name": "DEAD", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 3, "line_end": 3}]},
+                # 旗の無い項目: 常に描かれるので、表示の条件のイベントは入らない
+                {"name": "PLAIN", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 2, "line_end": 2}]},
+            ],
+        }
+        pn = {"EV10": "表示切替", "EV11": "別の入力"}
+        fill(data, pn, [], {}, rd)
+        cl = {c["name"]: c for c in data["common_logic"]}
+        assert cl["DEAD"]["used_by_processes_ids"] == ["FR1"], cl["DEAD"]
+        assert cl["PLAIN"]["used_by_processes_ids"] == [], cl["PLAIN"]
+        # 旗で絞り込む行が、CL の項目を描く宣言の外(SPECS を使わない Card)にあるなら、条件の state は拾わない
+        tsx.write_text(tsx.read_text(encoding="utf-8").replace("SPECS.filter(", "OTHERS.filter(").replace(
+            "  return rows;\n}\n", "  return rows;\n}\n\nfunction Other() {\n  return SPECS.map((s) => s.label);\n}\n"), encoding="utf-8")
+        data3 = json.loads(json.dumps(data))
+        for c in data3["common_logic"]:
+            c["used_by_processes_ids"] = []
+        fill(data3, pn, [], {}, rd)
+        assert {c["name"]: c["used_by_processes_ids"] for c in data3["common_logic"]}["DEAD"] == [], data3["common_logic"]
+    print("[selftest OK] fill_common_logic_callers front gate")
 
 
 def main():
