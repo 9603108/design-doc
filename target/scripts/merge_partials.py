@@ -15,11 +15,16 @@
 #           通常の実行が event_processes[].details へ写す。断片が無い画面（HTML を1体で作る従来の流れ）は何も変わらない
 
 import json
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_elements, literal_text_elements, visible_initially
+# WHY: JSX の {式} の値を、初期処理の評価器で決める（式の評価を二重に持たない）
+from _initial_eval import _value
+# WHY: 画面項目の src（TSX の行範囲）から、表示条件・活性・文言を位置で結ぶ（round10 T15）
+from _jsx_chain import chain_for_lines, text_of_lines
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -166,19 +171,127 @@ def _visibility(elements: list, env: dict) -> tuple:
             visible.pop() if len(visible) == 1 else "条件付き(式)")
 
 
-def _initial_value(item: dict, states: dict, options: dict, elements: list = None, env: dict = None) -> str:
-    """画面項目1件の初期値。結ぶ state があればその初期値（事実）。無ければ、同じ名前の表示専用の固定文のうち
-    表示条件が真のものの文言（画面に書かれた文言そのもの）。どちらも無ければ合成欄の既存値、それも無ければ Blank。
+def _tsx_src(sl_item: dict):
+    """画面項目の src のうち、読める TSX/JSX の1件（file・line_start・line_end）。無ければ None。
+    WHY: 項目の JSX の位置から表示条件を辿るため。src が無い・TSX でない・ファイルが無い項目は名前での結びに戻す。"""
+    srcs = sl_item.get("src") or []
+    if isinstance(srcs, dict):
+        srcs = [srcs]
+    for s in srcs:
+        if not isinstance(s, dict) or not s.get("line_start"):
+            continue
+        f = str(s.get("file") or "")
+        if f.endswith((".tsx", ".jsx")) and Path(f).is_file():
+            return s
+    return None
+
+
+def _text_value(expr: str, env: dict):
+    """JSX の {式} の値を文字列にする。評価できない式・配列・真偽は None（{式} のまま残す）。"""
+    v = _value(expr, env)
+    if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+        return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v)
+
+
+_BR = re.compile(r"<br\s*/?>")
+_TAG = re.compile(r"</?[A-Za-z][^<>]*>")
+
+
+def _brace_text(expr: str, env: dict) -> str:
+    """文言の中の {式} を値に直す。評価できなければ {式} のまま残す（推測しない）。"""
+    v = _text_value(expr, env)
+    if v is None:
+        return "{" + expr + "}"
+    return v
+
+
+def _range_text(file: str, start: int, end: int, env: dict) -> str:
+    """範囲の文言を、タグを外して取る。範囲が要素の途中の文言だけ（囲む要素の開始タグが範囲に無い）のときに使う。
+    WHY: 長い注記は行の途中から始まる。text_of_lines は範囲の最初の要素のタグから読むため、この形では文言を取れない。"""
+    lines = Path(file).read_text(encoding="utf-8").split("\n")[start - 1:end]
+    s = _BR.sub(" ", " ".join(lines))
+    s = re.sub(r"\{([^{}]*)\}", lambda mm: _brace_text(mm.group(1), env), s)
+    return re.sub(r"\s+", " ", _TAG.sub("", s)).strip()
+
+
+def _enclosing_open_line(file: str, start: int):
+    """範囲の前にある最後の開始タグ（行頭が <Name の行）の行番号。属性の行が囲まれる要素を探すために使う。無ければ None。"""
+    lines = Path(file).read_text(encoding="utf-8").split("\n")
+    for n in range(start - 1, 0, -1):
+        if re.match(r"\s*<[A-Za-z]", lines[n - 1]):
+            return n
+    return None
+
+
+def _is_array_use(r: dict) -> bool:
+    """鎖が配列の使用箇所から来ているか（その行は配列の要素で、画面の文言ではない）。"""
+    chain = r["visible_chain"]
+    return bool(chain) and chain[0].get("kind") == "array_use"
+
+
+def _src_fact(sl_item: dict, env: dict, elements: list):
+    """src の JSX から、活性・表示・文言を事実で決める。TSX の src が使えないときは None（名前での結びに戻す）。
+    WHY: 名前で結ぶと要素が見つからない項目が半数を超えた（round10 の 6）。位置で結べば、部品の呼出元・配列の使用箇所も辿れる。"""
+    s = _tsx_src(sl_item)
+    if s is None:
+        return None
+    # fallback-ok: 終了行が無い src は開始行だけの1行とみなす（行範囲は src が常に持つ想定）
+    start, end = int(s["line_start"]), int(s.get("line_end") or s["line_start"])
+    file = str(s["file"])
+    r = chain_for_lines(file, start, end)
+    attr = False
+    if not r["found"]:
+        # WHY: 属性の行（Card の subtitle など）は文言ではなく、囲む要素の開始タグの条件で表示が決まる
+        n = _enclosing_open_line(file, start)
+        if n is None:
+            return None
+        r = chain_for_lines(file, n, n)
+        if not r["found"]:
+            return None
+        attr = True
+    kind = str(sl_item.get("item_type") or "")
+    text = None
+    if not attr and kind in ("Button", "Link"):
+        # WHY: ボタンの名前は画面に出る文言（JSX の label）。label が無いときは範囲の文言で取る
+        text = next((str(el["label"]) for el in elements if el.get("label")), None)
+    if not attr and kind in ("Label", "Button", "Link") and not text:
+        text = (text_of_lines(file, start, end, lambda e: _text_value(e, env)) or "").strip()
+        # fallback-ok: 範囲の最初のタグが文言でないとき（<br /> から始まる等）は、タグを外して範囲の文言を取る
+        if not text and not _is_array_use(r):
+            text = _range_text(file, start, end, env)
+    return {
+        "active": {True: "非活性", False: "活性", None: "条件付き(式)"}[disabled_value(r["disabled_chain"], env)],
+        "visible": chain_value(r["visible_chain"], env),
+        # fallback-ok: 文言が空なら None（初期値として出さない）
+        "text": text or None,
+    }
+
+
+def _initial_value(item: dict, states: dict, options: dict, elements: list = None, env: dict = None, fact: dict = None) -> str:
+    """画面項目1件の初期値。結ぶ state があればその初期値（事実）。無ければ、表示が真の文言（src の JSX か、名前で結んだ固定文・ボタンの label）。
+    どちらも無ければ合成欄の既存値、それも無ければ Blank。
     意味合い: 初期値が無い項目だけ Blank にする。全項目を Blank に固定すると、下書きの事実を捨ててしまう。
-    WHY: 固定文は表示されている文言がそのまま初期の表示なので、Blank にすると事実を落とす。表示条件が偽・評価不能なら出さない。"""
+    WHY: 表示されている文言がそのまま初期の表示なので、Blank にすると事実を落とす。表示条件が偽・評価不能なら出さない。"""
     name = str(item.get("item_name") or "").strip()
     si = states.get(name)
     if si:
         return _initial_text_from_state(si, options.get(name, {}))
-    for el in elements or []:
-        if el.get("text") and not el.get("label") and visible_initially(el, env or {}) is True:
-            return str(el["text"])
-    # fallback-ok: 結ぶ state も表示される固定文も無い項目は、合成欄の既存値、無ければ Blank（事実が無いので決めない）
+    if fact is not None:
+        # WHY: src で結べた項目は、src の JSX の文言だけを見る（名前の結びと混ぜると、表示と文言が食い違うため）
+        if fact["visible"] is True and fact["text"]:
+            return fact["text"]
+    else:
+        for el in elements or []:
+            if visible_initially(el, env or {}) is not True:
+                continue
+            if el.get("text") and not el.get("label"):
+                return str(el["text"])
+            if el.get("label") and item.get("item_type") in ("Button", "Link"):
+                return str(el["label"])
+    # fallback-ok: 結ぶ state も表示される文言も無い項目は、合成欄の既存値、無ければ Blank（事実が無いので決めない）
     return item.get("initial_value") or "Blank"
 
 
@@ -237,14 +350,19 @@ def build_initialization(events: list, screen_layout: dict, db_operations: list 
         name = str(sl_item.get("item_name") or "").strip()
         # WHY: 名前で結ぶ要素が無い Label（設計上の名前「画面見出し」と JSX の文言「POS会計レポート」が違う）は、画面に書かれた文言（example）で固定文に結ぶ
         els = elements.get(name) or linked_fixed_elements([name, str(sl_item.get("example") or "")], literal)
-        active, visible = _visibility(els, env)
+        # WHY: src の TSX で位置から結べた項目は、名前での結びより先に使う（round10 の 6）。結べない項目だけ名前で決める
+        fact = _src_fact(sl_item, env, els)
+        if fact is not None:
+            active, visible = fact["active"], _VIS_LABEL[fact["visible"]]
+        else:
+            active, visible = _visibility(els, env)
         items.append({
             "no": len(items) + 1,
             "screen_no": sl_item.get("screen_no", ""),
             "item_name": sl_item.get("item_name", ""),
             "active": active,
             "visible": visible,
-            "initial_value": _initial_value(sl_item, states, options, els, env),  # 事実（下書き）が無い項目だけ Blank
+            "initial_value": _initial_value(sl_item, states, options, els, env, fact),  # 事実（下書き）が無い項目だけ Blank
         })
 
     return {
@@ -419,7 +537,7 @@ def _selftest_initialization() -> int:
         "読込中…": ("活性", "非表示", "Blank"),
         "注記文": ("活性", "表示", "注記文"),
         "式の注記": ("活性", "条件付き(式)", "Blank"),
-        "CSV出力": ("非活性", "表示", "Blank"),
+        "CSV出力": ("非活性", "表示", "CSV出力"),  # ボタンの初期値は画面の文言（label）
         "未設定の項目": ("活性", "表示", "Blank"),
         "手書きの項目": ("活性", "表示", "手書き"),
         "画面見出し": ("活性", "表示", "業務見出し"),  # 名前は違うが example の文言で h1 に結ぶ（初期表示で見える）
@@ -477,7 +595,7 @@ def _selftest_initialization() -> int:
                                                  {"item_name": "CSV出力", "item_type": "Button"}]}, [], real)
     rv = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in rb["items"]}
     if rv != {"店舗": ("活性", "表示", "- 全店 -"), "集計単位": ("活性", "表示", "レジ別（現行と同じ）"),
-              "合計": ("活性", "非表示", "Blank"), "CSV出力": ("非活性", "表示", "Blank")}:
+              "合計": ("活性", "非表示", "Blank"), "CSV出力": ("非活性", "表示", "CSV出力")}:
         print(f"[selftest NG] 実ソースの初期処理の表 {rv}")
         return 1
 
@@ -487,6 +605,64 @@ def _selftest_initialization() -> int:
     if bv["集計単位"] != ("活性", "表示", "Blank") or bv["CSV出力"] != ("活性", "表示", "Blank") or bare["db_operations_ref"] != []:
         print("[selftest NG] 下書き無しの初期処理")
         return 1
+    # src（TSX の行範囲）で位置から結ぶ項目。部品の呼出元（hidden）・配列の使用箇所・括弧なしの直接形・{式} の文言・ボタンの label を、実ファイルで確かめる。
+    # WHY: 名前で結ぶ方式は要素の見つからない項目が多かった。位置で結んだ結果を、名前の結びと同じ表の形で確かめる
+    import tempfile
+    src_tsx = (
+        "const LEFT = [\n"
+        "  { label: \"店舗数\" },\n"
+        "];\n"
+        "function Card({ items }) {\n"
+        "  return (\n"
+        "    <section>\n"
+        "      <p>件数</p>\n"
+        "    </section>\n"
+        "  );\n"
+        "}\n"
+        "export default function S() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      {rows.length > 1 && <Card items={rows} />}\n"
+        "      <span>店舗 {shops.length}店</span>\n"
+        "      {loading && <span>読込中…</span>}\n"
+        "      <button disabled={!rows.length}>CSV出力</button>\n"
+        "      <table>{rows.length > 1 && LEFT.map((r) => <tr key={r.label} />)}</table>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    src_drafts = [{"state_initials": [
+        {"state": "rows", "kind": "literal", "initial": "[]", "bound": []},
+        {"state": "shops", "kind": "literal", "initial": "[]", "bound": []},
+        {"state": "loading", "kind": "literal", "initial": "false", "bound": []},
+    ], "jsx_elements": [], "derived_arrays": []}]
+    with tempfile.TemporaryDirectory() as td:
+        tsx_path = str(Path(td) / "S.tsx")
+        Path(tsx_path).write_text(src_tsx, encoding="utf-8")
+
+        def at(needle: str) -> dict:
+            n = next(i for i, ln in enumerate(src_tsx.split("\n"), 1) if needle in ln)
+            return {"file": tsx_path, "line_start": n, "line_end": n}
+
+        src_screen = {"items": [
+            {"item_name": "件数", "item_type": "Label", "src": [at("<p>件数")]},
+            {"item_name": "店舗数表示", "item_type": "Label", "src": [at("<span>店舗 {shops")]},
+            {"item_name": "読込中表示", "item_type": "Label", "src": [at("{loading && <span>")]},
+            {"item_name": "CSV出力", "item_type": "Button", "src": [at("<button disabled")]},
+            {"item_name": "店舗数", "item_type": "Label", "src": [at('{ label: "店舗数" }')]},
+        ]}
+        got_src = build_initialization(events, src_screen, [], src_drafts)
+        sv = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in got_src["items"]}
+        want_src = {
+            "件数": ("活性", "非表示", "Blank"),          # Card の呼出元が rows.length > 1 の中（rows は空）
+            "店舗数表示": ("活性", "表示", "店舗 0店"),    # {shops.length} を初期値の shops（空の配列）で評価
+            "読込中表示": ("活性", "非表示", "Blank"),    # {loading && …} は初期が偽
+            "CSV出力": ("非活性", "表示", "CSV出力"),     # disabled={!rows.length} は非活性。ボタンの文言
+            "店舗数": ("活性", "非表示", "Blank"),        # 配列の行は使用箇所（rows.length > 1 の中）で決まる
+        }
+        if sv != want_src:
+            print(f"[selftest NG] src で結ぶ初期処理の表 {sv}")
+            return 1
     print("[selftest OK] merge_partials.initialization")
     return 0
 
