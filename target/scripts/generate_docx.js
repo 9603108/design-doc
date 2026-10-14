@@ -1252,7 +1252,10 @@ function sectionDocInfo(meta) {
   const frontendFiles = meta.frontend_files || [];
   if (frontendFiles.length > 0) {
     blocks.push(h3('1.1 フロントエンド構成ファイル'));
-    blocks.push(p('当画面を構成するフロントエンドファイル（HTML本体・CSS・JavaScript・外部CDN）の一覧です。HTML 内の <link rel="stylesheet"> および <script src="..."> から自動抽出されています。'));
+    // WHY: HTML からの抽出の文は source_html がある画面だけに出す(TSX 等の画面に HTML の文を出さない)
+    blocks.push(p(meta.source_html
+      ? '当画面を構成するフロントエンドファイル（HTML本体・CSS・JavaScript・外部CDN）の一覧です。HTML 内の <link rel="stylesheet"> および <script src="..."> から自動抽出されています。'
+      : '当画面を構成するフロントエンドファイルの一覧です。'));
     const frontRows = frontendFiles.map(f => [
       f.kind || '',
       f.path || '',
@@ -2019,8 +2022,10 @@ function groupByAreaOrdered(processes, areaOrder) {
  * 過去経緯: v18 まで H4 で各 F00X を直列に並べていたが「area 単位でまとめてほしい」というレビュー指摘で v19 で階層化
  */
 function sectionFrontProcesses(frontProcesses, opts = {}) {
-  const { prefix = '5.1' } = opts;
+  const { prefix = '5.1', init = null, areas = [] } = opts;
   if (!frontProcesses || frontProcesses.length === 0) return [];
+  // WHY: 初期表示後の画面項目表は、画面表示時の FR の直後に1度だけ出す(節の末尾へのフォールバックあり)
+  let initTableDone = false;
   const blocks = [
     h3(`${prefix} フロント処理`),
     // v50.5: 旧形式 F001〜 / B00X ハードコードを排除、id_scheme.json prefix 経由で動的化。
@@ -2192,9 +2197,48 @@ function sectionFrontProcesses(frontProcesses, opts = {}) {
       if (fp.calculation_refs && fp.calculation_refs.length > 0) refs.push(`計算式: ${fp.calculation_refs.join(', ')}${sec5Ref('calculation')}`);
       if (fp.common_logic_refs && fp.common_logic_refs.length > 0) refs.push(`共通ロジック: ${fp.common_logic_refs.join(', ')}${sec5Ref('common_logic')}`);
       if (refs.length > 0) blocks.push(p(`呼出先カタログ: ${refs.join(' / ')}`));
+      // 画面表示時に呼ばれる FR（初期処理）の直後に、初期表示後の画面項目表を出す
+      const isScreenShowFR = (fp.called_by_triggers || []).some(cb => cb.group_category === '画面表示時'); // fallback-ok: 呼出元が無い FR は画面表示時ではない
+      if (!initTableDone && isScreenShowFR && init && init.items && init.items.length > 0) {
+        blocks.push(...buildInitItemsBlocks(init, areas));
+        initTableDone = true;
+      }
     }
   }
+  // 画面表示時の FR が無いときは、節の末尾に出す(初期処理の画面項目を落とさない)
+  if (!initTableDone && init && init.items && init.items.length > 0) {
+    blocks.push(...buildInitItemsBlocks(init, areas));
+  }
   return blocks;
+}
+
+/**
+ * 初期表示後の画面項目表（§5.1 の初期処理の直後に出す）
+ *
+ * 目的: 初期処理の結果（活性・表示・初期値）を docx で読めるようにする。sectionProcessDetails の初期処理表と同じ列構成。
+ * 接続情報: 入力 = data.initialization.items / data.screen_layout.areas
+ *           呼出元 = sectionFrontProcesses（画面表示時の FR の直後。無ければ節の末尾）
+ */
+function buildInitItemsBlocks(init, areas) {
+  const rows = init.items.map(it => [
+    String(it.no || ''), // fallback-ok: No が無い項目は空欄で描く
+    formatAreaNo(it.screen_no, areas),
+    it.item_name || '', // fallback-ok: 項目名が無い項目は空欄で描く
+    it.active || '', // fallback-ok: 活性が無い項目は空欄で描く
+    it.visible || '', // fallback-ok: 表示が無い項目は空欄で描く
+    it.initial_value || '' // fallback-ok: 初期値が無い項目は空欄で描く
+  ]);
+  return [
+    new Paragraph({
+      children: [new TextRun({ text: '▸ 初期表示後の画面項目', font: FONT_BODY, size: SIZE_BODY, bold: true })],
+      spacing: { before: 80, after: 40 }
+    }),
+    buildTable(
+      [getIdHeaderLabel('item', 'self'), getIdHeaderLabel('area', 'ref'), '項目名', '活性', '表示', '初期値'],
+      rows,
+      [1, 1, 5, 1, 1, 3]
+    )
+  ];
 }
 
 /**
@@ -2634,7 +2678,11 @@ function sectionProcesses(data, maps) {
     h2('5. 処理詳細')
   ];
   // §6.1 フロント処理
-  blocks.push(...sectionFrontProcesses(data.front_processes, { prefix: '5.1' }));
+  blocks.push(...sectionFrontProcesses(data.front_processes, {
+    prefix: '5.1',
+    init: data.initialization || null,
+    areas: (data.screen_layout && data.screen_layout.areas) || []
+  }));
   // §6.2 バックエンド処理
   blocks.push(...sectionBackendProcesses(data.backend_processes, maps, { prefix: '5.2' }));
   // §5.3 以降のカタログ章(VL/CA/CL/DB/LG)。採番は sectionProcesses 冒頭で SEC5 に入れたもの(出す章だけで連番)
@@ -3041,12 +3089,35 @@ function sectionValidations(validations, opts = {}) {
 }
 
 /**
+ * メッセージID → エラー code の対応（§6 メッセージ一覧の「エラー code」列）
+ *
+ * 目的: API が返すエラー code（api_spec[].error_patterns[].error_code）を、message_id で messages[] の行に結ぶ。
+ * 意味合い: 結べないメッセージは空欄で出す（推測で埋めない）。同じ message_id に複数の code があれば改行で並べる。
+ * 接続情報: 入力 = data.api_spec / 出力 = { [message_id]: "code" } / 呼出元 = main（sectionMessages の opts 経由）
+ */
+function buildErrorCodeByMessageId(data) {
+  const codesById = {};
+  for (const api of data.api_spec || []) { // fallback-ok: api_spec が無い中間データは対応が空になるだけ
+    for (const e of api.error_patterns || []) { // fallback-ok: error_patterns が無い API は結ぶものが無い
+      const mid = e.message_id ? String(e.message_id) : ''; // fallback-ok: message_id が無い行は結ばない
+      const code = e.error_code ? String(e.error_code) : ''; // fallback-ok: error_code が無い行は結ばない
+      if (!mid || !code) continue;
+      const list = codesById[mid] || (codesById[mid] = []);
+      if (!list.includes(code)) list.push(code);
+    }
+  }
+  const out = {};
+  for (const mid of Object.keys(codesById)) out[mid] = codesById[mid].join('\n');
+  return out;
+}
+
+/**
  * メッセージ一覧
  *
  * v17: §6 統合後の章番号は §7。prefix / level を引数化。
  */
 function sectionMessages(messages, opts = {}) {
-  // 目的: §7 でシステムが発する全メッセージ一覧を「No / コード / 種別 / 本文 / 発行 API」の 5 列で出力。
+  // 目的: §7 でシステムが発する全メッセージ一覧を「No / メッセージID / エラー code / 種別 / 本文 / 発行 API」の 6 列で出力。
   // 意味合い: 業務担当者が画面で見るメッセージの「正規ID（新体系 MS#）」「業務コード（MSI/MSE 系）」「重大度（info/error）」「文言」「どの API が発するか」を一望できる形。
   //           v50.5 で中間 JSON の実キー (message_id=新体系 MS#, code=旧システム由来コード, message=本文, severity=重大度, emitted_by_api=発行 API 配列) と整合。
   //           旧体系の m.id は存在せず、§7 が「ID 列空白 + 本文列空白」状態だった（再発防止: A5 修正）。
@@ -3056,9 +3127,12 @@ function sectionMessages(messages, opts = {}) {
   const { prefix = '9', level = 'h2' } = opts;
   if (!messages || messages.length === 0) return [];
   // v50.5: 新体系 message_id (MS#) を主 ID として表示。code (MSI/MSE 由来) は業務追跡用に併記。
+  // WHY: エラー code は api_spec の error_code を message_id で結んだもの。結べないメッセージは空欄(推測で埋めない)
+  const errorCodes = opts.errorCodeByMessageId || {}; // fallback-ok: 呼出元が渡さなければ全行を空欄で出す
   const rows = messages.map(m => [
     String(m.message_id || ''),
-    m.code || '',
+    m.code || '', // fallback-ok: messages[].code が無い行は空欄(値は変えない)
+    errorCodes[String(m.message_id || '')] || '', // fallback-ok: 結べないメッセージは空欄
     m.severity || '',
     m.message || '',
     (m.emitted_by_api || []).join('\n')
@@ -3068,13 +3142,13 @@ function sectionMessages(messages, opts = {}) {
     heading,
     // B2（2026-07-19）: 主要一覧表への表番号キャプション試験導入（画面項目一覧・トリガー一覧と同方針）
     buildTableCaption(prefix, 'メッセージ一覧').paragraph,
-    // v50.5: 5 列構成。新体系 message_id は message カテゴリの header_self、コード列は「コード」（旧システム由来のコード）
+    // v50.5: 6 列構成。新体系 message_id は message カテゴリの header_self、「メッセージID」列は messages[].code、「エラー code」列は api_spec の error_code を message_id で結んだもの（結べなければ空）
     // A4（2026-07-18）: 種別列（rows[i][2]）の値で行全体を淡色に。error=赤系/warning=黄系/info=白のまま。
     buildTable(
-      [getIdHeaderLabel('message', 'self'), 'コード', '種別', '本文', '発行 API'],
+      [getIdHeaderLabel('message', 'self'), 'メッセージID', 'エラー code', '種別', '本文', '発行 API'],
       rows,
-      [2, 3, 2, 7, 4],
-      { rowFill: (row) => (row[2] === 'error' ? FILL_ERROR : row[2] === 'warning' ? FILL_WARNING : undefined) }
+      [2, 3, 3, 2, 7, 4],
+      { rowFill: (row) => (row[3] === 'error' ? FILL_ERROR : row[3] === 'warning' ? FILL_WARNING : undefined) }
     )
   ];
 }
@@ -4247,7 +4321,7 @@ function main() {
   // sectionProcesses 内部で §5.1 FR / §5.2 BE / §5.3 VL / §5.4 CA / §5.5 CL / §5.6 DB / §5.7 LG
   children.push(...sectionProcesses(data, maps));
   // v51: メッセージは §6 独立章（旧 §7）
-  children.push(...sectionMessages(data.messages, { prefix: '6' }));
+  children.push(...sectionMessages(data.messages, { prefix: '6', errorCodeByMessageId: buildErrorCodeByMessageId(data) }));
   // A2（2026-07-18）: 巻末 ID 索引。目次(TOC)が個別処理(h4/h5)を拾わない代わりに、
   // 全 ID をクリック1回で該当箇所へジャンプできる逆引き表として提供する。
   children.push(...sectionIdIndex(data));
