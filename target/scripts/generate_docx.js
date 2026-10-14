@@ -2413,12 +2413,15 @@ function sectionBackendProcesses(backendProcesses, maps, opts = {}) {
         e.condition || '',
         // fallback-ok: 旧い中間データは status_code を http_status という名前で持つ。どちらも無ければ空欄
         String(e.status_code ?? e.http_status ?? ''),
-        e.message_id || ''
+        e.message_id || '', // fallback-ok: message_id が無い行は空欄で描く
+        // WHY: error_code は合成が下書き common_errors の code_default から入れる。入らない行は「—」で見せる(推測で埋めない)
+        // fallback-ok: error_code が無い行は「—」で描く
+        e.error_code || '—'
       ]);
       blocks.push(buildTable(
-        ['発生条件', 'ステータス', 'メッセージID'],
+        ['発生条件', 'ステータス', 'メッセージID', 'エラー code'],
         errRows,
-        [7, 2, 3]
+        [6, 2, 3, 3]
       ));
     }
     }  // for items の閉じ
@@ -2463,10 +2466,41 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
     const rows = dbOp.dataset.map(d => [
       String(d.no || ''),
       withPhysical(d.logical_table, 'table', maps),
-      withPhysical(d.logical_column, 'column', maps, d.logical_table)
+      // WHY: 物理列が1つに決まらない式(count(*) 等)は physical_column が空。論理名[式 …] で式を見せる(合成が alias_expression を入れる)
+      // fallback-ok: 式の行だけ論理名の後ろに式を付ける。物理列がある行は従来どおり withPhysical で描く
+      (!d.physical_column && d.alias_expression) ? `${d.logical_column || ''}[式 ${d.alias_expression}]` : withPhysical(d.logical_column, 'column', maps, d.logical_table)
     ]);
     // v48: dbOp.dataset の「No」は db_operation カテゴリの header_self（データセット定義表）
     blocks.push(buildTable([getIdHeaderLabel('db_operation', 'self'), 'テーブル（論理[物理]）', '列（論理[物理]）'], rows, [1, 4, 5]));
+  }
+  // WITH 節(CTE)と副問合せ。WITH は本体の SELECT より前にあるので、データセットの後・結合条件の前に描く
+  // WHY: 中間 JSON の ctes・subqueries(migrate_v17_to_v18 が db_op_detail へ写す下書きの事実)を、docx に出さないと読み手が WITH 節を追えない
+  if (dbOp.ctes && dbOp.ctes.length > 0) {
+    blocks.push(new Paragraph({
+      children: [new TextRun({ text: '  ▸ 共通表式(WITH)', font: FONT_BODY, size: SIZE_BODY, bold: true })],
+      spacing: { before: 40, after: 30 }
+    }));
+    const rows = dbOp.ctes.map(c => [
+      // fallback-ok: 空の欄は空欄で描く(値の欠落を隠すものではない。下書きの事実をそのまま出す)
+      c.name || '',
+      // fallback-ok: 元の表が無い CTE は空欄で描く
+      c.from || '',
+      c.filtered ? 'あり' : 'なし',
+      // fallback-ok: 定義が空の CTE は空欄で描く
+      c.definition || '',
+      // fallback-ok: 条件付きの断片が無い CTE は空欄で描く(無条件の定義だけの行)
+      (c.conditional_parts || []).map(p => (p.when ? `${p.sql}（${p.when}）` : p.sql)).join('; ')
+    ]);
+    blocks.push(buildTable(['名前', '元の表', '絞り込み', '定義', '条件付きの部分'], rows, [2, 3, 2, 6, 4]));
+  }
+  if (dbOp.subqueries && dbOp.subqueries.length > 0) {
+    blocks.push(new Paragraph({
+      children: [new TextRun({ text: '  ▸ 副問合せ', font: FONT_BODY, size: SIZE_BODY, bold: true })],
+      spacing: { before: 40, after: 30 }
+    }));
+    // fallback-ok: 句・定義が空の副問合せは空欄で描く(下書きの事実をそのまま出す)
+    const rows = dbOp.subqueries.map(s => [s.location || '', s.filtered ? 'あり' : 'なし', s.definition || '']);
+    blocks.push(buildTable(['句', '絞り込み', '定義'], rows, [2, 2, 9]));
   }
   // joins
   if (dbOp.joins && dbOp.joins.length > 0) {
@@ -2484,16 +2518,16 @@ function renderDbOperationDetail(blocks, dbOp, maps) {
     const rows = dbOp.where.map(w => [
       w.and_or || '', withPhysical(w.logical_table, 'table', maps),
       withPhysical(w.logical_column, 'column', maps, w.logical_table),
-      w.operator || '', w.value || '', w.param_no || '', w.param_name || '' // fallback-ok: 旧版の中間 JSON には value が無いので空欄で描く
+      w.operator || '', w.value || '', w.param_no || '', w.param_name || '', w.when || '常に' // fallback-ok: 旧版の中間 JSON には value が無いので空欄で描く。when は分岐で変わるときだけ書く任意の欄(無ければ常に適用)
     ]);
     blocks.push(new Paragraph({
       children: [new TextRun({ text: '  ▸ 抽出条件', font: FONT_BODY, size: SIZE_BODY, bold: true })],
       spacing: { before: 40, after: 30 }
     }));
     blocks.push(buildTable(
-      ['AND/OR', 'テーブル', '列', '条件', '値', 'param#', 'パラメータ'],
+      ['AND/OR', 'テーブル', '列', '条件', '値', 'param#', 'パラメータ', '適用'],
       rows,
-      [1, 3, 3, 1, 3, 1, 3]
+      [1, 3, 3, 1, 3, 1, 3, 2]
     ));
   }
   // E3: グルーピング・集計・並び順。where の後・登録値の前。空の表は出さない。
@@ -2824,6 +2858,8 @@ function mapKindToLabel(kind) {
     calculation: '計算',
     transition: '画面遷移',
     event_emit: '通知発信',
+    // B9 が kind に入れる(ダウンロード・CSV・文字コード・見出し行・合計行・区切り等の語を持つ step)
+    file_output: 'ファイル出力',
     error_handling: 'エラー処理',
     logging: '操作ログ',
     logging_call: 'ログ呼出'
