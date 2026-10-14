@@ -571,7 +571,24 @@ def _sq_head(s):
     return re.sub(r"filter\(.*", "", _sq(s))
 
 
-def check_backend_facts(data, apis, common_errors):
+# WHY: 件数の単位を「日数」「N日」と説明しているかは説明文(remarks・description)だけで見る。表示名・見出し・例示値は
+#      ソースの文字列をそのまま写すもの(PosReport.tsx の CSV 見出し「日数」「取込欠損疑い日数」)なので対象外
+_DAY_TEXT = re.compile(r"日数|日の数")
+# WHY: 同じ説明の中に単位の補足(行数・集計単位による)があれば、日数と書いた文は単位の説明として通す
+_UNIT_NOTE = re.compile(r"行数|集計単位による")
+
+
+def _day_unit_claim(text, strings=None, pat=None):
+    """説明文 text が、件数の単位を日数として説明しているか(指摘の対象か)。
+    ソースの文字列と字面が一致する文言は対象外。単位の補足(行数・集計単位による)があれば対象外。
+    呼出元: check_backend_facts (3)・check_item_remarks_units(remarks)。"""
+    t = norm(str(text or ""))
+    if not t or not (pat or _HAS_DAYS).search(t) or _UNIT_NOTE.search(t):
+        return False
+    return not (strings and t in strings)
+
+
+def check_backend_facts(data, apis, common_errors, strings=None):
     """設計書(data)を backend 下書きの事実(apis[action].db_operations の columns・ctes・subqueries・aggregate_units と common_errors)と突き合わせる(ERROR)。
     [別名]: 物理列として書いた名前が SQL の別名(実列に無い) / 集計の別名が null なのにソースは AS を持つ。差し戻し先 H2
     [式]: api_spec の response_items[].expression が実 SQL の式と食い違う(SQL の関数の形を持つ式だけ比べる。日本語の説明は言い換えを許すので見ない)。差し戻し先 S2
@@ -660,8 +677,7 @@ def check_backend_facts(data, apis, common_errors):
             leaf = str(r.get("key")).rsplit(".", 1)[-1]
             for d in ops.get(a.get("action")) or []:
                 for u in d.get("aggregate_units") or []:
-                    text = " ".join(str(r.get(k) or "") for k in ("display_name", "description", "transform_backend"))
-                    if u.get("alias") == leaf and str(u.get("func")).lower() == "count" and u.get("scope") == "main" and re.search(r"日数|日の数", text) and (a.get("action"), r["key"]) not in unit_seen:
+                    if u.get("alias") == leaf and str(u.get("func")).lower() == "count" and u.get("scope") == "main" and _day_unit_claim(r.get("description"), strings, _DAY_TEXT) and (a.get("action"), r["key"]) not in unit_seen:
                         # 行数が日数になるのは、数える単位が日付の列だけのとき。日付が無い・日付以外(店舗・レジなど)も含むときは WARN(両方向を捕まえる)
                         gb = u.get("group_by") or []
                         dates = [g for g in gb if re.search(r"date|_dt|day|日", g, re.IGNORECASE)]
@@ -816,7 +832,7 @@ def _strings_in(node):
             yield from _strings_in(v)
 
 
-def check_item_remarks_units(data, apis, react=None):
+def check_item_remarks_units(data, apis, react=None, strings=None):
     """画面項目が結ぶ応答項目の件数(count)の単位に日付以外の列があるのに、項目の説明に「日数」「N日」と書いたものを ERROR にする(B15 b)。
     項目との結び: (1)response_to_screen_mapping の画面項目名 (2)react 下書きの field_usage の使用行が入る画面項目(src の行範囲)。どちらでも結ぶ項目を見る。
     WHY: mapping だけでは、店舗の選択肢(IT2)に日数の応答項目が結ばれ、日数の列を説明する会計カードの副題が見られない(run9 で数え方 0 件の原因)。
@@ -832,8 +848,8 @@ def check_item_remarks_units(data, apis, react=None):
         if (it.get("item_name"), leaf) in seen:
             return
         others = [g for g in u.get("group_by") or [] if not _is_date_col(g)]
-        text = " ".join(str(it.get(k) or "") for k in ("remarks", "example"))
-        if not others or not _HAS_DAYS.search(text):
+        # WHY: 例示値(「（14日）」など)はソースの表示を写すので対象外。単位を説明する remarks だけを見る
+        if not others or not _day_unit_claim(it.get("remarks"), strings):
             return
         seen.add((it.get("item_name"), leaf))
         unit = "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others)
@@ -1250,6 +1266,24 @@ def selftest():
     cg_calc = [{"name": "差引額", "formula": "差引額 = 売上 - 返品", "remarks": "返品が無いときは 0 として扱う", "inputs": [{"name": "売上"}, {"name": "返品"}]}]
     assert [g for g in check_calcs(cg_calc, cg) if g.startswith("[ERROR] [式の欠損]")], check_calcs(cg_calc, cg)
     assert not [g for g in check_calcs([dict(cg_calc[0], remarks="")], cg) if "[式の欠損]" in g], "備考が空なのに ERROR"
+    # 日数の指摘(説明文だけ見る)。正例: 単位を日数と説明した説明文は指摘。負例: 表示名・ソースの文字列の一致・単位の補足(行数・集計単位による)は通す
+    assert _day_unit_claim("期間内の会計日数") and _day_unit_claim("店舗ごとの集計日数を表示する", {"日数"}), "説明文の日数を拾わない"
+    assert not _day_unit_claim("期間内の会計日数", {"期間内の会計日数"}), "ソースの文字列と一致する文言を指摘した"
+    assert not _day_unit_claim("店舗ごとの行数で数える日数"), "行数の補足があるのに指摘した"
+    assert not _day_unit_claim("レジ別は会計日の数、店舗別は行数。件数の単位は集計単位による(日数ではない)"), "集計単位による の補足があるのに指摘した"
+    dd_api = {"act": {"db_operations": [{"aggregate_units": [{"alias": "days", "func": "count", "group_by": ["t.mise_no"], "scope": "main"}]}]}}
+    dd = {"api_spec": [{"action": "act", "response_items": [{"key": "rows[].days", "display_name": "日数", "description": "期間内の会計日数"}]}]}
+    assert len(check_backend_facts(dd, dd_api, [])) == 1, "説明文の日数を拾わない(response_items)"
+    assert check_backend_facts(dd, dd_api, [], {"期間内の会計日数"}) == [], "ソースの文字列と一致する説明を指摘した"
+    dd["api_spec"][0]["response_items"][0]["description"] = "店舗の行数"
+    assert check_backend_facts(dd, dd_api, []) == [], "表示名の日数を指摘した"
+    dd_item = {"screen_layout": {"items": [{"item_name": "副題", "remarks": "店舗名と日数を出す。件数の単位は集計単位による", "example": "武蔵小杉（14日）"}]},
+               "api_spec": [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].days", "screen_item_name": "副題"}]}]}
+    assert check_item_remarks_units(dd_item, dd_api, None, {"武蔵小杉（14日）"}) == [], "集計単位による の補足があるのに指摘した"
+    dd_item["screen_layout"]["items"][0]["remarks"] = "店舗名と日数を出す"
+    assert len(check_item_remarks_units(dd_item, dd_api, None, set())) == 1, "説明文の日数を拾わない(項目)"
+    dd_item["screen_layout"]["items"][0]["example"] = "作り話の副題（14日）"
+    assert len(check_item_remarks_units(dd_item, dd_api, None, set())) == 1, "例示値を見て指摘の数が変わった"
     print("selftest OK")
     return 0
 
@@ -1291,7 +1325,7 @@ def main(argv=None):
         # F2: 境界値と共通エラー(DB 例外)の照合。validations は最終の validations か、断片の validations_frontend
         bound_problems = check_boundaries(data.get("validations") or data.get("validations_frontend"), data.get("api_spec"), apis, bd.get("common_errors"))
         # B1 の事実(別名・CTE・副問合せ・集計の単位・例外の code)の照合。[WARN] 付きは終了コードに影響しない
-        fact_problems = check_backend_facts(data, apis, bd.get("common_errors"))
+        fact_problems = check_backend_facts(data, apis, bd.get("common_errors"), strings)
         n_bound = sum(len(a.get("boundaries") or []) for a in apis.values())
         n_sql = sum(1 for a in apis.values() for f in a.get("response_fields") or [] if f.get("db_type"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
@@ -1314,7 +1348,7 @@ def main(argv=None):
     fetch_problems = check_fetch_plan(plan, data.get("front_processes"))
     # B15: 合成後の DB 名・数え方・選択肢・SQL の文字列・禁止語(ERROR)
     db_problems = check_db_names(data, bapis)
-    remark_problems = check_item_remarks_units(data, bapis, rd_all)
+    remark_problems = check_item_remarks_units(data, bapis, rd_all, strings)
     enum_problems = check_enum_mentions(data, rd_all)
     literal_problems = check_literal_transform(data, bapis)
     forbidden_problems = check_forbidden_words(data)
