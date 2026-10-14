@@ -408,9 +408,8 @@ def _with_init_fact_steps(steps: list, ev00_failures: list, mode=None) -> list:
           件数が合わなければ何もしない(推測で対応させない)。
     位置: 開始時は呼出の前、成功時と失敗時は呼出の後(成功、失敗の順)。同じ趣旨の step が既にあれば足さない(extract_react_draft._FACT_MATCH の語で判定)。
           成功時の行は、後で migrate_v48_to_v49 が呼出の直後に入れる response_mapping の後ろに来る。
-    並行(mode == "parallel")のとき: 並びを「前置き・開始時1・呼出1・開始時2・呼出2・…・応答側1・応答側2」に直す。
-          WHY: 並行の取得は先の応答を待たずに次の呼出を出す。応答側を呼出の間に挟むと、後の呼出が応答の処理の後に見えてしまうため。
-          応答側 = 呼出の後から次の呼出の開始時の直前まで(最後の呼出は末尾まで)。serial・mode なしは従来どおり。
+    並行(mode == "parallel")の並べ替えは、ここでは行わない。v49 の reorder_parallel_fetch が response_mapping の後に行う。
+          WHY: 応答側の位置は、v49 が呼出の直後に response_mapping を入れた後でないと決まらないため。mode は呼出元の形を保つために受け取る。
     文面: extract_react_draft._event_facts と同じ文を使う(下書き側と文が割れないように)。state 名は下書きのまま(画面項目名への言い換えは無い)。
     """
     idx = [i for i, s in enumerate(steps) if s.get("kind") == "backend_call" or s.get("backend_call")]
@@ -444,12 +443,8 @@ def _with_init_fact_steps(steps: list, ev00_failures: list, mode=None) -> list:
         blocks.append([head, dict(s), tail])
 
     out = list(pre)
-    if mode == "parallel":
-        out += [x for head, call, _tail in blocks for x in head + [call]]
-        out += [x for _head, _call, tail in blocks for x in tail]
-    else:
-        for head, call, tail in blocks:
-            out += head + [call] + tail
+    for head, call, tail in blocks:
+        out += head + [call] + tail
     return out
 
 
@@ -532,7 +527,8 @@ def _guess_step_kind(text: str, react_kinds: frozenset = frozenset()) -> str:
         return "screen_update"
     # B9: ファイル出力(ダウンロード・CSV・文字コード・見出し行・合計行・区切り)。branch より前に置く(「場合」を含むファイル出力の文を branch にしない)。
     # WHY: 「CSV出力ボタンが活性化する」等の画面の状態の文は file_output にしない(活性・押せの語を含む文は除く)。
-    if any(kw in t for kw in ["ダウンロード", "ファイル", "CSV", "文字コード", "見出し行", "合計行", "区切り"]) and not any(kw in t for kw in ["活性", "押せ"]):
+    # WHY(U4): 引用符・BOM・Blob は CSV の書き方の語(二重引用符・合計行の引用符つきの空・BOM 付き UTF-8・Blob の作成)。手順の文を file_output にする。
+    if any(kw in t for kw in ["ダウンロード", "ファイル", "CSV", "文字コード", "見出し行", "合計行", "区切り", "引用符", "BOM", "Blob"]) and not any(kw in t for kw in ["活性", "押せ"]):
         return "file_output"
     if any(kw in t for kw in ["なら", "ならば", "場合", "閲覧モード", "編集モード"] + extra_keywords.get("branch", [])):
         return "branch"
@@ -1115,6 +1111,10 @@ def selftest() -> int:
     assert _guess_step_kind("CSV出力ボタンを活性化する") == "screen_update"
     assert _guess_step_kind("CSV出力ボタンを押せない") != "file_output"
     assert _guess_step_kind("店舗が指定された場合は絞り込む") == "branch"
+    # U4(新6後半): 引用符・BOM・Blob を含む CSV の手順は file_output
+    assert _guess_step_kind("二重引用符は2つ重ねる") == "file_output"
+    assert _guess_step_kind("文字コードは UTF-8 BOM 付きにする") == "file_output"
+    assert _guess_step_kind("Blob を作ってダウンロードする") == "file_output"
 
     # B9 a: build_backend_processes が db_op_detail に ctes・subqueries を渡す
     bps, _ids = build_backend_processes(
@@ -1144,13 +1144,10 @@ def selftest() -> int:
            {"kind": "state_update", "description": "店舗の応答を画面に反映する"},
            {"kind": "backend_call", "description": "会計レポートを取得する", "backend_call": {"backend_id": "B002"}},
            {"kind": "state_update", "description": "会計レポートの応答を表示する"}]
-    par = _with_init_fact_steps(two, [fe, fe2], "parallel")
-    assert len(par) == 10 and [i for i, s in enumerate(par) if s["kind"] == "backend_call"] == [1, 3], par
-    assert "取得の開始時" in par[0]["description"] and "取得の開始時" in par[2]["description"], par
-    assert "取得に成功" in par[4]["description"] and "取得に失敗" in par[5]["description"], par
-    assert par[6]["description"] == "店舗の応答を画面に反映する" and "取得に成功" in par[7]["description"], par
-    assert par[9]["description"] == "会計レポートの応答を表示する", par
+    # U4(N7): 並行の並べ替えは v17 では行わない(mode に関係なく呼出ごとの順のまま。並べ替えは v49 の reorder_parallel_fetch)
     ser = _with_init_fact_steps(two, [fe, fe2], "serial")
+    par = _with_init_fact_steps(two, [fe, fe2], "parallel")
+    assert par == ser, par
     assert [i for i, s in enumerate(ser) if s["kind"] == "backend_call"] == [1, 6], ser
     assert ser[2]["description"].startswith("取得に成功") and ser[3]["description"].startswith("取得に失敗") \
         and ser[4]["description"] == "店舗の応答を画面に反映する", ser

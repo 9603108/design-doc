@@ -257,6 +257,55 @@ def add_db_op_sub_no(data: dict) -> int:
     return numbered
 
 
+def _fetch_mode():
+    """react 下書き events[0].fetch_plan.mode(parallel・serial・single)を返す。下書きが無い・読めないときは None。
+    WHY: 並行の並べ替え(reorder_parallel_fetch)の読み元。v17 の _fetch_mode と同じ読み方にする。
+         v17 の関数を import すると、v17 のモジュール読込(画面設定の読込)が走るため、読み方だけをここに書く。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return None
+    try:
+        plan = ((json.loads(draft.read_text(encoding="utf-8")).get("events") or [{}])[0]).get("fetch_plan")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (plan or {}).get("mode")
+
+
+def reorder_parallel_fetch(steps: list, mode) -> list:
+    """並行の取得(mode == "parallel")の FR の steps を、開始時と呼出を先に並べ、応答側を後にまとめ直す。
+
+    呼出ごとのブロック = [開始時の行(呼出の直前にある「取得の開始時」の state_update。無ければ無し)・呼出・応答側]。
+    応答側 = 呼出の後から次のブロックの開始時の直前まで(response_mapping・成功・失敗・後続の step)。
+    並べ替え後 = 前置き + 全ブロックの(開始時・呼出) + 全ブロックの応答側。
+    何もしない(同じ list を返す): mode が parallel でない・呼出が2件未満・開始時の行が1件も無い。
+    WHY: 並行は先の応答を待たずに次の呼出を出す。応答側を呼出の間に挟むと、後の呼出が応答の処理の後に見えるため。
+         応答側の位置は、呼出の直後に response_mapping を入れた(migrate_response_to_screen_mapping)後でないと決まらないので、v49 で行う。
+    """
+    if mode != "parallel":
+        return steps
+    from extract_react_draft import _FACT_MATCH  # 遅延 import: 開始時の語を下書きの文面と同じ語で判定する(v17 と同じ)
+    calls = [i for i, s in enumerate(steps) if s.get("kind") == "backend_call" or s.get("backend_call")]
+    if len(calls) < 2:
+        return steps
+
+    def _is_start(s: dict) -> bool:
+        return s.get("kind") == "state_update" and any(m in str(s.get("description") or "") for m in _FACT_MATCH["start"])
+
+    # 開始時の行は呼出の直前にあるものだけを、その呼出の開始時とする(前の呼出の応答側と取り違えない)
+    heads = {c: c - 1 for c in calls if c - 1 >= 0 and (c - 1) not in calls and _is_start(steps[c - 1])}
+    if not heads:
+        return steps
+    # first[k] = 第 k ブロックの先頭(開始時があればその行、無ければ呼出の行)
+    first = [heads.get(c, c) for c in calls]
+    out = list(steps[:first[0]])  # 前置き
+    for k, c in enumerate(calls):
+        out += steps[first[k]:c + 1]  # 開始時・呼出
+    for k, c in enumerate(calls):
+        end = first[k + 1] if k + 1 < len(calls) else len(steps)
+        out += steps[c + 1:end]  # 応答側(呼出の後から次のブロックの先頭まで)
+    return [dict(s, step_no=i) for i, s in enumerate(out, start=1)]
+
+
 def strip_url_param_judgment_steps(data: dict, screen_config: dict) -> int:
     """初期処理 FRX に残る URL パラメータ判定 step を削除（v42 設計逸脱の解消）。
 
@@ -367,6 +416,41 @@ def selftest() -> int:
         check(m.get("item_ref_no") == "IT46", f"移動後の行が IT46 を指す: {m}")
         check(m.get("screen_item_nth") == 2, f"移動後の行に screen_item_nth=2 が残る: {m}")
 
+    # U4(N7): 並行の取得の並び。response_mapping が入った後の並びで、開始時・呼出を先に、応答側を後にまとめる
+    def _st(d):
+        return {"kind": "state_update", "description": d}
+
+    def _call(bid):
+        return {"kind": "backend_call", "description": f"{bid} を取得する", "backend_call": {"backend_id": bid}}
+
+    def _rm(bid):
+        return {"kind": "response_mapping", "description": f"[{bid}] のレスポンスを画面項目にマッピング",
+                "response_mapping": {"backend_id": bid, "mappings": []}}
+
+    par_in = [_st("取得の開始時に、loading を true にする"), _call("BE1"), _rm("BE1"),
+              _st("取得に成功したときは、shops を応答の内容に置き換える"), _st("取得に失敗したときは、error を表示する"),
+              _st("取得の開始時に、loading を true にする"), _call("BE2"), _rm("BE2"),
+              _st("取得に成功したときは、rows を応答の内容に置き換える"), _st("取得に失敗したときは、error を表示する"),
+              _st("カード表示")]
+    exp = ["取得の開始時に、loading を true にする", "BE1 を取得する",
+           "取得の開始時に、loading を true にする", "BE2 を取得する",
+           "[BE1] のレスポンスを画面項目にマッピング", "取得に成功したときは、shops を応答の内容に置き換える",
+           "取得に失敗したときは、error を表示する",
+           "[BE2] のレスポンスを画面項目にマッピング", "取得に成功したときは、rows を応答の内容に置き換える",
+           "取得に失敗したときは、error を表示する", "カード表示"]
+    out = reorder_parallel_fetch(par_in, "parallel")
+    check([s["description"] for s in out] == exp, f"並行: 開始時・呼出を先に、応答側を後にまとめる: {[s['description'] for s in out]}")
+    check([s["step_no"] for s in out] == list(range(1, 12)), "並行: step_no は 1 から振り直す")
+    check(len(par_in) == 11 and "step_no" not in par_in[0], "並行: 入力の list と step は書き換えない")
+    again = reorder_parallel_fetch(out, "parallel")
+    check([s["description"] for s in again] == exp, "並行: 2回目の実行で並びが変わらない(冪等)")
+    check(reorder_parallel_fetch(par_in, "serial") is par_in, "順(serial)は何もしない")
+    check(reorder_parallel_fetch(par_in, None) is par_in, "mode なしは何もしない")
+    one = [_st("取得の開始時に、loading を true にする"), _call("BE1"), _rm("BE1")]
+    check(reorder_parallel_fetch(one, "parallel") is one, "呼出が1件なら何もしない")
+    nostart = [_call("BE1"), _rm("BE1"), _call("BE2"), _rm("BE2")]
+    check(reorder_parallel_fetch(nostart, "parallel") is nostart, "開始時の行が無ければ何もしない")
+
     if fails:
         for f in fails:
             print(f"[selftest NG] {f}", file=sys.stderr)
@@ -398,6 +482,20 @@ def main():
     # (1) response_to_screen_mapping を front_processes へ移動
     inserted = migrate_response_to_screen_mapping(data, item_lookup)
     print(f"[OK] (1) response_mapping step 挿入: {inserted} 件（front_processes へ移動）")
+
+    # (1b) 並行の取得の並び(N7): 画面表示時の FR だけ、response_mapping が入った後の並びで並べ替える
+    # WHY: 並べ替えを v17 でやると、後から入る response_mapping が呼出の直後に挟まり、並行の形が崩れる。
+    fetch_mode = _fetch_mode()
+    reordered = 0
+    for fp in data.get("front_processes", []):
+        if not any(ref.get("group_category") == "画面表示時" for ref in fp.get("called_by_triggers") or []):
+            continue
+        before = fp.get("steps", []) or []
+        after = reorder_parallel_fetch(before, fetch_mode)
+        if after is not before:
+            fp["steps"] = after
+            reordered += 1
+    print(f"[OK] (1b) 並行の取得の並び(mode={fetch_mode}): {reordered} 件")
 
     # (2) response_spec.items[] に source / transform_backend 追加
     added = add_response_spec_source_fields(data)
