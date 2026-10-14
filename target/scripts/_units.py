@@ -389,9 +389,10 @@ def _fill_src(out):
     """下書きの src(ソースの出典 {file,line_start,line_end} の配列)を、合成した行へ機械で付ける。断片に src がある行は触らない。
     呼出元: compose(_fill_logical_names の前)。意味合い: src は機械抽出の下書きが正で、単位に書かせると作り話の行番号が混じるため。
     照合: events/event_processes←react の event_code、api_spec←backend.apis の action、response_items←apis[action] の key、
-    error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id。下書きが無ければ何もしない。"""
+    error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id、calculations←react の calc_candidates の label(候補が1件のときだけ)。下書きが無ければ何もしない。"""
     from _config_loader import INTERMEDIATE_DIR
     ev, ep, api, ri, err, dbo = {}, {}, {}, {}, {}, {}
+    calc, calc_n = {}, {}
     d = Path(INTERMEDIATE_DIR)
     for p in sorted(d.glob("*_react_draft.json")):
         try:
@@ -400,6 +401,12 @@ def _fill_src(out):
             continue
         ev.update({e["event_code"]: e["src"] for e in r.get("events") or [] if e.get("src") and e.get("event_code")})
         ep.update({e["event_code"]: e["src"] for e in r.get("event_processes") or [] if e.get("src") and e.get("event_code")})
+        # WHY: calculations の行は画面での計算名(label)で calc_candidates に結ぶ。label の候補が2件以上なら どれか決まらないので src を付けない(verify_vs_source.check_calcs の対の決め方と同じ)。
+        for c in r.get("calc_candidates") or []:
+            if c.get("label"):
+                calc_n[c["label"]] = calc_n.get(c["label"], 0) + 1
+                if c.get("src"):
+                    calc[c["label"]] = c["src"]
     for p in sorted(d.glob("*_backend_draft.json")):
         try:
             b = json.loads(p.read_text(encoding="utf-8"))
@@ -423,6 +430,10 @@ def _fill_src(out):
         put(r, ep.get(r.get("event_code")))
     for r in _rows(out, "db_operations"):
         put(r, dbo.get(r.get("id")))
+    # WHY: 式の出典は react 下書きの calc_candidates が正。合成の後に数える WARN([出典] H4 の calculations)の残りを、ここで機械で埋める(接続: verify_partials の src の検査)。
+    for r in _rows(out, "calculations"):
+        if calc_n.get(r.get("name")) == 1:
+            put(r, calc.get(r.get("name")))
     for r in _rows(out, "messages_backend"):
         put(r, err.get(r.get("message_id")))
     for a in _rows(out, "api_spec"):
@@ -1001,6 +1012,36 @@ def _selftest_compose_facts():
     print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers")
 
 
+def _selftest_calc_src():
+    """_fill_src が calculations の src を calc_candidates の label で付けることを一時の下書きで確かめる。
+    label が1件 = 付く・同じ label が2件 = 付かない・既存の src = 変えない・候補に無い name = 付かない。
+    WHY: 計算式の出典(H4 の calculations)は下書きが正。label が重ねると結べないので、付けない側に倒す。"""
+    import tempfile
+    import _config_loader
+    react = {"calc_candidates": [
+        {"id": "CC01", "label": "差", "src": [{"file": "a.tsx", "line_start": 76, "line_end": 76}]},
+        {"id": "CC02", "label": "平均", "src": [{"file": "a.tsx", "line_start": 80, "line_end": 80}]},
+        {"id": "CC03", "label": "平均", "src": [{"file": "a.tsx", "line_start": 83, "line_end": 83}]},
+        {"id": "CC04", "label": "税", "src": [{"file": "a.tsx", "line_start": 85, "line_end": 85}]}]}
+    keep = [{"file": "b.tsx", "line_start": 1, "line_end": 1}]
+    out = {"calculations": [{"name": "差", "formula": "a-b"}, {"name": "平均", "formula": "a/b"},
+                            {"name": "税", "formula": "x*0.1", "src": keep}, {"name": "無", "formula": "c"}]}
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_react_draft.json").write_text(json.dumps(react, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            _fill_src(out)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    rows = {r["name"]: r for r in out["calculations"]}
+    assert rows["差"]["src"] == [{"file": "a.tsx", "line_start": 76, "line_end": 76}], rows["差"]
+    assert "src" not in rows["平均"], rows["平均"]
+    assert rows["税"]["src"] == keep, rows["税"]
+    assert "src" not in rows["無"], rows["無"]
+    print("[selftest OK] _units._fill_src (calculations の src は calc_candidates の label が1件のとき)")
+
+
 def _selftest_db_op_ids():
     """番号振りの前(id が下書きの id)と後(id が DB1 等・旧 id が legacy_id)の両方で、下書きの ctes・subqueries が入ることを一時の下書きで確かめる。
     同じ action の行が複数あるときは表で結ぶ。結べない行の欄は外す。"""
@@ -1142,5 +1183,6 @@ if __name__ == "__main__":
     _selftest_b0()
     _selftest_initial_values()
     _selftest_compose_facts()
+    _selftest_calc_src()
     _selftest_db_op_ids()
     _selftest_message_text()
