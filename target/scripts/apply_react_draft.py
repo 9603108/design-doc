@@ -171,9 +171,10 @@ def _place_facts(lines, facts):
     """details の行(lines)へ事実の行(facts)を position どおりに入れた新しい list を返す。
 
     WHY: fact_lines の match の語を含む行は、モデルが書いた同趣旨の行でも下書きの行でも落として1回にする。
-    呼出の行は落とさない。before_calls は最初の呼出の行の前、after_calls は最後の呼出の行の後、
-    end(および未知の position)は末尾に置く。呼出の行が無いときは before_calls を先頭、after_calls を末尾にする。
-    業務の行の相対順は保つ。同じ文の重複は1回にする。
+    呼出の行は落とさない。before_calls は最初の呼出の行の前、after_calls は最後の呼出の行の後に置く。
+    position=seq(CSV の処理順など)は seq の昇順で、after_calls の後・残りの業務の行の前に置く。
+    end(および未知の position)は末尾に置く。呼出の行が無いときは before_calls を先頭、after_calls と seq を業務の行の末尾にする。
+    業務の行の相対順は保つ。同じ文の重複は1回にする。seq が整数でない行は fact_lines の並びのまま。
     """
     words = [w for f in facts for w in (f.get("match") or [])]
     kept = []
@@ -190,13 +191,23 @@ def _place_facts(lines, facts):
                 out.append(f["text"])
         return out
 
+    def pick_seq():
+        rows = [f for f in facts if f.get("position") == "seq"]
+        # WHY: 整数の seq だけで並べる。欄が無い行は並びを変えない(sort は安定)
+        rows.sort(key=lambda f: f["seq"] if isinstance(f.get("seq"), int) else float("inf"))
+        out = []
+        for f in rows:
+            if f["text"] not in texts and f["text"] not in out:
+                out.append(f["text"])
+        return out
+
     before = pick(("before_calls",))
     after = pick(("after_calls",))
-    end = pick(("end",) + tuple(p for p in {f.get("position") for f in facts} if p not in ("before_calls", "after_calls", "end")))
+    seq = pick_seq()
+    end = pick(("end",) + tuple(p for p in {f.get("position") for f in facts} if p not in ("before_calls", "after_calls", "end", "seq")))
     calls = [i for i, ln in enumerate(kept) if is_call_line(ln)]
     i0, i1 = (calls[0], calls[-1] + 1) if calls else (0, len(kept))
-    return kept[:i0] + before + kept[i0:i1] + after + kept[i1:] + end
-
+    return kept[:i0] + before + kept[i0:i1] + after + seq + kept[i1:] + end
 
 def _load(path):
     try:
@@ -349,6 +360,27 @@ def selftest():
             "取得の開始時に、loading を true にする", "・load をリクエストする",
             "取得に成功したときは、rows を応答の内容に置き換える", "取得に失敗したときは、error にエラーの内容を設定する",
             "0件のときは該当なしの旨を表示する", "連続操作の後から届く応答は上書きする"], "空の details は下書きの呼出から作り事実を入れる"
+        # (g) CSV の処理順(position=seq・seq の昇順)。モデルの同趣旨の行(見出し・データ行・合計行・二重引用符・BOM・ファイル名)は落ち、
+        #     業務の2行は相対順のまま残る。欄を逆順に渡しても seq の昇順に並ぶ
+        csv_draft = {"event_processes": [{"event_code": "EV04", "details": [], "fact_lines": [
+            {"key": "csv.name", "text": "ファイル名 pos_account_report.csv で保存する", "position": "seq", "seq": 6, "match": ["ファイル名"]},
+            {"key": "csv.blob", "text": "BOM 付きの Blob にする", "position": "seq", "seq": 5, "match": ["BOM"]},
+            {"key": "csv.quote", "text": "値は二重引用符で囲む", "position": "seq", "seq": 4, "match": ["二重引用符"]},
+            {"key": "csv.total", "text": "合計行を最後に足す", "position": "seq", "seq": 3, "match": ["合計行"]},
+            {"key": "csv.row", "text": "データ行は表示中の行ごとに並べる", "position": "seq", "seq": 2, "match": ["データ行"]},
+            {"key": "csv.head", "text": "CSV の見出し行に、固定列と項目名を並べる", "position": "seq", "seq": 1, "match": ["見出し"]},
+        ]}]}
+        mcsv = {"event_processes": [{"event_code": "EV04", "details": [
+            "集計結果が1行も無い間は、CSV 出力ボタンを押せない", "見出し行は項目名を並べる", "データ行を表示順に書く",
+            "読込中でも CSV 出力ボタンは押せる", "合計行を最後に書く", "値を二重引用符で囲む",
+            "BOM 付きで Blob にして保存する", "ファイル名を付けて保存する"]}]}
+        n, bad = apply_details(csv_draft, mcsv)
+        assert n == 1 and not bad, f"CSV の処理順: {n} {bad}"
+        assert mcsv["event_processes"][0]["details"] == [
+            "集計結果が1行も無い間は、CSV 出力ボタンを押せない", "読込中でも CSV 出力ボタンは押せる",
+            "CSV の見出し行に、固定列と項目名を並べる", "データ行は表示中の行ごとに並べる", "合計行を最後に足す",
+            "値は二重引用符で囲む", "BOM 付きの Blob にする", "ファイル名 pos_account_report.csv で保存する"], f"CSV の並び: {mcsv['event_processes'][0]['details']}"
+        assert apply_details(csv_draft, mcsv) == (0, []), "CSV の再実行は何もしない"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1
