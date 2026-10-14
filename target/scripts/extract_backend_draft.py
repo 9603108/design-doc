@@ -16,7 +16,7 @@ ACTIONS = {"action名": module.func, ...} のような「文字列 → 関数参
     columns は最上位 SELECT 句の全列の骨組み {no, alias, expression, table, column, logical_name, logical_name_source}。
     SELECT * / t.* は DDL の列で展開する。from は FROM の表 {table, name, alias}
     logical_name は機械的に取れた論理名の候補。出所 logical_name_source は取れた順に
-    comment(DDL のコメント)/ csv_header(backend の列名と日本語の見出しの対応)/ ui_label(画面の定数配列の label)/ expr(式の別名。元列の論理名から SUM・COUNT・MIN・MAX の種類で組む)/ api_type(TS の型のコメント)/ guess(列名からの推定)。取れなければ空
+    comment(DDL のコメント)/ csv_header(backend の列名と日本語の見出しの対応)/ docstring(backend の docstring・# コメントの「日本語(識別子)」)/ ui_label(画面の定数配列の label。型のコメントの「側の列」から末尾の語を取り、取れなければ ui_label_guess)/ expr(式の別名。元列の論理名から SUM・COUNT・MIN・MAX の種類で組む)/ api_type(TS の型のコメント)/ guess(列名からの推定)。取れなければ空
 
 【意味合い】
 Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いていたため、実行ごとに欠落とぶれが出た。
@@ -37,10 +37,12 @@ Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いて�
 """
 import argparse
 import ast
+import io
 import json
 import os
 import re
 import sys
+import tokenize
 from pathlib import Path
 
 # 集計・ウィンドウ関数の下書き(C4)。同じフォルダの _backend_facts.py を読む(実行時の sys.path は scripts/)
@@ -668,8 +670,8 @@ def _sql_type(c, dt):
 
 
 def _ui_specs(paths):
-    """TSX の直下の定数配列(const X = [ {label: "..", kin: "列", ...}, ... ])の要素を (label, [他の文字列の値]) で返す。
-    値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。
+    """TSX の直下の定数配列(const X = [ {label: "..", kin: "列", ...}, ... ])の要素を (label, [他の文字列の値], {値: 属性}) で返す。
+    値が SELECT の別名(応答の項目のキー)と一致すれば、その列の画面の表示名が label と分かる。属性(kin・cnt 等)は末尾の語の推定に使う。
     要素に csv(CSV 用の見出し)があれば label の代わりにそれを名前にする(呼出元は main と selftest。結果は _candidates が読む)。"""
     out = []
     for p in paths:
@@ -686,7 +688,8 @@ def _ui_specs(paths):
                     # csv は「小計1(値引前)」のように一意で意味まで持つ(PosReport.tsx の行定義)。_candidates の ui_label になる
                     lm = re.search(r"\bcsv\s*:\s*['\"]([^'\"]+)['\"]", o) or re.search(r"\blabel\s*:\s*['\"]([^'\"]+)['\"]", o)
                     if lm:
-                        out.append((lm.group(1), [v for k, v in re.findall(r"\b(\w+)\s*:\s*['\"]([^'\"]+)['\"]", o) if k not in ("label", "csv")]))
+                        pairs = [(k, v) for k, v in re.findall(r"\b(\w+)\s*:\s*['\"]([^'\"]+)['\"]", o) if k not in ("label", "csv")]
+                        out.append((lm.group(1), [v for _, v in pairs], {v: k for k, v in pairs}))
                     i = j
                 i += 1
     return out
@@ -729,23 +732,54 @@ def _type_note(c):
     return c if c and len(c) <= 20 and not re.search(r"[=\"'`]", c) and not c.isascii() else ""
 
 
+def _attr_suffix(note):
+    """型のコメントが「点数側の列」「の列」の形なら、その頭の語(点数)を返す。それ以外は空(T7)。"""
+    m = re.fullmatch(r"(.+?)(?:側の列|の列)", note or "")
+    return m.group(1) if m else ""
+
+
+def _attr_note(blocks, key):
+    """TSX の行の属性名(cnt・kin)と同じ欄に付いた型のコメント(生の文)を、型ブロックの中から探す。無ければ空(T7)。
+    ponytail: 同じ属性名の欄が複数の型にあれば最初の型のコメントを使う。"""
+    for _, notes in blocks:
+        if key and key in notes:
+            return notes[key]
+    return ""
+
+
+def _doc_hints(paths):
+    """backend の python の docstring と # コメントから「日本語(識別子)」を {識別子: 日本語} で取る(T7)。
+    同じ識別子に別の語が付くときは取らない。呼出元: extract(hints["doc"] → _candidates の docstring の出所)。
+    ponytail: 日本語の並びは最長 12 字で切る(「各店番号(mise_no)」は「各店番号」になる)。"""
+    seen = {}
+    for p in paths:
+        if p.suffix != ".py" or not p.is_file():
+            continue
+        t = p.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(t)
+        except SyntaxError:
+            continue
+        texts = [ast.get_docstring(tree) or ""]
+        texts += [tok.string.lstrip("#") for tok in tokenize.generate_tokens(io.StringIO(t).readline) if tok.type == tokenize.COMMENT]
+        for text in texts:
+            for jp, ident in _DOC_HINT.findall(text):
+                seen.setdefault(ident, set()).add(jp)
+    return {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
+
+
+# 日本語(識別子) の書き方(全角・半角の括弧)。_doc_hints が読む
+_DOC_HINT = re.compile(r"([々぀-ヿ㐀-鿿]{2,12})[（(]([A-Za-z_]\w*)[）)]")
+
+
 def _candidates(cols, hints):
-    """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / csv_header / ui_label / expr / api_type / guess。
+    """columns の各行に logical_name と logical_name_source を付ける。取れる順に comment / csv_header / docstring / ui_label / expr / api_type / guess。
     expr は式の別名(SUM・COUNT・MIN・MAX の1列の式)の元列の論理名から組む。CASE・四則演算は組まない。"""
     ddl, specs, blocks = hints.get("ddl") or {}, hints.get("ui") or [], hints.get("types") or []
+    doc = hints.get("doc") or {}
     aliases = {c["alias"] for c in cols if c["alias"]}
-    hits = [(lb, [v for v in vals if v in aliases]) for lb, vals in specs]
-    hits = [(lb, cs) for lb, cs in hits if cs]
-    ui = {}
-    for lb, cs in hits:
-        for c in cs:
-            n = lb
-            if sum(1 for x, _ in hits if x == lb) > 1:  # ponytail: 同じ表示名(小計・合計)が複数の列に付くときは列名の数字で分ける
-                n += "".join(re.findall(r"\d+", c))
-            if len(cs) > 1:  # 1つの表示行に件数と金額のように複数の列があるときは、列名の末尾の語で分ける
-                last = c.rsplit("_", 1)[-1]
-                n += _WORDS.get(last, last)
-            ui.setdefault(c, n)
+    hits = [(lb, [v for v in vals if v in aliases], attr) for lb, vals, attr in specs]
+    hits = [(lb, cs, attr) for lb, cs, attr in hits if cs]
     notes = {}
     # 別名を最も多く含む型を1つだけ見る。3つ以上(別名が3つ未満なら全部)含み、型の欄の半分以上が別名であること。
     # ponytail: id・name のような汎用の欄名で、別の型のコメントを取り違えないための目安。型の名前は突き合わせない
@@ -755,6 +789,20 @@ def _candidates(cols, hints):
         for f, c in best[1].items():
             if f in aliases and _type_note(c):
                 notes[f] = _type_note(c)
+    ui = {}  # 列の別名 -> (論理名, 出所)。型のコメントの「側の列」の語を末尾に付け、取れなければ語の推定(推定)
+    for lb, cs, attr in hits:
+        for c in cs:
+            n, guessed = lb, False
+            if sum(1 for x, _, _ in hits if x == lb) > 1:  # ponytail: 同じ表示名(小計・合計)が複数の列に付くときは列名の数字で分ける
+                n += "".join(re.findall(r"\d+", c))
+            if len(cs) > 1:  # 1つの表示行に件数と金額のように複数の列があるときは、末尾の語で分ける
+                last = c.rsplit("_", 1)[-1]
+                word = _attr_suffix(_type_note(_attr_note(blocks, attr.get(c, ""))))  # 属性(cnt・kin)の型のコメントが優先
+                if not word:
+                    key = attr.get(c) if attr.get(c) in ("kin", "cnt") else last
+                    word, guessed = _WORDS.get(key, key), True
+                n += word
+            ui.setdefault(c, (n + ("(推定)" if guessed else ""), "ui_label_guess" if guessed else "ui_label"))
     csv = hints.get("csv") or {}
     # 1回目: 元列の論理名になるもの(comment・csv_header・ui_label・api_type)を列ごとに出す。式の別名はこれを材料に組む
     rows = []
@@ -762,9 +810,11 @@ def _candidates(cols, hints):
         com = ddl.get(c["table"]) or {}
         plain = re.fullmatch(r"[\w.]+", c["expression"]) is not None  # 式の別名は元列のコメントを借りず、別名そのもので引く
         keys = (c["column"], c["alias"]) if plain else (c["alias"],)
+        ui_name, ui_src = ui.get(c["alias"], (None, "ui_label"))
         rows.append([(next((com[k] for k in keys if com.get(k)), ""), "comment"),
                      (next((csv[k] for k in keys if csv.get(k)), ""), "csv_header"),
-                     (ui.get(c["alias"]), "ui_label"),
+                     (next((doc[k] for k in keys if doc.get(k)), ""), "docstring"),
+                     (ui_name, ui_src),
                      (notes.get(c["alias"]), "api_type")])
     known = {}  # 元列の論理名の材料。別名ごとに取れた最初の名前(guess は材料にしない)
     for c, cs in zip(cols, rows):
@@ -779,7 +829,7 @@ def _candidates(cols, hints):
         src = (ddl.get(c["table"]) or {}).get(c["column"]) or known.get(c["column"]) or _guess(c["column"])
         if em and c["column"] and src:
             ex = {"SUM": src + "の合計", "COUNT": src + "の件数", "MIN": "最初の" + src, "MAX": "最後の" + src}[em.group(1).upper()]
-        order = cs[:3] + [(ex, "expr")] + cs[3:] + [(_guess(c["alias"]) or _guess(c["column"]), "guess")]
+        order = cs[:4] + [(ex, "expr")] + cs[4:] + [(_guess(c["alias"]) or _guess(c["column"]), "guess")]
         name, how = next(((n, s) for n, s in order if n), ("", ""))
         c["logical_name"], c["logical_name_source"] = name, how
     return cols
@@ -1112,7 +1162,7 @@ def extract(files, hints=None):
             for k, v in pairs:
                 if isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[A-Za-z_]\w*", k) and not v.isascii():
                     csv.setdefault(k, v)
-    hints = {**hints, "csv": csv}
+    hints = {**hints, "csv": csv, "doc": _doc_hints(files)}
     apis, unresolved, tables = {}, [], set()
     for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
         for n in mod.tree.body:
@@ -1317,7 +1367,25 @@ def selftest():
         (Path(d) / "W.tsx").write_text('const R = [\n  { label: "小計", csv: "小計1(値引前)", kin: "s_1" },\n'
                                        '  { label: "小計", csv: "小計5(現金計)", kin: "s_5" },\n  { label: "総売上", kin: "u" },\n];\n', encoding="utf-8")
         ui = _ui_specs([Path(d) / "W.tsx"])
-    assert ui == [("小計1(値引前)", ["s_1"]), ("小計5(現金計)", ["s_5"]), ("総売上", ["u"])], ui
+    assert ui == [("小計1(値引前)", ["s_1"], {"s_1": "kin"}), ("小計5(現金計)", ["s_5"], {"s_5": "kin"}), ("総売上", ["u"], {"u": "kin"})], ui
+    # T7: 論理名の出所 docstring(backend の docstring・# の「日本語(識別子)」。同じ識別子に別の語が付けば取らない)
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "m.py").write_text('"""店番号(mise_no) の表。"""\n# レジ番(reji_no) を見る\n# 支店番号(mise_no) も見る\n', encoding="utf-8")
+        dh = _doc_hints([Path(d) / "m.py"])
+    assert dh == {"reji_no": "レジ番"}, dh
+    dcols = [{"alias": "shop_id", "expression": "p.mise_no", "table": "real_tbl", "column": "mise_no", "logical_name": ""}]
+    dc = _candidates(dcols, {"doc": {"mise_no": "店番号"}})
+    assert (dc[0]["logical_name"], dc[0]["logical_name_source"]) == ("店番号", "docstring"), dc
+    dc = _candidates(dcols, {"doc": {"mise_no": "店番号"}, "ddl": {"real_tbl": {"mise_no": "店舗番号"}}})
+    assert (dc[0]["logical_name"], dc[0]["logical_name_source"]) == ("店舗番号", "comment"), "DDL のコメントが docstring より先"
+    # T7: ui_label の末尾の語は型のコメントの「点数側の列」から取る(取れなければ (推定) と ui_label_guess)
+    scols = [{"alias": a, "expression": a, "table": "", "column": a} for a in ("uri_teisei_kin", "uri_teisei_cnt")]
+    sfx = [("売上訂正", ["uri_teisei_kin", "uri_teisei_cnt"], {"uri_teisei_kin": "kin", "uri_teisei_cnt": "cnt"})]
+    types = [({"label", "kin", "cnt"}, {"kin": "金額側の列。派生値は calc で与える", "cnt": "点数側の列（無い行は金額のみ）"})]  # 型の欄(属性)に付いたコメント
+    sc = _candidates(scols, {"ui": sfx, "types": types})
+    assert [(c["logical_name"], c["logical_name_source"]) for c in sc] == [("売上訂正金額", "ui_label"), ("売上訂正点数", "ui_label")], sc
+    gs = _candidates(scols, {"ui": [("売上訂正", ["uri_teisei_kin", "uri_teisei_cnt"], {"uri_teisei_kin": "kin", "uri_teisei_cnt": "cnt"})]})
+    assert [(c["logical_name"], c["logical_name_source"]) for c in gs] == [("売上訂正金額(推定)", "ui_label_guess"), ("売上訂正件数(推定)", "ui_label_guess")], gs
     cs = _candidates([{"alias": a, "expression": a, "table": "", "column": a} for a in ("s_1", "s_5", "u")], {"ui": ui})
     assert [(c["logical_name"], c["logical_name_source"]) for c in cs] == [("小計1(値引前)", "ui_label"), ("小計5(現金計)", "ui_label"), ("総売上", "ui_label")], cs
     # F2: 日付の形式検査(from・to)の boundaries と、暦に無い日付を通すこと・大小比較が無いこと・共通エラー(except 節)
