@@ -604,6 +604,34 @@ def _day_unit_claim(text, strings=None, pat=None):
     return not (strings and t in strings)
 
 
+_FILTER_COND = re.compile(r"FILTER\s*\(\s*WHERE\s+(.*)\)\s*(?:::\w+)?\s*$", re.IGNORECASE | re.DOTALL)
+_CASE_DATE = re.compile(r"CASE\s+WHEN\s+(.*?)\s+THEN\s+([\w.]+)\s+END", re.IGNORECASE | re.DOTALL)
+
+
+def _counts_dates(u, cols):
+    """count の集計単位 u が、数える対象を日付そのものにしているか(GROUP BY に日付の列が無くても日数になる形)。
+    (a) count(DISTINCT 日付の列)。
+    (b) count(*) FILTER (WHERE 条件) と同じ条件で日付の列を並べる欄(array_agg(CASE WHEN 条件 THEN 日付の列 END))が同じ DB 操作の columns にある。
+        数えた件数はその日付の欄の要素数と同じなので、件数の単位は日付の列を持つ行(日)になる。
+    WHY: GROUP BY の列(店・レジ)だけで単位を決めると、日ごとに1行の表を店・レジ単位でまとめた count(*)(=その店・レジの日数)まで日数でないと誤る(run12 の warn_days)。
+    判定が付かないとき(式が FILTER で終わらない等)は False(従来どおり GROUP BY の列で見る)。呼出元: _units_with_date_count。"""
+    m = re.match(r"\s*DISTINCT\s+(.+?)\s*$", str(u.get("arg") or ""), re.IGNORECASE)
+    if m and _is_date_col(_split_col(m.group(1))[1]):
+        return True
+    own = next((c for c in cols if c.get("alias") == u.get("alias") and c.get("is_expression")), None)
+    fm = _FILTER_COND.search(str((own or {}).get("expression") or ""))
+    if not fm:
+        return False
+    want = _sq(fm.group(1))
+    return any(c is not own and (cm := _CASE_DATE.search(str(c.get("expression") or ""))) and _sq(cm.group(1)) == want and _is_date_col(_split_col(cm.group(2))[1])
+               for c in cols)
+
+
+def _units_with_date_count(dop):
+    """DB 操作 dop の aggregate_units に、counts_dates(count が日付を数えるか。_counts_dates)を足したコピーを返す。呼出元: check_backend_facts (3)・check_item_remarks_units。"""
+    return [dict(u, counts_dates=str(u.get("func")).lower() == "count" and _counts_dates(u, dop.get("columns") or [])) for u in dop.get("aggregate_units") or []]
+
+
 def check_backend_facts(data, apis, common_errors, strings=None):
     """設計書(data)を backend 下書きの事実(apis[action].db_operations の columns・ctes・subqueries・aggregate_units と common_errors)と突き合わせる(ERROR)。
     [別名]: 物理列として書いた名前が SQL の別名(実列に無い) / 集計の別名が null なのにソースは AS を持つ。差し戻し先 H2
@@ -611,6 +639,7 @@ def check_backend_facts(data, apis, common_errors, strings=None):
     [CTE]: ソースに CTE が無いのに CTE と書く / 定義が空の CTE を参照 / 絞り込みのある CTE を空・条件なしと書く / 本体の集計と書いた別名が CTE の集計。差し戻し先 S2・H2
     [副問合せ]: 別名の無い集計が副問合せの中の集計なのに本体の集計(aggregate)として書いてある。差し戻し先 H2
     [集計単位]: count の説明の「日数」が、数える単位(GROUP BY)に日付の列が無い・日付以外の列も含むのと合わない(WARN)。差し戻し先 S2
+        ただし日付そのものを数える count(DISTINCT 日付の列・同じ条件で日付を並べる欄がある FILTER 付き count。_counts_dates)は、GROUP BY が店・レジでも日数なので見ない
     [エラーcode]: api_spec の error_patterns の error_code が、ソースの例外処理の code_default のどれでもない。error_code が空で status が1つの共通エラーに当たる行も(差し戻し先 S2)。condition の code= は見ない。messages の code は見ない(MSE 番号が正。形は verify_intermediate.py)
     呼出元: main(下書きがあるとき)。apis が空なら何も言わない。差し戻し先は units.json の owns に合わせた(dataset・aggregate は H2、expression・説明・error_patterns は S2)。"""
     ops = {act: a.get("db_operations") or [] for act, a in (apis or {}).items()}
@@ -692,13 +721,14 @@ def check_backend_facts(data, apis, common_errors, strings=None):
         for r in a.get("response_items") or []:
             leaf = str(r.get("key")).rsplit(".", 1)[-1]
             for d in ops.get(a.get("action")) or []:
-                for u in d.get("aggregate_units") or []:
+                for u in _units_with_date_count(d):
                     if u.get("alias") == leaf and str(u.get("func")).lower() == "count" and u.get("scope") == "main" and _day_unit_claim(r.get("description"), strings, _DAY_TEXT) and (a.get("action"), r["key"]) not in unit_seen:
                         # 行数が日数になるのは、数える単位が日付の列だけのとき。日付が無い・日付以外(店舗・レジなど)も含むときは WARN(両方向を捕まえる)
+                        # WHY: ただし日付そのものを数える count(DISTINCT 日付・同じ条件で日付を並べる欄がある FILTER 付きの count)は、GROUP BY が店・レジでも日数(counts_dates)
                         gb = u.get("group_by") or []
                         dates = [g for g in gb if re.search(r"date|_dt|day|日", g, re.IGNORECASE)]
                         others = [g for g in gb if g not in dates]
-                        if dates and not others:
+                        if (dates and not others) or u.get("counts_dates"):
                             continue
                         unit_seen.add((a.get("action"), r["key"]))
                         why = "日付の列が無い" if not dates else f"日付の列以外({'・'.join(others)})も数える単位に含まれ、行数が日数と合わない"
@@ -865,7 +895,8 @@ def check_item_remarks_units(data, apis, react=None, strings=None):
             return
         others = [g for g in u.get("group_by") or [] if not _is_date_col(g)]
         # WHY: 例示値(「（14日）」など)はソースの表示を写すので対象外。単位を説明する remarks だけを見る
-        if not others or not _day_unit_claim(it.get("remarks"), strings):
+        # WHY: 日付そのものを数える count(counts_dates)は、GROUP BY が店・レジでも日数なので指摘しない(check_backend_facts (3) と同じ基準)
+        if not others or u.get("counts_dates") or not _day_unit_claim(it.get("remarks"), strings):
             return
         seen.add((it.get("item_name"), leaf))
         unit = "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others)
@@ -873,7 +904,7 @@ def check_item_remarks_units(data, apis, react=None, strings=None):
         problems.append(f"[数え方] screen_layout.items[{it.get('item_name')}]: 「日数」「N日」と書くが、件数の単位は {unit} を含み日数ではない。「{unit}の行数」と書く → 差し戻し先 S1")
 
     for a in data.get("api_spec") or []:
-        draft = [u for d in ((apis or {}).get(a.get("action")) or {}).get("db_operations") or [] for u in d.get("aggregate_units") or []]
+        draft = [u for d in ((apis or {}).get(a.get("action")) or {}).get("db_operations") or [] for u in _units_with_date_count(d)]
         counts = [u for u in draft if str(u.get("func")).lower() == "count" and (u.get("scope") or "main") == "main"]
         for m in a.get("response_to_screen_mapping") or []:
             it = items.get(m.get("screen_item_name"))
@@ -1094,6 +1125,28 @@ def selftest():
     assert len(got) == 1 and got[0].startswith("[WARN] [集計単位]") and "t.mise_no" in got[0], got
     bapis2["act"]["db_operations"][0]["aggregate_units"][0]["group_by"] = ["t.kai_date"]
     assert check_backend_facts(bad, bapis2, ces) == [], check_backend_facts(bad, bapis2, ces)
+    # 日付そのものを数える count は、GROUP BY が店・レジでも日数(run12 の warn_days: count(*) FILTER (WHERE 条件) と、同じ条件で日付を並べる array_agg(CASE WHEN 条件 THEN 日付 END))。日付を並べる欄が無い・条件が違うものは従来どおり WARN
+    wc = "p.seisan_cnt = 0 AND p.nz > p.z"
+    wdays = col("warn_days", "alias_only", expr=f"count(*) FILTER (WHERE {wc})::int")
+    wdates = lambda cond: col("warn_dates", "alias_only", expr=f"array_remove(array_agg( CASE WHEN {cond} THEN p.kai_date END ORDER BY p.kai_date), NULL)")
+    wunit = lambda alias, arg="*": {"func": "count", "arg": arg, "alias": alias, "scope": "main", "group_by": ["pos.mise_no", "pos.reji_no", "shops.name"], "unit": "pos.mise_no, pos.reji_no, shops.name"}
+    wdata = lambda text: {"api_spec": [{"action": "act", "response_items": [{"key": "rows[].warn_days", "description": text}]}],
+                          "screen_layout": {"items": [{"item_name": "警告", "remarks": text, "example": ""}]}}
+    wmap = {"act": {"db_operations": [{"columns": [wdays, wdates(wc)], "aggregate_units": [wunit("warn_days")]}]}}
+    wdata_all = lambda text: dict(wdata(text), api_spec=[{"action": "act", "response_items": [{"key": "rows[].warn_days", "description": text}], "response_to_screen_mapping": [{"api_field_path": "rows[].warn_days", "screen_item_name": "警告"}]}])
+    assert check_backend_facts(wdata("取込欠損の疑いがある日数"), wmap, ces) == [], check_backend_facts(wdata("取込欠損の疑いがある日数"), wmap, ces)
+    assert check_item_remarks_units(wdata_all("取込欠損の疑いがある日数"), wmap) == [], check_item_remarks_units(wdata_all("取込欠損の疑いがある日数"), wmap)
+    # 負例: 日付を並べる欄の条件が違う / 日付を並べる欄が無い → 日数と言えないので WARN・ERROR のまま
+    for cols_bad in ([wdays, wdates("p.seisan_cnt = 1")], [wdays]):
+        wbad = {"act": {"db_operations": [{"columns": cols_bad, "aggregate_units": [wunit("warn_days")]}]}}
+        got = check_backend_facts(wdata("取込欠損の疑いがある日数"), wbad, ces)
+        assert len(got) == 1 and got[0].startswith("[WARN] [集計単位]"), got
+        got = check_item_remarks_units(wdata_all("取込欠損の疑いがある日数"), wbad)
+        assert len(got) == 1 and got[0].startswith("[数え方]"), got
+    # count(DISTINCT 日付の列)は日数。count(DISTINCT 日付以外)は従来どおり
+    wdist = lambda arg: {"act": {"db_operations": [{"columns": [col("warn_days", "alias_only", expr=f"count({arg})")], "aggregate_units": [wunit("warn_days", arg)]}]}}
+    assert check_backend_facts(wdata("会計日数"), wdist("DISTINCT p.kai_date"), ces) == []
+    assert len(check_backend_facts(wdata("会計日数"), wdist("DISTINCT p.mise_no"), ces)) == 1
     # エラー code: error_code は common_errors の code_default と照合する。condition の code= は見ない(廃止)。messages の code は照合しない(MSE 番号が正)
     bad = json.loads(json.dumps(good))
     bad["messages_backend"][0]["code"] = "MSE00001"
