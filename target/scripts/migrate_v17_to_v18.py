@@ -687,9 +687,9 @@ def _build_event_steps(ep: dict, ev: dict, csv_codes: frozenset = frozenset(), f
          事実(fact の key・ハンドラの形・CSV の出力)で決められるものは事実で決め、補足は新しい種別 note(docx では「補足」)にする。
     規則(上から。data_load・backend_call・response_mapping の行は変えない):
       1. 文が下書きの fact_lines の text と同じ: key が start・success・failure → state_update、empty → screen_update、csv.* → file_output。
-      2. 括弧の中を除いた文末が否定なら note。
-      3. 2 に当たらない最初の行: イベントが csv_codes にあれば file_output、ハンドラが setter だけなら state_update。
-      4. 2・3 に当たらない2行目以降は、by_text が既定の state_update に倒したものだけ note(語が当たった種別は残す)。
+      2. 最初の行: イベントが csv_codes にあれば file_output、ハンドラが setter だけなら state_update(文末が否定でも note にしない)。どちらでもなければ語の種別のまま。
+      3. 2行目以降で、括弧の中を除いた文末が否定なら note。
+      4. 3 に当たらない2行目以降は、by_text が既定の state_update に倒したものだけ note(語が当たった種別は残す)。
     csv_codes: CSV を出すイベントの event_code の集合(_csv_trigger_codes)。facts・shapes: _step_facts の2つの表(無ければ事実なしで、規則2・4だけが動く)。
     接続: 呼出元は build_front_processes。note は generate_docx.js が「補足」と表示する。
     """
@@ -707,13 +707,15 @@ def _build_event_steps(ep: dict, ev: dict, csv_codes: frozenset = frozenset(), f
             s["kind"] = "screen_update"
         elif key and key.startswith("csv."):
             s["kind"] = "file_output"
-        elif _ends_negative(s["description"]):
-            s["kind"] = "note"
         elif i == 0:
+            # 最初の行は規則3(CSV・ハンドラの形)を規則2より先に当て、note にしない。
+            # WHY: 最初の行は「そのイベントが何をするか」の本体で、文末が否定(「全店を選んだときは絞り込まない」)でも手順であって補足ではない。
             if code in csv_codes:
                 s["kind"] = "file_output"
             elif shapes.get(code) == "setter":
                 s["kind"] = "state_update"
+        elif _ends_negative(s["description"]):
+            s["kind"] = "note"
         elif s["kind"] == "state_update":
             s["kind"] = "note"
     return steps
@@ -1265,6 +1267,14 @@ def selftest() -> int:
             "・表示中の結果を保存する", "・未確定の日付は保存する内容に影響しない", "・見出し行: 開始日", "・データ行: 表示中の行ごと"]},
             {}, frozenset({"EV22"}), facts, shapes)
         assert [s["kind"] for s in w3] == ["file_output", "note", "file_output", "file_output"], w3
+        # 最初の行の文末が否定でも note にしない(setter なら state_update、CSV なら file_output、どちらでもなければ語の種別のまま)
+        w5 = _build_event_steps({"event_code": "EV21", "src": span(10, 20), "details": [
+            "・選んだ店舗を条件にする。全店のときは絞り込まない", "・期間は使わない"]}, {}, frozenset(), facts, shapes)
+        assert [s["kind"] for s in w5] == ["state_update", "note"], w5
+        w6 = _build_event_steps({"event_code": "EV22", "src": span(10, 20), "details": ["・保存しない場合もある"]}, {}, frozenset({"EV22"}), facts, shapes)
+        assert w6[0]["kind"] == "file_output", w6
+        w7 = _build_event_steps({"event_code": "EV20", "src": span(10, 20), "details": ["・何もしない"]}, {}, frozenset(), facts, shapes)
+        assert w7[0]["kind"] != "note", w7
         # 括弧の中の否定は文末として見ない
         assert not _ends_negative("反映する(変わらない)") and _ends_negative("反映しない(注記)。") and _ends_negative("確認はせず")
         # 2行目以降: 語が当たった種別(branch)は残し、既定の state_update だけ note
