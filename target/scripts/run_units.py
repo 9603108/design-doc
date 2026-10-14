@@ -57,6 +57,8 @@ AFTER = [
     "python3 target/scripts/apply_id_scheme.py {feat}",
     "python3 target/scripts/migrate_v49_event_unify.py {feat}",
     "python3 target/scripts/migrate_v48_to_v49.py {feat}",
+    # WHY: IDs(FR・BE)が確定した後に、共通ロジックの呼出元の名前を ID へ結ぶ(used_by_processes_ids)。
+    "python3 target/scripts/fill_common_logic_callers.py {feat}",
     "python3 target/scripts/verify_vs_source.py {feat}",
     "python3 target/scripts/verify_intermediate.py {feat}",
     "python3 target/scripts/verify_call_graph.py {feat}",
