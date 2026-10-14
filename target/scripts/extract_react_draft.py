@@ -511,7 +511,12 @@ def _state_names(sources):
     for g in _react_facts.jsx_elements(sources)["jsx_elements"]:
         if g.get("bind") and g.get("label"):
             labels.setdefault(g["bind"], set()).add(g["label"])
-    return {k: next(iter(v)) for k, v in labels.items() if len(v) == 1}
+    names = {k: next(iter(v)) for k, v in labels.items() if len(v) == 1}
+    # WHY: state の中の欄(applied.from)は、その欄へ入れた state の画面項目名で言い換える(表示の確定で入った値を辿る)
+    for key, st in _react_facts.object_fields(sources).items():
+        if st in names:
+            names[key] = names[st]
+    return names
 
 
 def _state_name(st, names):
@@ -578,10 +583,15 @@ def _when_text(when):
 
 
 def _file_name(tpl, names):
-    """ファイル名の ${式} を、state 名(names)が画面項目名に決まるものだけ項目名にする。決まらない式は残す。"""
+    """ファイル名の ${式} を読める文にする。式が画面項目名に決まれば「(<項目名>の値)」、決まらなければ「(式: <式>)」。
+
+    WHY: ${…} を残すと合成後の穴検査が ERROR にする。式のまま出すと、ファイル名の中身が画面から読めない。
+         names は _state_names(state 名と、state の欄 applied.from の両方)。推測で項目名を当てない。
+    """
     def rep(m):
         expr = m.group(1)
-        return names.get(expr) or names.get(expr.split(".")[0]) or m.group(0)
+        name = names.get(expr)
+        return f"({name}の値)" if name else f"(式: {expr})"
     return re.sub(r"\$\{([^}]+)\}", rep, tpl)
 
 
@@ -1064,7 +1074,7 @@ def _selftest_t4():
               "value_separator": " "},
           "joins": [{"target": "dates", "separator": " "}], "src": []}
     try:
-        got = _csv_fact_map([cv], dr, {"applied": "適用期間"})["EV07"]
+        got = _csv_fact_map([cv], dr, {"applied.from": "集計開始日"})["EV07"]
         f = {x["seq"]: x for x in got}
         assert sorted(f) == [1, 2, 3, 4, 5, 6], f"seq: {sorted(f)}"
         assert all(x["position"] == "seq" for x in got), "position は seq"
@@ -1074,7 +1084,24 @@ def _selftest_t4():
         assert "表示が2行以上のとき" in f[3]["text"] and "開始日 は空欄にする" in f[3]["text"], f[3]["text"]
         assert "店舗は「合計」" in f[3]["text"], f[3]["text"]
         assert f[5]["text"].startswith("全体を連結する"), f[5]["text"]
-        assert f[6]["text"] == "ファイル名は「pos_適用期間.csv」で保存する", f[6]["text"]
+        assert f[6]["text"] == "ファイル名は「pos_(集計開始日の値).csv」で保存する", f[6]["text"]
+        # 決まらない式は「(式: …)」で出す(${…} の穴は残さない)
+        assert _file_name("a_${rows.length}.csv", {}) == "a_(式: rows.length).csv", _file_name("a_${rows.length}.csv", {})
+        # 欄の写像は表示の確定の setter の引数から読む(setApplied({ from, to }) → applied.from は from の項目)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td) / "P.tsx"
+            tp.write_text("export default function P() {\n"
+                          "  const [from, setFrom] = useState(\"\");\n"
+                          "  const [to, setTo] = useState(\"\");\n"
+                          "  const [applied, setApplied] = useState({ from: \"\", to: \"\" });\n"
+                          "  const show = () => setApplied({ from, to });\n"
+                          "  return <div><label>集計開始日</label><input value={from} onChange={(e) => setFrom(e.target.value)} />"
+                          "<label>集計終了日</label><input value={to} onChange={(e) => setTo(e.target.value)} /></div>;\n"
+                          "}\n", encoding="utf-8")
+            nm = _state_names([tp])
+        assert nm.get("applied.from") == "集計開始日" and nm.get("applied.to") == "集計終了日", nm
+        assert _file_name("pos_${applied.from}_${applied.to}.csv", nm) == "pos_(集計開始日の値)_(集計終了日の値).csv", nm
     except AssertionError as e:
         print(f"[selftest NG] T4 {e}")
         return 1

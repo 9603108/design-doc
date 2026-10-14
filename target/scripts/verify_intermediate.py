@@ -1266,6 +1266,19 @@ def check_message_code_format(merged: dict) -> list:
 # 接続情報: 入力 = merged（中間 JSON 全体）/ 出力 = [(level, message), ...] / 呼出元 = main()
 MESSAGE_ID_STRICT_RE = re.compile(r"^MS[EWI]\d{5}$")
 BRACE_HOLE_RE = re.compile(r"\{[^{}\s]+\}")  # 空白を含まない {名前} だけを穴とみなす（JSON 風の記述を誤検出しない）
+# 応答の形を書く欄(api_spec[].response_pattern・backend_processes[].response_spec.pattern)は、応答の JSON の形で書く。
+# 「成功時 {success: true, data: {rows}}」の {rows} は data の値の置き方(キー名)で、実行時に決まる穴ではない。
+# WHY: 値の位置(「: {名前}」)と、内側に「:」のある波括弧({k: v} の形)だけ JSON の形として外す。それ以外は従来どおり穴。
+RESPONSE_SHAPE_PATH_RE = re.compile(r"^(api_spec\[\d+\]\.response_pattern|backend_processes\[\d+\]\.response_spec\.pattern)$")
+JSON_VALUE_BRACE_RE = re.compile(r":\s*\{[^{}]*\}")
+JSON_OBJ_BRACE_RE = re.compile(r"\{[^{}]*:[^{}]*\}")
+
+
+def _has_brace_hole(path: str, s: str) -> bool:
+    """欄の文字列に、未展開の {名前} の穴があるか。応答の形の欄だけ JSON の形を穴にしない。"""
+    if RESPONSE_SHAPE_PATH_RE.match(path):
+        s = JSON_OBJ_BRACE_RE.sub("{}", JSON_VALUE_BRACE_RE.sub(": {}", s))
+    return bool(BRACE_HOLE_RE.search(s))
 # 2026-10-13: 画面項目の例示値は、実行時に決まる値(金額・件数・日付など)を {金額} 円 のように書式の例として書く(S1 手順書)。
 # 具体的な値はソースに無く verify_vs_source が止めるため。この道筋の {名前} は未展開の穴とみなさない
 EXAMPLE_PATH_RE = re.compile(r"^screen_layout\.items\[\d+\]\.example$")
@@ -1321,7 +1334,7 @@ def check_intermediate_strict(merged: dict) -> list:
             issues.append(("ERROR", f"{path}: 物理名 'db_op_' が文字列に残存: '{s[:80]}'"))
         # 画面項目の例示値(screen_layout.items[].example)の {名前} は下の elif で WARN にする(〈 は従来どおり ERROR)。
         # 理由: 例示値は書式の例として実値で書くのが正(S1 手順書)。穴は S1 へ戻して実値に直させる
-        if "〈" in s or (BRACE_HOLE_RE.search(s) and not EXAMPLE_PATH_RE.match(path)):
+        if "〈" in s or (_has_brace_hole(path, s) and not EXAMPLE_PATH_RE.match(path)):
             issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
         # 例示値の {名前} は WARN に留める(最終段で残れば S1 へ差し戻す)。ERROR にすると docx 生成前に止まり、S1 の手戻りを機械的に強制しすぎるため
         elif EXAMPLE_PATH_RE.match(path) and EXAMPLE_HOLE_RE.search(s):
@@ -1424,6 +1437,38 @@ def check_src(merged: dict, sc: dict) -> list:
     return issues
 
 
+def _same_place(a: dict, b: dict) -> bool:
+    """2つの src({file, line_start, line_end})が同じファイルで行範囲が重なるか。"""
+    if str(a.get("file") or "") != str(b.get("file") or ""):
+        return False
+    # fallback-ok: 行範囲の終わりが無い src は開始行だけの1行とみなす(src は行範囲を常に持つ想定)。開始行が無いものは 0 で重ならない
+    a0, a1 = int(a.get("line_start") or 0), int(a.get("line_end") or a.get("line_start") or 0)
+    # fallback-ok: 同上(比較の相手側)
+    b0, b1 = int(b.get("line_start") or 0), int(b.get("line_end") or b.get("line_start") or 0)
+    return a0 <= b1 and b0 <= a1
+
+
+def _fixed_for_item(s: dict, literal: list) -> list:
+    """画面項目1件に結ぶ固定文の要素。項目に src(TSX の行範囲)があれば、その範囲と重なる要素だけを使う。無ければ名前・example で結ぶ。
+    WHY: merge_partials の初期値・表示は src の位置で結ぶ(_src_fact)。名前だけで結ぶと、同じ文言が別の場所にあるとき
+         位置の違う要素の表示で判定してしまう。POS会計レポートの項目「空」は行の見出しの印(Card の中。初期表示では出ない)だが、
+         凡例の「空」(初期表示で見える)で結ぶと誤って ERROR になった。
+    """
+    named = linked_fixed_elements([s.get("item_name"), s.get("example")], literal)
+    srcs = s.get("src") or []
+    spans = [x for x in ([srcs] if isinstance(srcs, dict) else srcs) if isinstance(x, dict) and x.get("line_start")]
+    if not spans:
+        return named
+    out = []
+    for el in named:
+        els = el.get("src") or []
+        for es in ([els] if isinstance(els, dict) else els):
+            if isinstance(es, dict) and any(_same_place(es, sp) for sp in spans):
+                out.append(el)
+                break
+    return out
+
+
 def check_initialization_items(merged: dict, drafts: list = None) -> list:
     """B16 (round9): 初期処理の表の中身を検査する。
 
@@ -1454,7 +1499,7 @@ def check_initialization_items(merged: dict, drafts: list = None) -> list:
     literal = literal_text_elements(drafts)
     visible_fixed = set()
     for s in sl_items:
-        linked = linked_fixed_elements([s.get("item_name"), s.get("example")], literal)
+        linked = _fixed_for_item(s, literal)
         if any(visible_initially(el, env) is True for el in linked):
             visible_fixed.add(str(s.get("item_name") or "").strip())
     for i in init_items:
@@ -1659,6 +1704,33 @@ def _selftest() -> int:
         return 1
     if not any("一致しない" in m for _, m in check_initialization_items({"initialization": {"items": good["initialization"]["items"][:1]}, "screen_layout": sl_ok})):
         print("[selftest NG] 初期処理の件数の不一致が出ない")
+        return 1
+    # 2026-10-14: 項目の src(位置)で結ぶ。同じ文言の凡例が初期表示で見えても、項目の位置(隠れた行の印)で判定する
+    card_src = {"file": "/x/S.tsx", "line_start": 10, "line_end": 10}
+    legend_src = {"file": "/x/S.tsx", "line_start": 50, "line_end": 50}
+    lit_pos = [{"jsx_elements": [
+        {"text": "空", "visible_chain": [{"cond": "rows.length > 1", "kind": "and"}], "src": [card_src]},
+        {"text": "空", "visible_chain": [], "src": [legend_src]}]}]
+    pos_init = {"initialization": {"items": [{"no": 1, "item_name": "空", "active": "活性", "visible": "非表示", "initial_value": "Blank"}]},
+                "screen_layout": {"items": [{"item_name": "空", "item_type": "Label", "example": "空", "src": [card_src]}]}}
+    if any("固定文" in m for _, m in check_initialization_items(pos_init, lit_pos)):
+        print("[selftest NG] 項目の位置で隠れた印を、別の位置の凡例で固定文の ERROR にした")
+        return 1
+    # src が無い項目は従来どおり名前で結ぶ(凡例の「空」が初期表示で見える → ERROR)
+    no_src = {"initialization": pos_init["initialization"],
+              "screen_layout": {"items": [{"item_name": "空", "item_type": "Label", "example": "空"}]}}
+    if not any("固定文" in m for _, m in check_initialization_items(no_src, lit_pos)):
+        print("[selftest NG] src の無い項目の名前での固定文の判定が外れた")
+        return 1
+    # 応答の形の欄: JSON の形({success: true, data: {rows}})は穴にしない。応答の形の中の素の {名前} は穴のまま
+    shape = {"api_spec": [{"response_pattern": "成功時 {success: true, data: {rows}}"}],
+             "backend_processes": [{"response_spec": {"pattern": "成功時 {success:true,data:{rows}}"}}]}
+    if any("未展開の穴" in m for _, m in check_intermediate_strict(shape)):
+        print("[selftest NG] 応答の形の JSON を未展開の穴にした")
+        return 1
+    bare = {"api_spec": [{"response_pattern": "成功時 {件数} 件を返す"}]}
+    if not any("未展開の穴" in m for _, m in check_intermediate_strict(bare)):
+        print("[selftest NG] 応答の形の中の素の {名前} の穴を見逃した")
         return 1
     if not check_event_action({"events": [{"no": "EV1", "action": ""}]}):
         print("[selftest NG] 動作語の空が出ない")

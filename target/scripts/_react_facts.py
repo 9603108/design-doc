@@ -97,6 +97,33 @@ def _set_calls(seg, setters):
     return out
 
 
+_IDENT = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def object_fields(sources):
+    """setX({ k, k2: v }) の引数の欄ごとに、入った識別子の写像 {"state.欄": "識別子"} を返す。呼出元: extract_react_draft._state_names()。
+
+    意味合い: `applied.from` のような state の中の欄が、どの state(画面項目)の値で入ったかの事実。
+    WHY: 表示の確定(setApplied({ from, to }))で入った値を辿れば、ファイル名の式の欄を画面項目名に言い換えられる。
+         同じ欄へ別の識別子が入るときは写さない(決まらないものを推測で埋めない)。...の展開は欄の事実ではないので飛ばす。
+    """
+    setters = _setter_map(sources)
+    seen = {}
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        for st, arg in _set_calls(Path(p).read_text(encoding="utf-8"), setters):
+            if not (arg.startswith("{") and arg.endswith("}")):
+                continue
+            for part in _split_top(arg[1:-1]):
+                i = _top_colon(part)
+                key, val = (part[:i], part[i + 1:]) if i >= 0 else (part, part)
+                key, val = key.strip(), val.strip()
+                if _IDENT.fullmatch(key) and _IDENT.fullmatch(val):
+                    seen.setdefault(f"{st}.{key}", set()).add(val)
+    return {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
+
+
 def _promise_chain(b, setters):
     """本体 b の最初の .then/.catch/.finally の並びを読む。.catch が無ければ None。
 
