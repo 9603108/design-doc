@@ -1421,6 +1421,155 @@ def check_src(merged: dict, sc: dict) -> list:
     return issues
 
 
+def check_initialization_items(merged: dict) -> list:
+    """B16 (round9): 初期処理の表の中身を検査する。
+
+    判定ルール:
+      (a) initialization.items の件数が screen_layout.items の件数と違う → ERROR
+      (b) 全項目が「活性/表示」の一色 → ERROR（表示条件・disabled を評価できた項目が1つも無い）
+      (c) 固定文の項目（表示専用の Label で example に {…} の穴が無い）の初期値が Blank → ERROR
+    WHY: merge_partials.build_initialization は評価できない項目を仮埋めの「活性/表示」で出す。
+         後段の検査が無いと、その仮埋めのまま docx に出ても止まらないため。
+    接続情報: 入力 = merged['initialization']['items'] / merged['screen_layout']['items'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    init_items = (merged.get("initialization") or {}).get("items") or []
+    sl_items = (merged.get("screen_layout") or {}).get("items") or []
+    if len(init_items) != len(sl_items):
+        issues.append(("ERROR", f"initialization.items が {len(init_items)} 件で screen_layout.items の {len(sl_items)} 件と一致しない（画面項目と同数にする）"))
+    if init_items and all(str(i.get("active") or "") == "活性" and str(i.get("visible") or "") == "表示" for i in init_items):
+        issues.append(("ERROR", "initialization.items が全項目「活性/表示」の一色（表示条件・disabled を評価できた項目が1つも無い。仮埋めのまま）"))
+    # 固定文の判定: 表示専用の Label で example に {…} の穴が無く、文字がある項目
+    # WHY: 固定文は画面に書かれた文言そのものなので、初期値を Blank にする理由が無い
+    fixed_names = set()
+    for s in sl_items:
+        ex = str(s.get("example") or "").strip()
+        if str(s.get("item_type") or "").lower() == "label" and ex and not re.search(r"[{}]", ex):
+            fixed_names.add(str(s.get("item_name") or "").strip())
+    for i in init_items:
+        name = str(i.get("item_name") or "").strip()
+        if name in fixed_names and str(i.get("initial_value") or "") == "Blank":
+            issues.append(("ERROR", f"initialization.items[{i.get('no') or '?'}]({name}): 固定文の項目の初期値が Blank（画面に書かれた文言を初期値に入れる）"))
+    return issues
+
+
+def check_event_action(merged: dict) -> list:
+    """B16 (round9): events[].action が空の行を ERROR で検出する。
+
+    WHY: 動作語（押下・選択など）が無いと、トリガーの文が「どの操作で動くか」を業務担当者に伝えられない。
+         convert_events_location_action.py が取れなかった行を後段で止めるための検査。
+    接続情報: 入力 = merged['events'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    for e in merged.get("events") or []:
+        if not str(e.get("action") or "").strip():
+            issues.append(("ERROR", f"events[no={e.get('no') or '?'}].action が空（動作語を入れる。取れなければ react 下書きの動作語で補う）"))
+    return issues
+
+
+def check_diagram_ids(merged: dict) -> list:
+    """B16 (round9): 構成図（diagrams.screen_structure）のラベル先頭 ID が、画面のエリア番号と一致するか検査する。
+
+    判定ルール: ラベルの先頭が「英字+数字」の ID で、screen_layout.areas[].area_no の集合に無い → ERROR。
+                areas が空なら比べる相手が無いので検査しない。
+    WHY: 構成図だけ旧番号（A1）のまま出ると、画面一覧の AR 番号と結べず、同じ画面の番号が2通りになるため。
+    接続情報: 入力 = merged['diagrams']['screen_structure'] と merged['screen_layout']['areas'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    areas = (merged.get("screen_layout") or {}).get("areas") or []
+    area_nos = {str(a.get("area_no")) for a in areas if a.get("area_no")}
+    if not area_nos:
+        return issues
+    labels = []
+
+    def walk(node):
+        # ラベルは入れ子（spec.structure[].children[]）のどこにあっても拾う
+        if isinstance(node, dict):
+            if isinstance(node.get("label"), str):
+                labels.append(node["label"])
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    # WHY: 中間 JSON の diagrams は2形がある（dict の {id: spec} と、id を持つ要素の list）。両方から screen_structure を取る
+    diagrams = merged.get("diagrams") or {}
+    if isinstance(diagrams, dict):
+        walk(diagrams.get("screen_structure") or {})
+    else:
+        walk([d for d in diagrams if isinstance(d, dict) and d.get("id") == "screen_structure"])
+    for lab in labels:
+        m = re.match(r"^([A-Za-z]+\d+)(?=\s|$)", lab.strip())
+        if m and m.group(1) not in area_nos:
+            issues.append(("ERROR", f"diagrams.screen_structure のラベル「{lab}」の先頭 ID {m.group(1)} が screen_layout.areas[].area_no に無い（AR 形の番号に直す）"))
+    return issues
+
+
+def check_common_logic_callers(merged: dict) -> list:
+    """B16 (round9): common_logic[].used_by_processes_ids が空の行を ERROR で検出する。
+
+    WHY: 呼出元が空だと docx の共通ロジックの「呼出元」が「（該当なし）」になり、どこから呼ばれるか分からない。
+         fill_common_logic_callers.py が結べなかった行を後段で止めるための検査。
+    接続情報: 入力 = merged['common_logic'] / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    for cl in merged.get("common_logic") or []:
+        if not (cl.get("used_by_processes_ids") or []):
+            no = cl.get("no") or cl.get("logic_id") or "?"
+            issues.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): used_by_processes_ids が空（呼出元の FR・BE を結ぶ）"))
+    return issues
+
+
+def _selftest() -> int:
+    """B16 の4検査の最小自己検査。ERROR が出る形と出ない形を1つずつ置く。
+    WHY: 実データ（run8 の複製）が無くても、検査の判定そのものが壊れていないことを確かめるため。"""
+    sl_ok = {"areas": [{"area_no": "AR1"}],
+             "items": [{"item_name": "店舗", "item_type": "Select"},
+                       {"item_name": "注記", "item_type": "Label", "example": "※ 注記文"}]}
+    good = {
+        "initialization": {"items": [
+            {"no": 1, "item_name": "店舗", "active": "活性", "visible": "表示", "initial_value": "- 全店 -"},
+            {"no": 2, "item_name": "注記", "active": "非活性", "visible": "表示", "initial_value": "※ 注記文"},
+        ]},
+        "screen_layout": sl_ok,
+        "events": [{"no": "EV1", "action": "押下"}],
+        "diagrams": {"screen_structure": {"structure": [{"label": "POS会計レポート画面", "children": [{"label": "AR1 ヘッダ"}]}]}},
+        "common_logic": [{"no": "CL1", "used_by_processes_ids": ["FR1"]}],
+    }
+    checks = (check_initialization_items, check_event_action, check_diagram_ids, check_common_logic_callers)
+
+    def all_issues(d):
+        return [i for c in checks for i in c(d)]
+
+    if all_issues(good) != []:
+        print(f"[selftest NG] 正しい形で ERROR が出た: {all_issues(good)}")
+        return 1
+    bad_init = {"initialization": {"items": [
+        {"no": 1, "item_name": "店舗", "active": "活性", "visible": "表示", "initial_value": "Blank"},
+        {"no": 2, "item_name": "注記", "active": "活性", "visible": "表示", "initial_value": "Blank"},
+    ]}, "screen_layout": sl_ok}
+    msgs = [m for _, m in check_initialization_items(bad_init)]
+    if not (any("一色" in m for m in msgs) and any("固定文" in m for m in msgs)):
+        print(f"[selftest NG] 初期処理の一色・固定文の ERROR が出ない: {msgs}")
+        return 1
+    if not any("一致しない" in m for _, m in check_initialization_items({"initialization": {"items": good["initialization"]["items"][:1]}, "screen_layout": sl_ok})):
+        print("[selftest NG] 初期処理の件数の不一致が出ない")
+        return 1
+    if not check_event_action({"events": [{"no": "EV1", "action": ""}]}):
+        print("[selftest NG] 動作語の空が出ない")
+        return 1
+    if not check_diagram_ids({"screen_layout": {"areas": [{"area_no": "AR1"}]},
+                              "diagrams": {"screen_structure": {"children": [{"label": "A1 ヘッダ"}]}}}):
+        print("[selftest NG] 旧番号の構成図ラベルが出ない")
+        return 1
+    if not check_common_logic_callers({"common_logic": [{"no": "CL1", "used_by_processes_ids": []}]}):
+        print("[selftest NG] 呼出元の空が出ない")
+        return 1
+    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元")
+    return 0
+
+
 def main():
     # 目的: 引数で指定された機能名の中間 JSON を検証する。引数なしなら環境変数 FEATURE_NAME、
     #       どちらも無ければ _config_loader 側が「feature_name 未指定」で止める（既定の機能名は持たない）。
@@ -1513,6 +1662,11 @@ def main():
     all_issues.extend(check_intermediate_strict(merged))
     # 2026-10-13 案 A4: 出典(src)の無い記述は WARN、対象外のファイル・作り話の行番号は ERROR
     all_issues.extend(check_src(merged, sc))
+    # B16 (round9): 初期処理の表（件数・一色・固定文）、動作語の空、構成図の ID、共通ロジックの呼出元
+    all_issues.extend(check_initialization_items(merged))
+    all_issues.extend(check_event_action(merged))
+    all_issues.extend(check_diagram_ids(merged))
+    all_issues.extend(check_common_logic_callers(merged))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]
@@ -1541,5 +1695,8 @@ def main():
     sys.exit(1 if errors else 0)
 
 
+# WHY: --selftest は機能名や中間 JSON を要らずに検査の判定だけを確かめる入口
+if __name__ == "__main__" and "--selftest" in sys.argv:
+    sys.exit(_selftest())
 if __name__ == "__main__":
     main()
