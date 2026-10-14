@@ -46,6 +46,36 @@ FEATURE_NAME = get_feature_name_from_argv()
 INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 
+def sync_initialization_screen_no(data):
+    """initialization.items[].screen_no を、同じ順の screen_layout.items[].screen_no から写す。写した件数を返す。
+
+    目的: 初期表示後の画面項目表(docx)のエリア# 列が空にならないようにする。
+          initialization.items は screen_layout.items とは別に作られ、screen_no を持たないため。
+    意味合い: 件数が違うときは対応が決まらないので全体を触らない。項目名が違う行も触らない
+              (推測で写さない)。既に screen_no がある行は上書きしない(冪等)。
+    """
+    init_items = (data.get("initialization") or {}).get("items") or []
+    layout_items = (data.get("screen_layout") or {}).get("items") or []
+    if not init_items:
+        return 0
+    if len(init_items) != len(layout_items):
+        print(f"[INFO] initialization.items[] を写さない(件数 {len(init_items)} と screen_layout.items[] {len(layout_items)} が違う)")
+        return 0
+    copied = 0
+    mismatched = 0
+    for ini, lay in zip(init_items, layout_items):
+        if ini.get("item_name") != lay.get("item_name"):
+            mismatched += 1
+            continue
+        if ini.get("screen_no") or not lay.get("screen_no"):
+            continue
+        ini["screen_no"] = lay["screen_no"]
+        copied += 1
+    if mismatched:
+        print(f"[WARN] initialization.items[] の項目名が screen_layout.items[] と違う行 {mismatched} 件は触らない")
+    return copied
+
+
 def main():
     # v30: screen_config.json から画面エリア定義をロード（ハードコード SCREEN_AREAS 廃止）
     # 意味合い: 画面別ハードコードを画面別 JSON に外出しすることで、本スクリプトは画面非依存の汎用処理になる
@@ -90,6 +120,11 @@ def main():
         for m in api.get("response_to_screen_mapping") or []:
             if m.get("screen_item_name") in item_screen_no:
                 m["screen_no"] = item_screen_no[m["screen_item_name"]]
+
+    # 2c. 初期処理の項目表(initialization.items[])の screen_no を、2. で揃えた画面項目から写す(2026-10-14)
+    #     意味合い: 2. の後に行う。写す元の screen_no が揃っている必要があるため。件数・名前が合わない行は触らない
+    synced = sync_initialization_screen_no(data)
+    print(f"[OK] initialization.items[] に screen_no を {synced} 件写した")
 
     # 3. v32: area_pattern_subdivisions[] を screen_layout に伝播
     # 意味合い: generate_docx.js は中間JSON のみを読むため、screen_config.json の subdivision 定義を
