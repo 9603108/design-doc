@@ -66,12 +66,115 @@ def renumber_common_logic(items: list) -> list:
     return items
 
 
-def build_initialization(events: list, screen_layout: dict) -> dict:
+def load_react_drafts() -> list:
+    """react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
+    呼出元: build_initialization。意味合い: 初期値（useState の初期値）と初期表示の API は下書きの事実が正。
+    partial の events には action が無い形（run7 の形）があるため、初期表示の判定もここの下書きから取る。下書きが無ければ []。"""
+    drafts = []
+    for p in sorted(INTERMEDIATE_DIR.glob("*_react_draft.json")):
+        try:
+            drafts.append(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return drafts
+
+
+def _state_by_label(drafts: list) -> dict:
+    """画面項目の名前 → その項目に結ばれた state_initials の1件。同じ名前は最初の1件（_units._fill_initial_values と同じ辿り方）。"""
+    out = {}
+    for d in drafts:
+        for si in d.get("state_initials") or []:
+            for b in si.get("bound") or []:
+                if isinstance(b, dict) and b.get("label"):
+                    out.setdefault(str(b["label"]).strip(), si)
+    return out
+
+
+def _option_texts(drafts: list) -> dict:
+    """選択欄の名前 → {option の value: 表示名}。下書きの jsx_elements が options を持つものだけ入る。
+    意味合い: 選択欄の初期値（例 "register"）を業務の表示名（例 レジ別）へ写すための事実。無ければ空にして、推測で言い換えない。
+    接続情報: 現状の react 下書きは options を書かないため、実運用では空になりうる（その場合は引用符を外した値を書く）。"""
+    out = {}
+    for d in drafts:
+        for el in d.get("jsx_elements") or []:
+            if not isinstance(el, dict) or not el.get("label") or not el.get("options"):
+                continue
+            pairs = {str(o["value"]): str(o.get("text") or "") for o in el["options"] if isinstance(o, dict) and "value" in o}
+            out.setdefault(str(el["label"]).strip(), pairs)
+    return out
+
+
+def _initial_text_from_state(si: dict, options: dict) -> str:
+    """state_initials の1件を、初期処理の表の「初期値」欄の文にする。
+    リテラル（引用符付き）: 選択肢の事実（value→表示名）があれば表示名、無ければ引用符を外した値。空文字は「空文字」。
+    リテラル（その他）: そのまま（true・false など）。式: 読める説明（readable）、無ければ「式: 原文」。未設定: 「未設定(undefined)」。
+    意味合い: 業務担当者が読む表なので、value の綴り（register）より表示名（レジ別）を優先する。"""
+    kind, raw = si.get("kind"), si.get("initial") or ""
+    if kind == "none":
+        return "未設定(undefined)"
+    if kind == "literal":
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+            val = raw[1:-1]
+            if options.get(val):
+                return options[val]
+            return val if val else "空文字"
+        return {"[]": "空の一覧"}.get(raw, raw)
+    return si.get("readable") or f"式: {raw}"
+
+
+def _initial_value(item: dict, states: dict, options: dict) -> str:
+    """画面項目1件の初期値。結ぶ state があればその初期値（事実）、無ければ合成欄に既にある値、それも無ければ Blank。
+    意味合い: 初期値が無い項目だけ Blank にする。全項目を Blank に固定すると、下書きにある初期値の事実を捨ててしまう。"""
+    name = str(item.get("item_name") or "").strip()
+    si = states.get(name)
+    if si:
+        return _initial_text_from_state(si, options.get(name, {}))
+    return item.get("initial_value") or "Blank"
+
+
+def _initial_db_refs(db_operations: list, drafts: list) -> list:
+    """初期表示が呼ぶ API の DB 操作の id を、db_operations の並びのまま返す。
+    辿り方は _units の _react_draft_facts / _fill_initial_db_triggers と同じ:
+      1. 初期表示の行（下書きの events のうち action が「初期表示」）の event_code を集める
+      2. その行の event_processes の calls の action と、初期表示の code を trigger_events に持つ API の action を集める
+      3. 集めた action を持つ DB 操作の id を返す
+    意味合い: 初期表示が引く DB の参照を、機能別処理の表と同じ id（db_operations_ref）で結ぶため。
+    初期表示の行が無い・API を辿れないときは []（推測で結ばない）。"""
+    init = {str(e["event_code"]) for d in drafts for e in d.get("events") or []
+            if isinstance(e, dict) and e.get("action") == "初期表示" and e.get("event_code")}
+    if not init:
+        return []
+
+    def api_of(op) -> dict:
+        api = op.get("api_endpoint") if isinstance(op, dict) else None
+        return api if isinstance(api, dict) else {}
+
+    actions = set()
+    for d in drafts:
+        for ep in d.get("event_processes") or []:
+            if isinstance(ep, dict) and ep.get("event_code") in init:
+                actions |= {c["action"] for c in ep.get("calls") or [] if isinstance(c, dict) and c.get("action")}
+    # 合成後の db_operations（trigger_events が初期表示の code を持つ）と、下書きの db_operations の両方を見る。
+    # 理由: 合成済みの partial に初期表示の code が無い版（run7 の形）でも、下書きの側で API を辿れるようにするため
+    for op in list(db_operations) + [o for d in drafts for o in d.get("db_operations") or []]:
+        api = api_of(op)
+        if api.get("action") and init & set(api.get("trigger_events") or []):
+            actions.add(api["action"])
+    return [op["id"] for op in db_operations if isinstance(op, dict) and op.get("id") and api_of(op).get("action") in actions]
+
+
+def build_initialization(events: list, screen_layout: dict, db_operations: list = None, drafts: list = None) -> dict:
     """初期処理セクションを最小テンプレで生成。
     EV00 が events にあれば content を Overview に転載、なければデフォルト文を入れる。
     items は screen_layout から Button 以外を抜粋（仮実装）"""
     ev00 = next((e for e in events if e.get("event_code") == "EV00"), None)
     overview = ev00["content"] if ev00 else "画面初期表示処理（詳細はWave 3充実化で展開）"
+
+    # 初期値と初期表示の API は react 下書きの事実から取る（下書きを省略時は読み直す。selftest は与える）
+    if drafts is None:
+        drafts = load_react_drafts()
+    states = _state_by_label(drafts)
+    options = _option_texts(drafts)
 
     items = []
     for sl_item in screen_layout.get("items", []):
@@ -84,13 +187,14 @@ def build_initialization(events: list, screen_layout: dict) -> dict:
             "item_name": sl_item.get("item_name", ""),
             "active": "活性",       # 仮埋め
             "visible": "表示",      # 仮埋め
-            "initial_value": "Blank",  # 仮埋め
+            "initial_value": _initial_value(sl_item, states, options),  # 事実（下書きの state_initials）が無い項目だけ Blank
         })
 
     return {
         "pattern": "DB取得",  # 初期表示はセッションデータ取得から始まる前提の DB取得パターン
         "overview": overview,
-        "db_operations_ref": [],  # Wave 3 充実化で db_op_get_session_data 等を紐付ける
+        # 初期表示が呼ぶ API の DB 操作。Wave 3 充実化ではなく、下書きの事実から今埋める（理由: 初期表示の DB 参照が空だと表に紐づかない）
+        "db_operations_ref": _initial_db_refs(db_operations or [], drafts),
         "items": items,
     }
 
@@ -191,6 +295,59 @@ def apply_unit_details(event_processes: list, unit_eps: list) -> None:
             ep["src"] = list(src["src"])
 
 
+def _selftest_initialization() -> int:
+    """初期処理の表の初期値（結ぶ state・選択肢の表示名・式・未設定・Blank・既存値の維持）と db_operations_ref（初期表示が呼ぶ API の id）を、
+    一時の下書きで確かめる。終了コード 0=OK / 1=NG。"""
+    drafts = [{
+        "events": [{"event_code": "EV00", "action": "初期表示"}, {"event_code": "EV01", "action": "クリック"}],
+        "event_processes": [{"event_code": "EV00", "calls": [{"action": "list_a"}]}],
+        "db_operations": [{"api_endpoint": {"action": "list_b", "trigger_events": ["EV00"]}}],
+        "state_initials": [
+            {"state": "from", "kind": "expression", "initial": "todayJst()", "readable": "当月1日(UTC+9時間基準)", "bound": [{"label": "集計開始日"}]},
+            {"state": "shopId", "kind": "literal", "initial": '""', "readable": None, "bound": [{"label": "店舗"}]},
+            {"state": "group", "kind": "literal", "initial": '"register"', "readable": None, "bound": [{"label": "集計単位"}]},
+            {"state": "kind2", "kind": "literal", "initial": '"shop"', "readable": None, "bound": [{"label": "別の選択欄"}]},
+            {"state": "showDead", "kind": "literal", "initial": "false", "readable": None, "bound": [{"label": "空欄項目も表示"}]},
+        ],
+        "jsx_elements": [
+            {"label": "集計単位", "options": [{"value": "register", "text": "レジ別（現行と同じ）"}, {"value": "shop", "text": "店舗別（レジ合算）"}]},
+            {"label": "店舗", "options": [{"value": "", "text": "- 全店 -"}]},
+        ],
+    }]
+    screen = {"items": [
+        {"item_name": "集計開始日", "item_type": "Calendar"},
+        {"item_name": "店舗", "item_type": "ComboBox"},
+        {"item_name": "集計単位", "item_type": "ComboBox"},
+        {"item_name": "別の選択欄", "item_type": "ComboBox"},
+        {"item_name": "空欄項目も表示", "item_type": "Checkbox"},
+        {"item_name": "表示", "item_type": "Button"},
+        {"item_name": "未設定の項目", "item_type": "Label"},
+        {"item_name": "手書きの項目", "item_type": "Label", "initial_value": "手書き"},
+    ]}
+    events = [{"event_code": "EV00", "content": "初期表示の概要"}, {"event_code": "EV01", "content": ""}]
+    dbs = [{"id": "db_op_a", "api_endpoint": {"action": "list_a"}},
+           {"id": "db_op_b", "api_endpoint": {"action": "list_b"}},
+           {"id": "db_op_c", "api_endpoint": {"action": "list_c"}}]
+
+    got = build_initialization(events, screen, dbs, drafts)
+    vals = {i["item_name"]: i["initial_value"] for i in got["items"]}
+    want = {"集計開始日": "当月1日(UTC+9時間基準)", "店舗": "- 全店 -", "集計単位": "レジ別（現行と同じ）",
+            "別の選択欄": "shop", "空欄項目も表示": "false", "未設定の項目": "Blank", "手書きの項目": "手書き"}
+    if vals != want:
+        print(f"[selftest NG] initial_value {vals}")
+        return 1
+    if got["db_operations_ref"] != ["db_op_a", "db_op_b"]:
+        print(f"[selftest NG] db_operations_ref {got['db_operations_ref']}")
+        return 1
+    # 下書きが無いときは従来どおり Blank（既存値の項目を除く）と空の参照になる
+    bare = build_initialization(events, screen, dbs, [])
+    if {i["item_name"]: i["initial_value"] for i in bare["items"]}["集計単位"] != "Blank" or bare["db_operations_ref"] != []:
+        print("[selftest NG] 下書き無しの初期処理")
+        return 1
+    print("[selftest OK] merge_partials.initialization")
+    return 0
+
+
 def main():
     # --help / -h は機能名ではなく使い方の要求。FEATURE_NAME に入ると screen_config 読込で落ちるため先に返す。
     #   接続: 第1引数の判定だけ。機能名の解決（モジュール先頭）は変えない。
@@ -198,6 +355,9 @@ def main():
         print("usage: merge_partials.py [機能名] [--compose-units]  (機能名省略時は環境変数 FEATURE_NAME)")
         print("  --compose-units: _unit_*.json を検査して partial 4本へ合成するだけで終わる（委譲の単位の流れ）")
         return
+    # --selftest: 組込みの検査だけ走らせる（partial・機能名は不要。機能名の解決は先頭で済んでいて、ここでは使わない）
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(_selftest_initialization())
     if "--compose-units" in sys.argv[1:]:
         sys.exit(compose_units())
     se = load_partial("screen_events")
@@ -276,7 +436,7 @@ def main():
     }
 
     # initialization と event_processes は本スクリプトで最小テンプレ生成
-    initialization = build_initialization(events, screen_layout)
+    initialization = build_initialization(events, screen_layout, db_operations)
     event_processes = build_event_processes(events, db_operations)
     apply_unit_details(event_processes, se.get("event_processes"))
 
