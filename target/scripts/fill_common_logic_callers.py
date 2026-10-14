@@ -20,7 +20,10 @@ runs_on が「サーバー」「データベース」を含む行は、結んだ
       (backend 下書きの logic_candidates)の name か text が実在する
   (b) BE のソースが python で、共通ロジックの出典の行に重なるモジュール直下の名前(定数・関数・クラス)を、
       BE の関数から同じモジュール内の参照を推移で辿って使っている(_module_reach)
-どちらも判らないとき(下書き候補も出典の定義も無い)だけ、従来どおり FR の BE を全部足し、WARN を1行出す。
+どちらも判らないとき(下書き候補も出典の定義も無い。ただし src はある)だけ、従来どおり FR の BE を全部足し、WARN を1行出す。
+src が1件も無い CL には BE を足さず WARN を出す(round13 W3。src は S1 が必ず書き、verify_partials が止める)。
+runs_on が「ブラウザ」の CL は、src の関数・定数を TSX で使う箇所(useMemo の依存・state を変えるイベント・CSV の
+起点のイベント)から呼出元の FR を引く(_front_callers。react 下書き <機能名>_react_draft.json を読む)。
 WHY: 候補が無くても、定数や補助関数の参照で BE を絞れる。候補と行が重ならない共通ロジックで「全部足す」に
 倒れると、別の BE まで呼出元に入る(run10 の CL4・CL5 は BE1 が誤って入っていた)。
 WHY: サーバー・DB で動くロジックは、呼ぶ FR が呼ぶ BE の中で動くため、呼出元の鎖として BE も示す。
@@ -296,10 +299,178 @@ def _name_of_api(tok, idx):
     return idx["be_name"].get(bid) or tok
 
 
-def fill(data, pnames, log, draft=None):
-    """common_logic[] の used_by_processes_ids を埋める。draft は backend 下書き(logic_candidates・apis)。
+# ---- round13 W3: 画面(ブラウザ)で動く共通ロジックの呼出元を、TSX の使用箇所から機械で引く ----
+# WHY: S1 が書く used_in は画面で動く関数の呼出元を取りこぼす(関数が useMemo の中で使われ、その結果が
+# 別の state の変化で変わる、という鎖を S1 は辿らない)。事実は react 下書き(events・failure_effects・
+# derived_arrays・csv_exports・state_initials)と TSX の行だけで、画面名・関数名は決め打ちしない。
+_FRONT_EXT = (".tsx", ".jsx", ".ts", ".js")
+_RE_TOP_FUNC = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)")
+_RE_TOP_CONST = re.compile(r"^(?:export\s+)?const\s+(\w+)\s*=")
+_RE_MEMO_DECL = re.compile(r"^\s*(?:const|let)\s+(\w+)\s*=\s*use(?:Memo|Callback)\(")
+_RE_MEMO_DEPS = re.compile(r"\[([^\[\]]*)\]\s*\)\s*;?\s*$")
+
+
+def _word_in(name, line):
+    """行に識別子 name が単語として現れるか。"""
+    return re.search(r"(?<![A-Za-z0-9_$])" + re.escape(name) + r"(?![A-Za-z0-9_$])", line) is not None
+
+
+def _top_blocks(lines):
+    """モジュール直下の宣言ごとの行範囲(1始まり)と宣言名。次の「行頭が英字・/ の行」までを1ブロックとする。"""
+    starts = [i for i, ln in enumerate(lines) if ln[:1].isalpha() or ln.startswith("//")]
+    blocks = []
+    for k, s in enumerate(starts):
+        e = (starts[k + 1] - 1) if k + 1 < len(starts) else len(lines) - 1
+        m = _RE_TOP_FUNC.match(lines[s]) or _RE_TOP_CONST.match(lines[s])
+        blocks.append({"start": s + 1, "end": e + 1, "name": m.group(1) if m else None})
+    return blocks
+
+
+def _memo_regions(lines):
+    """useMemo / useCallback の宣言ごとに、行範囲(1始まり)・変数名・依存の名前を取る。
+    依存の配列は、宣言の行から30行先までで「, [deps])」で終わる最初の行から読む。"""
+    out = []
+    for i, ln in enumerate(lines):
+        m = _RE_MEMO_DECL.match(ln)
+        if not m:
+            continue
+        for j in range(i, min(i + 30, len(lines))):
+            d = _RE_MEMO_DEPS.search(lines[j])
+            if d:
+                deps = [x.strip() for x in d.group(1).split(",") if x.strip()]
+                out.append({"start": i + 1, "end": j + 1, "name": m.group(1), "deps": deps})
+                break
+    return out
+
+
+def _front_callers(cl, data, react_draft, idx, cache=None):
+    """ブラウザで動く CL の呼出元の FR の ID を返す(新しく足せるものだけでなく、辿れた全部。重複の除去は呼出側)。
+    1. CL の src の行にあるモジュール直下の宣言(function / const)と useMemo の変数を defs にする
+    2. 同じファイルで defs を参照する行を探し、useMemo の中なら変数を defs に足し(推移)、依存を state に引き直す
+    3. 参照の行がイベントの範囲(events[].src・csv_exports[].src)に入れば、そのイベントを呼出元にする
+    4. 依存の state を変えるイベント(failure_effects の on_success・ハンドラの set<State>( )も呼出元にする
+    5. event_code → idx の ev_to_name → fr_by_name で FR の ID に写す
+    react 下書きが無い・src に画面のファイルが無いときは空。"""
+    if not react_draft:
+        return []
+    cache = {} if cache is None else cache
+    events = react_draft.get("events") or []  # fallback-ok: 下書きに欄が無ければ何も辿らない
+    states = {s.get("state"): s for s in (react_draft.get("state_initials") or []) if s.get("state")}  # fallback-ok: 同上
+    derived = {d.get("name"): d.get("source") for d in (react_draft.get("derived_arrays") or []) if d.get("name")}  # fallback-ok: 同上
+    ev_codes = []
+
+    def add_ev(code):
+        if code and code not in ev_codes:
+            ev_codes.append(code)
+
+    dep_states = set()
+
+    def resolve_state(name, memos, seen):
+        """依存の名前を state に引き直す。派生配列は source へ、別の useMemo はその依存へ辿る。"""
+        if name in seen:
+            return
+        seen.add(name)
+        if name in states:
+            dep_states.add(name)
+        elif name in derived:
+            resolve_state(derived[name], memos, seen)
+        elif name in memos:
+            for d in memos[name]["deps"]:
+                resolve_state(d, memos, seen)
+
+    for s in cl.get("src") or []:
+        f = s.get("file") or ""  # fallback-ok: file が無い出典は読めないので飛ばす
+        if not f.endswith(_FRONT_EXT):
+            continue
+        if f not in cache:
+            try:
+                cache[f] = Path(f).read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                cache[f] = None
+        lines = cache[f]
+        if not lines:
+            continue
+        blocks = _top_blocks(lines)
+        memo_list = _memo_regions(lines)
+        memos = {m["name"]: m for m in memo_list}
+        ls, le = s.get("line_start", 0), s.get("line_end", 0)  # fallback-ok: 行番号が欠けた出典は範囲が空
+        defs = []
+        for n in range(max(ls, 1), min(le, len(lines)) + 1):
+            m = _RE_TOP_FUNC.match(lines[n - 1]) or _RE_TOP_CONST.match(lines[n - 1]) or _RE_MEMO_DECL.match(lines[n - 1])
+            if m and m.group(1) not in defs:
+                defs.append(m.group(1))
+        # 出典が宣言の途中の行だけのときは、その行を含むブロックの名前も defs にする
+        for b in blocks:
+            if b["name"] and b["start"] <= le and ls <= b["end"] and b["name"] not in defs:
+                defs.append(b["name"])
+        # 出典の行を含む useMemo の変数も defs
+        for m in memo_list:
+            if m["start"] <= le and ls <= m["end"] and m["name"] not in defs:
+                defs.append(m["name"])
+        # イベントの範囲(行 → event_code)
+        ev_ranges = []
+        for ev in events:
+            for r in ev.get("src") or []:
+                if _same_file(r.get("file"), f):
+                    ev_ranges.append((r.get("line_start", 0), r.get("line_end", 0), ev.get("event_code")))  # fallback-ok: 行欠けは範囲が空
+        for ce in react_draft.get("csv_exports") or []:  # fallback-ok: 欄が無ければ辿らない
+            for r in ce.get("src") or []:
+                if _same_file(r.get("file"), f):
+                    for code in ce.get("trigger_events") or []:  # fallback-ok: 起点のイベントが無ければ足さない
+                        ev_ranges.append((r.get("line_start", 0), r.get("line_end", 0), code))  # fallback-ok: 同上
+        done, todo = set(), list(defs)
+        while todo:
+            name = todo.pop()
+            if name in done:
+                continue
+            done.add(name)
+            own = {(b["start"], b["end"]) for b in blocks if b["name"] == name}
+            own |= {(m["start"], m["end"]) for m in memo_list if m["name"] == name}
+            if name in memos:
+                for d in memos[name]["deps"]:
+                    resolve_state(d, memos, set())
+            for n, ln in enumerate(lines, 1):
+                if not _word_in(name, ln) or any(a <= n <= b for a, b in own):
+                    continue
+                for a, b, code in ev_ranges:
+                    if a <= n <= b:
+                        add_ev(code)
+                inner = [m for m in memo_list if m["start"] <= n <= m["end"]]
+                if inner:
+                    m = inner[-1]
+                    todo.append(m["name"])
+                    for d in m["deps"]:
+                        resolve_state(d, memos, set())
+                else:
+                    blk = [b for b in blocks if b["start"] <= n <= b["end"] and b["name"]]
+                    if blk and blk[0]["name"] not in done:
+                        # 別の直下の関数・定数の中で使われる(補助関数の連鎖)。コンポーネントなら参照先が無く止まる
+                        todo.append(blk[0]["name"])
+    # 4. 依存の state を変えるイベント
+    for fe in react_draft.get("failure_effects") or []:  # fallback-ok: 欄が無ければ足さない
+        if any(st in (fe.get("on_success") or []) for st in dep_states):
+            add_ev(fe.get("event"))
+    for ev in events:
+        handler = (ev.get("source") or {}).get("handler") or ""  # fallback-ok: handler が無いイベントは setter を呼ばない扱い
+        for st in dep_states:
+            setter = (states.get(st) or {}).get("setter")
+            if setter and re.search(r"(?<![A-Za-z0-9_$])" + re.escape(setter) + r"\(", handler):
+                add_ev(ev.get("event_code"))
+    out = []
+    for code in ev_codes:
+        pname = idx["ev_to_name"].get(code)
+        for fid in idx["fr_by_name"].get(pname, []) if pname else []:
+            if fid not in out:
+                out.append(fid)
+    return out
+
+
+def fill(data, pnames, log, draft=None, react_draft=None):
+    """common_logic[] の used_by_processes_ids を埋める。draft は backend 下書き(logic_candidates・apis)、
+    react_draft は react 下書き(ブラウザで動く CL の呼出元を引く。無ければ引かない)。
     結べなかった語は log に WARN を積む。"""
     idx = build_index(data, pnames)
+    front_cache = {}
     # fallback-ok: 下書きが無いときは候補も本文も無い扱い(呼ぶ BE を絞れないので WARN が出る)
     draft = draft or {}
     cands = draft.get("logic_candidates") or []  # fallback-ok: 同上
@@ -323,7 +494,15 @@ def fill(data, pnames, log, draft=None):
         # WHY: サーバー・DB で動くロジックは、結んだ FR が呼ぶ BE の中でも動く。BE も呼出元の鎖に入れる。
         # ただし FR の BE の全部ではなく、BE の本文に共通ロジックの手掛かりがあるものだけ入れる。
         ro = cl.get("runs_on") or cl.get("runtime_location") or ""  # fallback-ok: 既存の判定と同じ(動作場所が無ければ対象外)
-        if "サーバー" in ro or "データベース" in ro:
+        if "ブラウザ" in ro:
+            # WHY(round13 W3): 画面で動く CL は、TSX の使用箇所・useMemo の依存・state を変えるイベントから FR を引く。
+            # S1 の語(used_in)は消さず、辿れた FR を足すだけ。
+            resolved += _front_callers(cl, data, react_draft, idx, front_cache)
+        if ("サーバー" in ro or "データベース" in ro) and not cl.get("src"):
+            # WHY(round13 W3): src が無いと呼ぶ BE を絞れず、全部足す退避で別の BE まで入る(run12 の新7')。
+            # src は S1 が必ず書く(verify_partials が止める)ので、無いものには BE を足さない。
+            log.append(f"[WARN] common_logic「{cl.get('name')}」は src が無いので呼ぶ BE を絞れない(BE を足さない)")
+        elif "サーバー" in ro or "データベース" in ro:
             keys = _keys_of_common(cl, cands)
             fallback_used = False
             for rid in list(resolved):
@@ -416,10 +595,11 @@ def selftest():
         fill(data, pn, log, draft)
         cl = {c["name"]: c for c in data["common_logic"]}
         assert cl["A"]["used_by_processes_ids"] == ["FR1"], cl["A"]
+        # round13 W3: src が無いサーバー・DB の CL には BE を足さない(E)。B は語 list_report が BE2 に直接結ぶので従来どおり
         assert cl["B"]["used_by_processes_ids"] == ["BE2", "FR2"], cl["B"]
         assert cl["C"]["used_by_processes_ids"] == [], cl["C"]
         assert cl["D"]["used_by_processes_ids"] == ["FR9", "FR2"], cl["D"]
-        assert cl["E"]["used_by_processes_ids"] == ["FR1", "BE1"], cl["E"]
+        assert cl["E"]["used_by_processes_ids"] == ["FR1"], cl["E"]
         assert cl["F"]["used_by_processes_ids"] == ["BE1", "FR1"], cl["F"]
         assert cl["F"]["used_by_processes"] == ["店舗一覧", "初期表示"], "API 名が BE の name に直っていない"
         assert cl["CL_A"]["used_by_processes_ids"] == ["FR2", "FR1", "BE2"], cl["CL_A"]
@@ -428,7 +608,7 @@ def selftest():
         assert cl["CL_D"]["used_by_processes_ids"] == ["FR2", "BE2"], cl["CL_D"]
         assert cl["CL_E"]["used_by_processes_ids"] == ["FR3", "BE3"], cl["CL_E"]
         assert not any("CL_E" in m or "別の画面" in m for m in log), log
-        # WARN: C は結べない語(1件)。B・E・CL_D は候補と行が重ならず絞れない(各1件)。計4件
+        # WARN: C は結べない語(1件)。B・E は src が無く BE を足さない(各1件)。CL_D は候補と行が重ならず絞れない(1件)。計4件
         assert len(log) == 4, log
         assert sum("どこにも無い" in m for m in log) == 1, log
         assert sum("絞れない" in m for m in log) == 3, log
@@ -437,7 +617,65 @@ def selftest():
         log2 = []
         fill(data, pn, log2, draft)
         assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before and len(log2) == 4, log2
+    _selftest_front()
     print("[selftest OK] fill_common_logic_callers")
+
+
+def _selftest_front():
+    """round13 W3: ブラウザで動く CL の呼出元(TSX の useMemo の依存と state を変えるイベント)。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "Page.tsx"
+        tsx.write_text("\n".join([
+            "function sumX(list) {",                                   # 1
+            "  return list.length;",                                   # 2
+            "}",                                                       # 3
+            "",                                                        # 4
+            "export default function Page() {",                        # 5
+            "  const aggs = useMemo(() => rows.map(toAgg), [rows]);",  # 6
+            "  const total = useMemo(() => sumX(aggs), [aggs]);",      # 7
+            "  const exportCsv = () => {",                             # 8
+            "    return total;",                                       # 9
+            "  };",                                                    # 10
+            "  const x = 1;",                                          # 11
+            "}",                                                       # 12
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+        rd = {
+            "state_initials": [{"state": "rows", "setter": "setRows"}, {"state": "show", "setter": "setShow"}],
+            "derived_arrays": [{"name": "aggs", "source": "rows"}],
+            "events": [
+                {"event_code": "EV00", "source": {"handler": "useEffect"}, "src": [{"file": f, "line_start": 20, "line_end": 20}]},
+                {"event_code": "EV01", "source": {"handler": "(e) => setRows(x)"}, "src": [{"file": f, "line_start": 21, "line_end": 21}]},
+                {"event_code": "EV05", "source": {"handler": "(e) => setRows(y)"}, "src": [{"file": f, "line_start": 22, "line_end": 22}]},
+                {"event_code": "EV06", "source": {"handler": "(e) => setShow(!x)"}, "src": [{"file": f, "line_start": 23, "line_end": 23}]},
+                {"event_code": "EV07", "source": {"handler": "exportCsv"}, "src": [{"file": f, "line_start": 24, "line_end": 24}]},
+            ],
+            "failure_effects": [{"event": "EV00", "call": "fetchX", "on_success": ["rows"]}],
+            "csv_exports": [{"function": "exportCsv", "trigger_events": ["EV07"], "src": [{"file": f, "line_start": 8, "line_end": 10}]}],
+        }
+        names = ["初期", "送信", "切替", "表示切替", "CSV"]
+        data = {
+            "events": [{"no": c, "event_code": c} for c in ("EV00", "EV01", "EV05", "EV06", "EV07")],
+            "front_processes": [{"process_id": f"FR{i + 1}", "name": n, "steps": []} for i, n in enumerate(names)],
+            "backend_processes": [],
+            "common_logic": [
+                {"name": "T", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 1, "line_end": 3}]},
+            ],
+        }
+        pn = {"EV00": "初期", "EV01": "送信", "EV05": "切替", "EV06": "表示切替", "EV07": "CSV"}
+        log = []
+        fill(data, pn, log, {}, rd)
+        got = data["common_logic"][0]["used_by_processes_ids"]
+        # rows を変える EV00(on_success)・EV01・EV05(setRows)と CSV の EV07。無関係の setShow の EV06 は入らない
+        assert sorted(got) == ["FR1", "FR2", "FR3", "FR5"], got
+        assert "FR4" not in got, got
+        # react 下書きが無いときは何も足さない
+        data2 = json.loads(json.dumps(data))
+        data2["common_logic"][0]["used_by_processes_ids"] = []
+        fill(data2, pn, [], {}, None)
+        assert data2["common_logic"][0]["used_by_processes_ids"] == [], data2["common_logic"][0]
+    print("[selftest OK] fill_common_logic_callers front")
 
 
 def main():
@@ -451,9 +689,12 @@ def main():
         return 1
     draft_path = INTERMEDIATE_DIR / f"{feat}_backend_draft.json"
     draft = json.loads(draft_path.read_text(encoding="utf-8")) if draft_path.exists() else {}
+    # WHY(round13 W3): ブラウザで動く CL の呼出元は react 下書き(events・derived_arrays 等)から引く。無ければ引かない。
+    react_path = INTERMEDIATE_DIR / f"{feat}_react_draft.json"
+    react_draft = json.loads(react_path.read_text(encoding="utf-8")) if react_path.exists() else {}
     data = json.loads(path.read_text(encoding="utf-8"))
     log = []
-    fill(data, get_process_names_by_event_code(feat), log, draft)
+    fill(data, get_process_names_by_event_code(feat), log, draft, react_draft)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     for line in log:
         print(line, file=sys.stderr)
