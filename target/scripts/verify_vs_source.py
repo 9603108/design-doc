@@ -41,6 +41,160 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip().rstrip("。").strip()
 
 
+class _Pat:
+    """テンプレートリテラル・JSX の式の並びを、固定部分は字面・穴({…} や ${…})は任意の値とみなす正規表現にしたもの。
+    WHY: 穴で割った断片だけを集めると、穴をまたぐ語順(「（レジ2）： 」など)が照合できず、正しい表示まで WARN になる。"""
+    __slots__ = ("text", "rx")
+
+    def __init__(self, text, rx):
+        self.text, self.rx = text, rx
+
+    def __hash__(self):
+        return hash(("pat", self.text))
+
+    def __eq__(self, other):
+        return isinstance(other, _Pat) and other.text == self.text
+
+
+def _skip_quoted(text, j):
+    """text[j] の引用符が閉じる位置の次を返す。TSX の文字列は1行なので改行で止める。"""
+    q, k = text[j], j + 1
+    while k < len(text) and text[k] != q and text[k] != "\n":
+        k += 2 if text[k] == "\\" else 1
+    return k + 1
+
+
+def _read_template(text, i):
+    """text[i] の ` で始まるテンプレートリテラルの中身(${…} を含む生の文字列)と、閉じた次の位置を返す。"""
+    j, out = i + 1, []
+    while j < len(text):
+        c = text[j]
+        if c == "\\":
+            out.append(text[j:j + 2])
+            j += 2
+        elif c == "`":
+            return "".join(out), j + 1
+        elif text.startswith("${", j):
+            end = _skip_expr(text, j + 2)
+            out.append(text[j:end])
+            j = end
+        else:
+            out.append(c)
+            j += 1
+    return "".join(out), j
+
+
+def _skip_expr(text, j):
+    """{ や ${ の直後の位置 j から、対応する } の次の位置を返す。文字列と入れ子の `…` は飛ばす。
+    WHY: 式の中の { } を数えないと、JSX の式の並びの終わりを誤る(「{r.reji_no ? `（レジ${r.reji_no}）` : ''}」は入れ子の { } を持つ)。"""
+    depth = 1
+    while j < len(text):
+        c = text[j]
+        if c in "\"'":
+            j = _skip_quoted(text, j)
+            continue
+        if c == "`":
+            _, j = _read_template(text, j)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return j
+
+
+def _split(text, dollar):
+    """穴で区切った固定部分の列(穴の数は len(戻り値) - 1)。dollar=True は ${…}(テンプレート)、False は {…}(JSX の式)。"""
+    parts, buf, j = [], [], 0
+    while j < len(text):
+        if (dollar and text.startswith("${", j)) or (not dollar and text[j] == "{"):
+            parts.append("".join(buf))
+            buf = []
+            j = _skip_expr(text, j + (2 if dollar else 1))
+        else:
+            buf.append(text[j])
+            j += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _jsx_runs(text):
+    """TSX の JSX の文言の並び(タグの > と次の < の間)を、式の { … } を含む生の文字列で返す。
+    WHY: _JSX_TEXT の正規表現は式の中の { } で切れるので、入れ子の式を含む文言は別の方法で拾う。"""
+    runs, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] != ">":
+            i += 1
+            continue
+        j, buf = i + 1, []
+        while j < n and text[j] != "<":
+            if text[j] == "{":
+                end = _skip_expr(text, j + 1)
+                buf.append(text[j:end])
+                j = end
+            else:
+                buf.append(text[j])
+                j += 1
+        runs.append("".join(buf))
+        i = j
+    return runs
+
+
+def _lit_rx(s):
+    """固定部分の字面を正規表現にする。空白の違いは \\s* で吸収する(JSX の改行・インデントは norm で潰れるため)。"""
+    return r"\s*".join(re.escape(p) for p in re.split(r"\s+", s))
+
+
+def _make_pat(text, parts):
+    """固定部分の列から _Pat を作る。固定部分の字(空白を除く)が無いもの(穴だけ)は作らない。
+    WHY: 穴だけの文言({error} など)は何にでも当たるため。値がまるごと実行時に決まる項目は check_examples が別に通す。"""
+    if not "".join(re.sub(r"\s+", "", p) for p in parts):
+        return None
+    return _Pat(text, re.compile(".*?".join(_lit_rx(p) for p in parts), re.S))
+
+
+def _patterns(text):
+    """TSX の文字列から、テンプレートリテラル(${…})と JSX の式の並び({…})を _Pat の列にする。"""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] != "`":
+            i += 1
+            continue
+        body, i = _read_template(text, i)
+        out.append(_make_pat(body, _split(body, True)))
+    out += [_make_pat(run, _split(run, False)) for run in _jsx_runs(text) if "{" in run]
+    return [p for p in out if p is not None]
+
+
+def _pat_hit(text, strings):
+    """text(正規化済みの生の文字列)が、ソースのテンプレート・JSX の式の並びの正規表現のどれかに当たるか。呼出元: _in_source・_example_in_source。"""
+    return any(s.rx.search(text) for s in strings if isinstance(s, _Pat))
+
+
+def _src_body(src):
+    """出典(file・line_start・line_end。1 始まり)の範囲の本文。読めなければ None。"""
+    try:
+        lines = Path(src["file"]).read_text(encoding="utf-8").splitlines()
+        return "\n".join(lines[src["line_start"] - 1:src["line_end"]])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _wholly_runtime(src):
+    """項目の出典の本文に、固定の字面が1つも無く式({error} など)だけで出る文言があるか。
+    WHY: String(e) のように値がそのまま実行時に決まる要素は、例示の字面を照合しても意味が無いので、例示の形を問わず通す。
+    呼出元: check_examples。出典が読めないときは False(照合する)。"""
+    for s in src or []:
+        body = _src_body(s) if isinstance(s, dict) else None
+        for run in _jsx_runs(body or ""):
+            if "{" in run and not re.sub(r"\s+", "", "".join(_split(run, False))):
+                return True
+    return False
+
+
 def collect_source_strings(files):
     """files(Path の列)の文字列を正規化して返す(set)。読めない・構文が壊れたファイルは飛ばす。
     Python は ast の Constant(str)と JoinedStr の定数部、TSX/TS は引用符・テンプレートの定数部・JSX の文言。"""
@@ -68,6 +222,8 @@ def collect_source_strings(files):
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(text))
             # WHY: <strong>や<code>の境界で文が切れている(「<strong>取込欠損の疑い</strong>：…」)ので、インライン要素のタグを外した版からも文を取る
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(_INLINE_TAG.sub("", text)))
+            # WHY: テンプレートと式の並びは、字面を穴で割った断片に加えて、穴を任意の値とみなす正規表現(_Pat)としても持つ
+            out.update(_patterns(_INLINE_TAG.sub("", text)))
     out.discard("")
     return out
 
@@ -103,10 +259,13 @@ def _in_source(text, strings):
     """text(正規化済み)がソースのどれかの文字列に含まれるか。{key} などの穴は、穴の間の定数部がどれかの文字列に
     全部含まれるかで見る(穴の中身は実行時に決まるため)。"""
     chunks = [c.strip() for c in _HOLE.split(text) if len(c.strip()) >= 2]
-    if not chunks or any(all(c in s for c in chunks) for s in strings):
+    lits = [s for s in strings if isinstance(s, str)]
+    if not chunks or any(all(c in s for c in chunks) for s in lits):
+        return True
+    if _pat_hit(text, strings):
         return True
     # 展開済みの文言(例 shop_id は正の整数で指定してください)は、穴({_})を持つソースの f-string の型文に当てはまれば実在とみなす
-    return any("{_}" in s and len("".join(s.split("{_}")).strip()) >= 2 and re.search("(?:.+?)".join(re.escape(p) for p in s.split("{_}")), text) for s in strings)
+    return any("{_}" in s and len("".join(s.split("{_}")).strip()) >= 2 and re.search("(?:.+?)".join(re.escape(p) for p in s.split("{_}")), text) for s in lits)
 
 
 def check_messages(data, strings):
@@ -134,13 +293,17 @@ def _example_in_source(text, strings):
     WHY: 例示値は実データの一例で、書式に合う数字まで字面で照合すると、正しい書式の例示が WARN になる(POS 会計レポートの S1 で発生)。
     呼出元: check_examples(verify_partials.check_examples も同じ関数を呼ぶので、両検査の基準は揃う)。"""
     # WHY: 「3 点 / 4,500 円」のように区切った例示は、区切りごとに別々に照合する。画面では点と円が別のセルに出るので、ソースも別々の文字列を持つ
-    return all(_in_source(_EX_NUMBER.sub("{_}", part), strings) for part in norm(text).split(" / "))
+    whole = norm(text)
+    # WHY: 穴をまたぐ例示(「横浜店（レジ2）： 2026-10-05 / 2026-10-09」)は、 / で割る前に式の並びの正規表現で見る(割ると「：」の前後の穴が別々になる)
+    if _pat_hit(whole, strings):
+        return True
+    return all(_pat_hit(part, strings) or _in_source(_EX_NUMBER.sub("{_}", part), strings) for part in whole.split(" / "))
 
 
 def check_examples(items, strings):
     """S1 の screen_layout.items[].example が、ソースの文字列に実在するか(D1 後半)。"""
     return [f"[WARN] [例示値] screen_layout.items[{i.get('item_name')}]: example「{i['example']}」がソースの文字列に無い → 差し戻し先 S1"
-            for i in items if isinstance(i, dict) and i.get("example") and not _example_in_source(norm(str(i["example"])), strings)]
+            for i in items if isinstance(i, dict) and i.get("example") and not _wholly_runtime(i.get("src")) and not _example_in_source(norm(str(i["example"])), strings)]
 
 
 def _name_variants(names):
@@ -235,6 +398,12 @@ def _overlap(a, b):
                for x in a or [] for y in b or [])
 
 
+def _within(a, b):
+    """b の行範囲のどれかが、a の行範囲のどれかの中に入るか(同じファイル)。呼出元: check_kinds(1)。"""
+    return any(x.get("file") == y.get("file") and x["line_start"] <= y["line_start"] and y["line_end"] <= x["line_end"]
+               for x in a or [] for y in b or [])
+
+
 def check_kinds(validations, front_processes, behaviors):
     """処理の種別の書き間違いを react 下書きの behaviors と突き合わせる(B5。ERROR)。
 
@@ -251,9 +420,11 @@ def check_kinds(validations, front_processes, behaviors):
         if want is None:
             continue
         text = " ".join(str(v.get(k) or "") for k in ("field", "rule", "applied_when"))
-        # WHY: 同じ行範囲で対になる behavior(src が重なる)を先に使う。字面(cond の一部の語)で拾うと、同じ語を含む別の表示用の行を誤って対にする(POS の VL5 は「s.dead」で表示用の行に当たった)
-        by_src = {b["kind"] for b in behaviors if _overlap(v.get("src"), b["src"] + b.get("control_src", []))}
-        got = by_src or {b["kind"] for b in behaviors if (len(b.get("target") or "") >= 2 and b["target"] in text) or (b.get("cond") and b["cond"] in text)}
+        # WHY: 行範囲の中にある behavior だけを候補にする。範囲の外の behavior(control_src だけが範囲に重なるもの)と結ぶと、別の処理の種別と食い違わせる(POS の VL16 は 216 行の表示切替なのに、範囲外の 282 行の活性切替と結ばれて ERROR になった)
+        if v.get("src"):
+            got = {b["kind"] for b in behaviors if _within(v.get("src"), b["src"])}
+        else:
+            got = {b["kind"] for b in behaviors if (len(b.get("target") or "") >= 2 and b["target"] in text) or (b.get("cond") and b["cond"] in text)}
         where = f"validations[{v.get('no') or v.get('field')}]"
         if want == "input_check" and not has_input:
             problems.append(f"[種別] {where}: kind=入力検査 だが画面のソースに入力検査(setError・throw・required 等)が無い → 差し戻し先 H4")
@@ -972,6 +1143,35 @@ def selftest():
     assert len(got) == 1 and "括弧書き" in got[0] and not got[0].startswith("[WARN]"), got
     got = check_items([], None, [{"specs": [{"label": "返品"}]}])
     assert len(got) == 1 and "返品" in got[0] and not got[0].startswith("[WARN]"), got
+    # 式の並び・テンプレート(_Pat): 穴は任意の値。固定部分の語順は照合する。入れ子のテンプレートも拾う
+    with tempfile.TemporaryDirectory() as d:
+        tsx2 = Path(d, "T.tsx")
+        tsx2.write_text("\n".join([
+            "const sub = `${applied.from} 〜 ${applied.to} / ${rows.length}${group === 'shop' ? '店舗' : 'レジ'}分`;",
+            "const hdr = `${r.shop_name}${r.reji_no ? ` / レジNO ${r.reji_no}` : ''} / ${applied.from} 〜 ${applied.to}（${r.days}日）`;",
+            "<li>",
+            "  {r.shop_name}",
+            "  {r.reji_no ? `（レジ${r.reji_no}）` : ''}： {r.warn_dates.join(' / ')}",
+            "</li>",
+            "{error && <div className='error-note'>{error}</div>}",
+            "<span>読込中…</span>",
+        ]), encoding="utf-8")
+        ps = collect_source_strings([tsx2])
+        assert _example_in_source("2026-10-01 〜 2026-10-14 / 3レジ分", ps), "合計カードの副題の形を通さない"
+        assert _example_in_source("横浜店（レジ2）： 2026-10-05 / 2026-10-09", ps), "式の並びの形を通さない"
+        assert _example_in_source("横浜店 / レジNO 1 / 2026-10-01 〜 2026-10-14（14日）", ps), "入れ子のテンプレートを通さない"
+        assert not _example_in_source("横浜店 / レジNO 1 / 2026-10-01 まで（14日）", ps), "語順の違う例示を通した"
+        line_at = lambda a, b: [{"file": str(tsx2), "line_start": a, "line_end": b}]
+        assert _wholly_runtime(line_at(7, 7)) and not _wholly_runtime(line_at(8, 8)), "まるごと実行時の判定が違う"
+        assert check_examples([{"item_name": "エラー表示", "example": "Error: Failed to fetch", "src": line_at(7, 7)}], ps) == [], "まるごと実行時の項目を WARN にした"
+        got = check_examples([{"item_name": "読込中表示", "example": "作り話の表示", "src": line_at(8, 8)}], ps)
+        assert len(got) == 1 and got[0].startswith("[WARN] [例示値]"), got
+    # 行範囲: 範囲の外の behavior(control_src だけが範囲に重なる)とは結ばない。範囲の中の表示切替に合う kind は通す
+    bh16 = [{"id": "BH16", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(216), "control_src": []},
+            {"id": "BH17", "kind": "enable_toggle", "cond": "!rows.length", "target": "", "src": sp(282), "control_src": sp(200, 232)}]
+    v16 = {"no": "VL16", "field": "CSV出力", "rule": "合計行の表示", "kind": "表示切替", "src": sp(200, 232)}
+    assert check_kinds([v16], [], bh16) == [], check_kinds([v16], [], bh16)
+    assert len(check_kinds([dict(v16, kind="活性切替")], [], bh16)) == 1, "表示切替と活性切替の食い違いを拾わない"
     print("selftest OK")
     return 0
 
