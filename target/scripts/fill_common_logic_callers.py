@@ -553,6 +553,10 @@ def fill(data, pnames, log, draft=None, react_draft=None):
         if "ブラウザ" in ro:
             # WHY(round13 W3): 画面で動く CL は、TSX の使用箇所・useMemo の依存・state を変えるイベントから FR を引く。
             # S1 の語(used_in)は消さず、辿れた FR を足すだけ。
+            # WHY(round13 W3): src が無いと画面の呼出元を引けず、_front_callers は黙って空を返す(呼出元が S1 の語だけになる)。
+            # サーバー・DB の CL と同じく WARN で知らせる。呼出元の値は変えない。
+            if not cl.get("src"):
+                log.append(f"[WARN] common_logic「{cl.get('name')}」は src が無いので画面の呼出元を引けない(呼出元の値は S1 の語のまま)")
             resolved += _front_callers(cl, data, react_draft, idx, front_cache)
         if ("サーバー" in ro or "データベース" in ro) and not cl.get("src"):
             # WHY(round13 W3): src が無いと呼ぶ BE を絞れず、全部足す退避で別の BE まで入る(run12 の新7')。
@@ -664,15 +668,19 @@ def selftest():
         assert cl["CL_D"]["used_by_processes_ids"] == ["FR2", "BE2"], cl["CL_D"]
         assert cl["CL_E"]["used_by_processes_ids"] == ["FR3", "BE3"], cl["CL_E"]
         assert not any("CL_E" in m or "別の画面" in m for m in log), log
-        # WARN: C は結べない語(1件)。B・E は src が無く BE を足さない(各1件)。CL_D は候補と行が重ならず絞れない(1件)。計4件
-        assert len(log) == 4, log
+        # WARN: C は結べない語(1件)。B・E は src が無く BE を足さない(各1件)。CL_D は候補と行が重ならず絞れない(1件)。
+        # round(clwarn): ブラウザの CL で src が無い A・F は画面の呼出元を引けない WARN(各1件)。計6件
+        assert len(log) == 6, log
         assert sum("どこにも無い" in m for m in log) == 1, log
         assert sum("絞れない" in m for m in log) == 3, log
+        assert sum("画面の呼出元を引けない" in m for m in log) == 2, log
+        # WARN は画面の CL の A・F(src が無い方)にだけ出る
+        assert all("「A」" in m or "「F」" in m for m in log if "画面の呼出元" in m), log
         # 冪等: 2回目で結果が変わらず、WARN も増えない
         before = json.dumps(data, ensure_ascii=False, sort_keys=True)
         log2 = []
         fill(data, pn, log2, draft)
-        assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before and len(log2) == 4, log2
+        assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before and len(log2) == 6, log2
     _selftest_front()
     print("[selftest OK] fill_common_logic_callers")
 
