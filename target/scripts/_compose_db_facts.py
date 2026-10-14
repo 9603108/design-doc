@@ -38,23 +38,14 @@ def _load_drafts(directory):
 
 
 def _draft_op(drafts, op, log):
-    """db_operation に対応する下書きの (db_op, api) を返す。見つからない・曖昧なときは (None, None)。
-    WHY: 同じ action と id が複数の下書きにあると、どれの事実か決まらない。推測せず合成を止める。"""
-    action = (op.get("api_endpoint") or {}).get("action")  # fallback-ok: api_endpoint は任意。無ければ対応が取れないだけ
-    found = []
-    for d in drafts:
-        a = (d.get("apis") or {}).get(action) if action else None  # fallback-ok: 下書きの apis は任意
-        if not a:
-            continue
-        for dop in a.get("db_operations") or []:  # fallback-ok: 下書きの欄は任意(無ければ対応なし)
-            if dop.get("id") == op.get("id"):
-                found.append((dop, a))
-    if not found:
-        return None, None
-    if len(found) > 1:
-        log.append(f"WARN _compose_db_facts: {op.get('id')} の下書きが {len(found)} 件あり、合成しない")
-        return None, None
-    return found[0]
+    """db_operation に対応する下書きの (db_op, api) を返す。決まらないときは (None, None) と WARN を残す。
+    対応の鍵は _units.draft_db_op が一か所で決める(番号振りの前は id、後は legacy_id・action・表で結ぶ)。
+    WHY: 同じ id や action の下書きが複数あると、どれの事実か決まらない。推測せず合成を止める。"""
+    import _units  # 結び方を _units の1か所に置く。compose の中から呼ばれるので、読み込み順の循環は無い
+    dop, a, note = _units.draft_db_op(op, drafts)
+    if note:
+        log.append(f"WARN _compose_db_facts: {op.get('id')} {note}、合成しない")
+    return dop, a
 
 
 def _column_of(table, sources):
@@ -371,6 +362,8 @@ def selftest():
             ],
         }],
     }
+    import copy
+    raw = copy.deepcopy(out)  # 番号振りの後の形を作るため、合成の前の入力を残す
     log = []
     _compose_db(out, drafts, log)
     ln = out["logical_names"]
@@ -471,6 +464,16 @@ def selftest():
     got6 = [[(r["function"], r["target"]) for r in op["aggregate"]] for op in out6["db_operations"]]
     assert got6 == [[("max", "p.kai_date")], [("max", "kai_date")]], got6  # db_op_lq は主の SELECT にも同じ集計があるので残す
     assert any("副問い合わせ" in x and "max(kai_date)" in x for x in log6), log6
+    # 番号振りの後の id でも、番号振りの前と同じ事実が入る(WHY: 番号振り後は id が DB1 等になり、id の一致だけでは下書きに結べない)。
+    # 旧 id が legacy_id に残る形(id だけ番号)と、legacy_id が無い形(action の1件で結ぶ)の両方を見る。
+    strip = lambda o: {k: v for k, v in o.items() if k not in ("id", "legacy_id")}
+    for extra in ({"legacy_id": "db_op_list_x"}, {}):
+        num = copy.deepcopy(raw)
+        num["db_operations"][0].update({"id": "DB1", **extra})
+        _compose_db(num, drafts, [])
+        assert strip(num["db_operations"][0]) == strip(op), (extra, num["db_operations"][0], op)
+        assert num["logical_names"] == out["logical_names"], extra
+    print("[selftest OK] _compose_db_facts 番号振りの後の id でも同じ事実(legacy_id・action で結ぶ)")
     print("[selftest OK] _compose_db_facts F2 (副問い合わせの集計を外す・主の集計は残す)")
     print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
     print("[selftest OK] _compose_db_facts (B2: 物理列・when・句の論理名・(推定)・集計の別名・derived の除外)")

@@ -447,29 +447,63 @@ def _initial_text(si):
     return si.get("readable") or f"式: {raw}"
 
 
+def draft_db_op(op, drafts):
+    """合成の db_operations の行に対応する backend 下書きの db_operations の行を (下書きの行, API, 注記) で返す。決まらないときは (None, None, 注記)。
+    鍵はこの関数だけが決める。順に試し、推測しない:
+      1. 下書きの id が、行の id か legacy_id と一致する行が1件
+      2. 行の API の action が同じ下書きの行が1件だけ
+      3. action の行が複数のとき、行の dataset の物理表がすべて下書きの table_aliases の表に含まれる行が1件
+    WHY: 番号振り(apply_id_scheme)の前は行の id が下書きの id(db_op_…)と同じ。後は id が DB1 等になり、旧 id が legacy_id に残る。
+         どちらで呼ばれても同じ下書きに結ぶため、結び方を1か所に置く。_compose_db_facts もこの関数を使う。"""
+    keys = {k for k in (op.get("legacy_id"), op.get("id")) if k}  # fallback-ok: 番号振りの前は legacy_id が無い
+    ep = op.get("api_endpoint")  # fallback-ok: api_endpoint は任意。無ければ action で結べない
+    action = ep.get("action") if isinstance(ep, dict) else None  # fallback-ok: 同上
+    rows = []
+    for d in drafts:
+        for act, a in ((d.get("apis") or {}) if isinstance(d, dict) else {}).items():  # fallback-ok: 下書きの apis は任意
+            if not isinstance(a, dict):
+                continue
+            for dop in a.get("db_operations") or []:  # fallback-ok: 下書きの欄は任意
+                if isinstance(dop, dict):
+                    rows.append((act, dop, a))
+    by_id = [(dop, a) for _, dop, a in rows if dop.get("id") in keys]
+    if len(by_id) == 1:
+        return by_id[0][0], by_id[0][1], ""
+    if len(by_id) > 1:
+        return None, None, f"の下書きが id で {len(by_id)} 件あり、どれか決まらない"
+    if not action:
+        return None, None, ""
+    same = [(dop, a) for act, dop, a in rows if act == action]
+    if len(same) == 1:
+        return same[0][0], same[0][1], ""
+    if not same:
+        return None, None, ""
+    tables = {r.get("physical_table") for r in op.get("dataset") or [] if isinstance(r, dict) and r.get("physical_table")}  # fallback-ok: dataset は任意
+    hit = [(dop, a) for dop, a in same if tables and tables <= set((dop.get("table_aliases") or {}).values())]  # fallback-ok: 別名の無い下書きは表で結べない
+    if len(hit) == 1:
+        return hit[0][0], hit[0][1], ""
+    return None, None, f"の下書きが action {action} で {len(same)} 件あり、表で1件に決まらない"
+
+
 def _fill_db_op_facts(out):
-    """db_operations[].ctes・subqueries を、backend 下書きの apis[*].db_operations[] の事実(同じ id の行)で置き換える(F2)。
+    """db_operations[].ctes・subqueries を、backend 下書きの同じ db 操作の事実で置き換える(F2)。
     呼出元: compose(_fill_src の後)。意味合い: 副問い合わせ・CTE はソースの SQL を機械が分解した事実なので、単位(H2)の書き写しは使わない。
-    単位が書いた値は捨てる(差し戻さない。check_fragments が COMPOSED の欄を飛ばす)。下書きに同じ id の行が無いときは事実が無いので欄を外す。
-    WHY: 欄を外すのは、単位が書いた値が下書きに無い SQL の作り話を残さないため。事実で埋めるのを下書きの有無に任せると、無い下書きで作り話が残る。"""
+    単位が書いた値は捨てる(差し戻さない。check_fragments が COMPOSED の欄を飛ばす)。下書きで結べない行は事実が無いので欄を外す。
+    WHY: 欄を外すのは、単位が書いた値が下書きに無い SQL の作り話を残さないため。結び方は draft_db_op に任せ、番号振りの前後どちらでも同じ事実が入るようにする。"""
     from _config_loader import INTERMEDIATE_DIR
-    facts = {}
+    drafts = []
     for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
         try:
-            b = json.loads(p.read_text(encoding="utf-8"))
+            drafts.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             continue
-        for a in (b.get("apis") or {}).values():
-            for o in a.get("db_operations") or []:
-                if isinstance(o, dict) and o.get("id"):
-                    facts[o["id"]] = o
-    _set_db_op_facts(_rows(out, "db_operations"), facts)
+    _set_db_op_facts(_rows(out, "db_operations"), drafts)
 
 
-def _set_db_op_facts(rows, facts):
-    """rows の各行の ctes・subqueries を、facts(id → 下書きの db_operations の行)の値で置き換える。facts に無い id の欄は外す。"""
+def _set_db_op_facts(rows, drafts):
+    """rows の各行の ctes・subqueries を、draft_db_op で結んだ下書きの行の値で置き換える。結べない行の欄は外す。"""
     for r in rows:
-        f = facts.get(r.get("id"))
+        f, _, _ = draft_db_op(r, drafts)
         if f is None:
             r.pop("ctes", None)
             r.pop("subqueries", None)
@@ -967,6 +1001,37 @@ def _selftest_compose_facts():
     print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers")
 
 
+def _selftest_db_op_ids():
+    """番号振りの前(id が下書きの id)と後(id が DB1 等・旧 id が legacy_id)の両方で、下書きの ctes・subqueries が入ることを一時の下書きで確かめる。
+    同じ action の行が複数あるときは表で結ぶ。結べない行の欄は外す。"""
+    import tempfile
+    import _config_loader
+    draft = {"apis": {
+        "list_a": {"db_operations": [{"id": "db_op_list_a", "table_aliases": {"p": "pos"},
+                                      "ctes": [{"name": "c1"}], "subqueries": [{"definition": "SELECT 1"}]}]},
+        "list_b": {"db_operations": [{"id": "db_op_b1", "table_aliases": {"a": "t1"}, "ctes": [{"name": "x"}]},
+                                     {"id": "db_op_b2", "table_aliases": {"b": "t2"}, "ctes": [{"name": "y"}]}]}}}
+    rows = [{"id": "db_op_list_a", "api_endpoint": {"action": "list_a"}},
+            {"id": "DB1", "legacy_id": "db_op_list_a", "api_endpoint": {"action": "list_a"}},
+            {"id": "DB2", "api_endpoint": {"action": "list_b"}, "dataset": [{"physical_table": "t1"}]},
+            {"id": "DB3", "api_endpoint": {"action": "list_b"}, "dataset": [{"physical_table": "t2"}]},
+            {"id": "DB4", "api_endpoint": {"action": "list_b"}, "dataset": [{"physical_table": "t3"}]}]
+    out = {"db_operations": rows}
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_backend_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            _fill_db_op_facts(out)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    assert rows[0]["ctes"] == [{"name": "c1"}], rows[0]
+    assert rows[1]["ctes"] == [{"name": "c1"}] and rows[1]["subqueries"] == [{"definition": "SELECT 1"}], rows[1]
+    assert rows[2]["ctes"] == [{"name": "x"}] and rows[3]["ctes"] == [{"name": "y"}], (rows[2], rows[3])
+    assert "ctes" not in rows[4] and "subqueries" not in rows[4], rows[4]
+    print("[selftest OK] _units._fill_db_op_facts (番号振りの前後の id・action・表で結ぶ)")
+
+
 def _selftest_b0():
     """B0 の a)〜e) を一時の下書きと合成の欄で確かめる(フック・error_code・処理名の保持・[重複] の誤検出の除去)。"""
     import tempfile
@@ -1077,4 +1142,5 @@ if __name__ == "__main__":
     _selftest_b0()
     _selftest_initial_values()
     _selftest_compose_facts()
+    _selftest_db_op_ids()
     _selftest_message_text()

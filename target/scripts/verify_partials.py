@@ -788,7 +788,8 @@ def selftest_warn():
             {"id": "db_op_y", "subqueries": [{"definition": "作り話"}]}]
     facts = {"db_op_x": {"ctes": [{"name": "d", "definition": "SELECT 1", "from": "t", "filtered": True}],
                          "subqueries": [{"location": "WHERE", "definition": "SELECT max(d) FROM t", "filtered": False}]}}
-    _units._set_db_op_facts(rows, facts)
+    # 結び方は _units.draft_db_op(id・legacy_id・action・表)が一か所で決める。入力は下書きの形(apis[*].db_operations)で渡す
+    _units._set_db_op_facts(rows, [{"apis": {"x": {"db_operations": [{"id": k, **v} for k, v in facts.items()]}}}])
     assert rows[0]["subqueries"] == facts["db_op_x"]["subqueries"] and rows[0]["ctes"] == facts["db_op_x"]["ctes"], rows[0]
     assert "subqueries" not in rows[1] and "ctes" not in rows[1], rows[1]
     # B14 a): 括弧の中が DB・実行時 等のプレースホルダの例示値は ERROR。実値(横浜店・1,234 円)は通す
