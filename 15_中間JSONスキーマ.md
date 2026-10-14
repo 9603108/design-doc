@@ -31,6 +31,7 @@
 | v52 | `derived_processes[]` 新設（派生処理マーク）。`screen_layout.areas[].screen_no` に裏方領域パターン（`"0"`/`null`）新設。`dispatch[].derived_from` 新設 |
 | v53 | `db_operations[].api_endpoint.trigger_events`（event_code の配列。同じ action を複数イベントから呼ぶ多対一用。単数 `trigger_event` と併用可。`process_flows[]` の旧キーとは別物）を許容。`meta.frontend_files[]` は screen_config の `source_files` 指定時に HTML を介さず入る（`.tsx`/`.ts` は `kind: js`） |
 | v54 | Phase 1 の機械下書き `extract_react_draft.py`（React の画面だけ）を追加。出力は中間JSON本体ではなく下書きJSON（`target/intermediate/{機能名}_react_draft.json`）で、キーは `events[]`（`event_code` は EV00 = 初期表示〔マウント時に走る useEffect の呼出を集める〕、以降 EV01 形式の連番）/ `db_operations[].api_endpoint.{action, trigger_events}` / `event_processes[].{event_code, details}`（details の呼出の行は `db_operations` の並びに一致）/ `unresolved[{file, line, reason}]`。`unresolved` は下書きJSONだけのキーで、中間JSON本体には無い。merge 前の検査 `verify_partials.py` を追加（event_code の連番・`trigger_events` の参照先の実在・overview 30字以内・details の呼出の行の数と並びが `api_endpoint` と一致・trigger 文が `screen_name` で始まる）。下書きは `apply_react_draft.py` が partial（`--stage partial`: 同じ action を持つ全 db_operations の `trigger_events`）と中間JSON（`--stage merge`: `event_processes[].details` の呼出の行）へ当てはめる。既存の値と食い違えば上書きせず終了コード 1。`api_spec[].error_patterns` を Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す |
+| v55 | 契約の欄を追加（B17）: `logical_names[].derived`、`db_operations[].where[].when` / `where[].text` / `ctes[].conditional_parts` / `table_aliases` / `dataset[].alias_expression`、`steps[].kind` の `file_output`、`api_spec[].error_patterns[].error_code`、`response_to_screen_mapping[].screen_item_nth`、`common_logic[].used_by_processes_ids`。合成の担当は fill_common_logic_callers.py ほか（各欄の節を参照） |
 
 ---
 
@@ -183,6 +184,7 @@
 ```
 
 - `physical_table` ごとに列を網羅。
+- `derived`（任意、true）: 合成（`_compose_db_facts.py`）が補った行を示す。`apply_logical_name_substitution.py` は `derived: true` の行を置換の表に使わない（first_date・last_date が kai_date を指すだけの行で、本文の kai_date が誤って置換されるのを防ぐ）。
 - project_config の `logical_name_sources` に定義した資料に名称があればそれを優先（rank A の資料が最優先。詳細は 10_論理名変換.md）。
 - 上のサンプルの「顧客マスタ」「顧客コード」は、project_config の `naming.legacy_system` が既定（null）のときの値の例。`naming.legacy_system` を設定した案件では、その `master_suffix`・`code_suffix` に従った論理名になる（規則は 10_論理名変換.md。以降のサンプルも同じ）。
 
@@ -445,7 +447,7 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 | `postconditions` | △ | 正常終了時の業務的結果 |
 | `called_by_triggers` | ◯ | 呼出元トリガーへの逆引き参照。`{group_kind, group_category, trigger_no}` の配列 |
 | `steps[]` | ◯ | 処理ステップ。kind は process_flows と同じ語彙に + `backend_call` を追加 |
-| `steps[].kind` | ◯ | `data_load` / `branch` / `validation` / `confirmation` / `backend_call` / `api_call` (表示ラベル:「API実行」) / `screen_update` / `response_mapping` / `state_update` / `calculation` / `transition` / `event_emit` / `logging_call` / `error_handling` |
+| `steps[].kind` | ◯ | `file_output`（ダウンロード・CSV・文字コード・見出し行・合計行・区切り等のファイル出力。表示ラベルは「ファイル出力」。v55 で新設、migrate_v17_to_v18 の `_guess_step_kind` が付ける）/ `data_load` / `branch` / `validation` / `confirmation` / `backend_call` / `api_call` (表示ラベル:「API実行」) / `screen_update` / `response_mapping` / `state_update` / `calculation` / `transition` / `event_emit` / `logging_call` / `error_handling` |
 | `steps[].backend_call` | △ | kind=`backend_call` のとき必須。`{backend_id, request_summary, response_handling[{on,then,message_ref?}]}` |
 | `steps[].response_mapping` | △ | kind=`response_mapping` のとき必須。直前の `backend_call` の応答を画面項目に変換する。`{backend_id, mappings[{api_field_path, screen_area_no, item_ref_no, screen_item_name, transform}]}`。docx では §5.1 の配下に独立小節を生成し、表は 4 列（No / 画面項目（AR# / IT# / 名称）/ API フィールド / JS 変換）。**旧 backend_processes[].response_spec.response_to_screen_mapping[] は本フィールドに移動**（`migrate_v48_to_v49.py` で自動変換、詳細はチェンジログ参照） |
 | `validation_refs` | △ | 使用するバリデーションID配列（`validations[].id`） |
@@ -567,7 +569,7 @@ backend_processes[].response_to_screen_mapping[].screen_item_name 等で画面�
 | `response_spec` | ◯ | `{pattern, schema, items[]}`（`response_to_screen_mapping[]` は `front_processes[].steps[]` に移動済、詳細はチェンジログ v49 参照） |
 | `response_spec.items[].source` | ◯ | `{type, source_ref, source_column}`。type は `request`（リクエスト透過）/ `db`（DB SELECT 直結）/ `calculated`（DB + バック計算）/ `merged`（複数 SELECT 統合）/ `const`（固定値）。source_ref は `②-X データセット名`、source_column は `テーブル.列名` |
 | `response_spec.items[].transform_backend` | ◯ | バック側 Python での加工内容を業務語彙で記述（例: `"date → 'YYYY/MM/DD' 書式変換"`, `"数量 × 単価 × 税率 ÷ 100（小数切り捨て）"`, `"パターン単位で辞書化、商品配列にネスト"`）。「そのまま」「DB の生値をそのまま」も明示する（不可視の加工がないことを示す） |
-| `error_patterns[]` | ◯ | エラー応答パターン一覧。Phase 4 の `migrate_v17_to_v18.py` が、同じ action の `api_spec[].error_patterns` をそのまま写す（無ければ空配列）。空だと verify_intermediate.py が ERROR |
+| `error_patterns[]` | ◯ | エラー応答パターン一覧。各要素の `error_code`（v55 で新設、文字列）は api_spec 由来で、合成が入れる（上の api_spec 節を参照）。Phase 4 の `migrate_v17_to_v18.py` が、同じ action の `api_spec[].error_patterns` をそのまま写す（無ければ空配列）。空だと verify_intermediate.py が ERROR |
 | `error_patterns_none_reason` | △ | error_patterns を空にする理由（本当にエラーを返さない API だけ）。`api_spec[].error_patterns_none_reason` から写る。あれば空の error_patterns を ERROR にしない |
 | `notes[]` | △ | 業務担当者への注意書き。各要素は `{kind: '注意'|'補足'|'制約', text: string}`。フェーズB施策B3で新設、追加のみで既存フィールドへの影響なし |
 
@@ -735,6 +737,9 @@ INSERT/UPDATE/DELETE の場合:
 - `group_by[]`(任意): `{ logical_table, logical_column, when? }`。`when` は分岐で変わるときの条件(例: `group = register`)。docx の DB 問合せに「グルーピング」の表で出る
 - `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)
 - `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
+- `where[].when`（任意、文字列）: その条件が分岐で付く・外れるときの条件（例: `shop_id が指定されたとき`）。`where[].text`（任意）は条件の字面で、合成が `when` を付けるときの照合に使う。
+- `ctes[].conditional_parts[{sql, when}]`（任意）: CTE の中の条件付きの断片。`definition` には無条件の部分だけを残す。`db_operations[].table_aliases{別名: 実表}`（任意）は、`joins[].condition` の「別名.列」を実表・論理表へ解決するための対応表。
+- `dataset[].alias_expression`（任意）: 物理列が1つに決まらない式（`count(*)` 等）の表示用の式。`physical_column` が空のとき、docx は「論理名[式 …]」と出す。
 - `transaction`: INSERT/UPDATE/DELETE は必ず `true`
 - `operation_type` ごとに必要なフィールドが変わる（上記の通り）
 - `api_endpoint.trigger_event`: この API を呼ぶ Phase 1 の event_code（`events[].event_code` と同じ語彙。例 `EV01`）。1件に1つ
@@ -870,6 +875,8 @@ SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` 
 
 `error_patterns[]`（`{condition, status_code, message_id}` の配列）を Phase 1 で書くと、Phase 4 の `migrate_v17_to_v18.py` が `backend_processes[].error_patterns` へ写す。空なら verify_intermediate.py が ERROR。本当にエラーを返さない API は `error_patterns_none_reason`（文字列）に理由を書く（これも写る）。
 
+`error_code`（任意、文字列、v55 で新設）: API が返すエラー code（例: `validation_error` / `internal_error`）。書かなければ、下書き `common_errors` の `code_default` を `_units.py` の `_fill_error_codes` が全行に入れる（status が数値、または式の中の既定の数値と一致する行）。`condition` に「。code=…」を書かない。`messages[].code`（MSE の ID）とは別の欄で、docx のエラー表の「エラー code」列に出る。
+
 `name`（任意、文字列）: 処理名。あれば `backend_processes[].name` になり、`description` はそのまま `overview` になる。無ければ `description` の1文目が name、2文目以降（無ければ description 全体）が overview になる。
 
 `no` は `AP1` 形式。`response_items[].key` は1キー1行で書く（「各列」「等」「など」「…」や（）・` / ` で複数を括ると verify_intermediate.py が ERROR）。
@@ -920,7 +927,7 @@ SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` 
 |:---|:---:|:---|
 | `related_db_operations` | △ | このAPIが内部で実行するDB操作のid配列（`db_operations[].id` への参照）。merge_partials.py または手動で `db_operations[].api_endpoint.action == api_spec[].action` の突合により自動推測可能。docx に API 仕様の独立した章は無いが、この値は `migrate_v17_to_v18.py` が `backend_processes[].processing[]` の db_operation step へ移し、docx では 5.2 バックエンド処理の【②DB問合せ】に出る。省くと該当 API の DB 問合せが docx から消えるので、DB 操作がある API には必ず書く |
 | `related_cache_operations` | △ | このAPIが操作するキャッシュ系の処理一覧。ロックAPI等、DB操作を伴わずキャッシュ層のみで完結するAPIで使用。各要素は `{ "operation": "キャッシュ SET/GET/DEL", "key_pattern": "lock:{ym}", "ttl_sec": 300, "purpose": "編集ロック取得" }` 形式 |
-| `response_to_screen_mapping` | △ | APIレスポンスのフィールドが画面のどの項目に表示されるかのマッピング。`{ api_field_path, screen_no, screen_item_name, transform }` の配列。`api_field_path` は `response_items[].key` と同形式（例: `data[].customer_code`、`session.last_confirmed_at`）。`transform` は画面表示前の変換（例: `"YYYY/MM/DD HH:MM 形式に変換"`、`"カンマ区切り整形"`）。空文字なら無変換。業務担当者が「レスポンスの中身が画面のどこに出るか」を辿るための項目。docx に API 仕様の独立した章は無いが、この値は `migrate_v17_to_v18.py` と `migrate_v48_to_v49.py` が `front_processes[].steps[]` の `response_mapping` step へ移し、docx では 5.1 フロント処理の「レスポンスの画面表示先」の表（No / 画面項目 / API フィールド / JS 変換）に出る。省くとこの表が docx から消えるので、レスポンスを画面に出す API には書く |
+| `response_to_screen_mapping` | △ | APIレスポンスのフィールドが画面のどの項目に表示されるかのマッピング。`{ api_field_path, screen_no, screen_item_name, transform, screen_item_nth? }` の配列。`screen_item_nth`（任意、1始まり、v55 で新設）は、同じ名前の画面項目が複数あるとき（「小計」等）何番目かを示す。react 下書きの display_rows の nth から合成が入れ、`migrate_v48_to_v49.py` の find_item_no が (エリア, 名前, nth) で画面項目を引く。`api_field_path` は `response_items[].key` と同形式（例: `data[].customer_code`、`session.last_confirmed_at`）。`transform` は画面表示前の変換（例: `"YYYY/MM/DD HH:MM 形式に変換"`、`"カンマ区切り整形"`）。空文字なら無変換。業務担当者が「レスポンスの中身が画面のどこに出るか」を辿るための項目。docx に API 仕様の独立した章は無いが、この値は `migrate_v17_to_v18.py` と `migrate_v48_to_v49.py` が `front_processes[].steps[]` の `response_mapping` step へ移し、docx では 5.1 フロント処理の「レスポンスの画面表示先」の表（No / 画面項目 / API フィールド / JS 変換）に出る。省くとこの表が docx から消えるので、レスポンスを画面に出す API には書く |
 
 ### common_logic
 
@@ -936,6 +943,8 @@ SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` 
   }
 ]
 ```
+
+`used_by_processes_ids`（v55 で新設）: 各要素の、この共通ロジックを呼ぶ処理の ID 配列（FR1・BE2 の形）。`used_by_processes`（名前の配列）から `fill_common_logic_callers.py` が、IDs 確定後（`migrate_v48_to_v49.py` の後）に入れる。結べなかった語は `used_by_processes` に残り、標準エラーに WARN が出る。空だと `verify_intermediate.py` が ERROR にする。
 
 ### diagrams（任意、構成図を載せるときのみ）
 

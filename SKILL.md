@@ -537,6 +537,8 @@ python3 target/scripts/replace_hatsuka.py "${FEATURE_NAME}"                     
 python3 target/scripts/add_screen_areas.py "${FEATURE_NAME}"                      # screen_layout.areas[] 定義（screen_config.json から読込、裏方領域 screen_no="0" も含む）
 python3 target/scripts/extract_source_files.py "${FEATURE_NAME}"                  # frontend_files / backend_files 抽出（screen_config.source_files も frontend_files へ）
 
+# 初期処理の表（initialization）と、画面の状態（開始時・成功時・失敗時・0件）・連続操作・CSV の事実の行は、
+#   react 下書きの fact_lines から apply_react_draft.py / merge_partials.py が機械で入れる（手で書かない。業務の説明だけ書く）
 # === Phase 4 の前（手作業）: event_processes[].details を埋める ===
 # 委譲の単位で作ったときは不要（S3 の断片の details を merge_partials.py が写している）
 # target/intermediate/${FEATURE_NAME}.json の event_processes[].details に、処理ステップを1行1 step で書く
@@ -609,6 +611,9 @@ python3 target/scripts/migrate_v49_event_unify.py "${FEATURE_NAME}"             
 # 意味合い: backend_processes.response_spec.response_to_screen_mapping を front_processes.steps の response_mapping step に移動、
 #           response_spec.items に source/transform_backend 追加、db_op_detail に sub_no 採番、URL パラメータ判定 step を除去
 python3 target/scripts/migrate_v48_to_v49.py "${FEATURE_NAME}"                     # v48 中間 JSON を v49 構造に変換、front/back の責務を明確化
+
+# === Phase 5.95: 共通ロジックの呼出元（v55 で新設。IDs 確定後、migrate_v48_to_v49 の後。冪等） ===
+python3 target/scripts/fill_common_logic_callers.py "${FEATURE_NAME}"              # common_logic[].used_by_processes（名前）を used_by_processes_ids（FR/BE の ID）へ結ぶ。結べない語は WARN
 
 # === Phase 6: 整合性検証（v52 で画面別引数対応） ===
 python3 target/scripts/verify_intermediate.py "${FEATURE_NAME}"                   # 業務的構造の整合性、ERROR 0 を目標
