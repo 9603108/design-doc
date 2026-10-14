@@ -10,6 +10,8 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
   b) state[].項目 の使用箇所(field_usage の uses の行)が入る画面項目(format=固定文言 の見出しは外す。React の key だけの使用は外す)。
   c) 派生配列(filter 等)の fields に項目があるとき、配列名を表示条件に含む画面項目のうち、行が最小の1つ。
   d) 表示行の specs の kin・cnt が項目と一致し、その表示名の画面項目が1つに決まるとき。
+  b) の補足(round13 W6): 使用行に当たった項目が入れ子のときは内側の項目だけを候補にする(入れ物は外す)。
+表示行の spec の葉は、display_rows[].cell_format・specs[].unit(react 下書き)から transform を事実の文で上書きする(cell_format が null なら触らない)。
 入れ替え: モデルの行の項目が候補に無ければ、候補の1番目へ入れ替える(transform はそのまま。log に書く)。
   候補のうち行が無いものは行を足す。候補が空の欄は触らない。冪等(2回目は何も変えない)。
 """
@@ -85,6 +87,35 @@ def _items_at(items, s):
                 hit.append(i)
                 break
     return hit
+
+
+def _range_at(it, s):
+    """画面項目 it の src のうち、使用行 s が入る範囲 (line_start, line_end)。無ければ None。_items_at と同じ判定。"""
+    ln = s["line_start"]
+    for r in it.get("src") or []:
+        if not isinstance(r, dict) or r.get("file") != s.get("file") or r.get("line_start") is None:
+            continue
+        end = r.get("line_end") or r["line_start"]
+        if r["line_start"] <= ln <= end:
+            return (r["line_start"], end)
+    return None
+
+
+def _innermost(items, idxs, s):
+    """使用行 s に当たった画面項目 idxs のうち、別の当たった項目の範囲を真に含む外側の項目を外した list(round13 W6 a・新4')。
+    WHY: Card の subtitle(318行)の使用が、その行を含む入れ物の項目(IT18: 314-321)にも当たり、入れ物にまで写しの行が足された。
+    使用行を直に持つのは内側の項目なので、入れ物は候補にしない。範囲が入れ子でない(一部だけ重なる・同じ範囲)当たりは全部残す
+    (どちらが内側か事実で決まらないため)。接続先: _candidates の b) 使用箇所の当たり。"""
+    rng = {i: _range_at(items[i], s) for i in idxs}
+    out = []
+    for i in idxs:
+        a = rng[i]
+        inner_exists = a is not None and any(
+            j != i and rng[j] is not None and a[0] <= rng[j][0] and rng[j][1] <= a[1] and a != rng[j]
+            for j in idxs)
+        if not inner_exists:
+            out.append(i)
+    return out
 
 
 def _conds(chain):
@@ -166,10 +197,10 @@ def _candidates(states, leaf, drafts, usage, items, derived, cache):
             if _is_key_use(u):
                 continue
             for s in u.get("src") or []:
-                for i in _items_at(items, s):
-                    # WHY: 画面の見出し(format=固定文言)は応答の値を出さない。使用行が重なっても候補にしない
-                    if items[i].get("format") == "固定文言":
-                        continue
+                # WHY: 画面の見出し(format=固定文言)は応答の値を出さない。使用行が重なっても候補にしない
+                # (入れ物の判定の前に外す。見出しだけが内側のとき、入れ物まで候補から消えないようにする)
+                idxs = [i for i in _items_at(items, s) if items[i].get("format") != "固定文言"]
+                for i in _innermost(items, idxs, s):
                     hits.setdefault(i, None)
     for i in _spec_items(drafts, items, leaf):
         hits.setdefault(i, None)
@@ -179,6 +210,64 @@ def _candidates(states, leaf, drafts, usage, items, derived, cache):
             if i is not None:
                 hits.setdefault(i, da.get("lambda_expr") or "")
     return [(i, hits[i]) for i in sorted(hits)]
+
+
+def _spec_of(drafts, leaf):
+    """表示行の spec のうち kin か cnt が leaf のもの (spec, 表示行の cell_format)。ちょうど1つのときだけ返し、無い・2つ以上は None。
+    WHY: 同じ葉を2つの spec が持つと、どちらの書式か事実で決まらない(推測しない)。"""
+    found = [(s, row.get("cell_format")) for d in drafts for row in d.get("display_rows") or [] if isinstance(row, dict)
+             for s in row.get("specs") or [] if isinstance(s, dict) and leaf in (s.get("kin"), s.get("cnt"))]
+    return found[0] if len(found) == 1 else None
+
+
+def _spec_transform(drafts, leaf):
+    """表示行の spec の葉 leaf の transform の文と、その spec の label。決まらなければ None(round13 W6 b・新3)。
+    WHY: S2 の transform が55行とも「そのまま表示」で、点数の「点」・金額の「円」・人数の「人」、3桁区切り、値が無いときの0表示が
+    設計書に出なかった。これらは W7 が react 下書きに出した display_rows[].cell_format(セルの書式の事実)と spec.unit から機械で作る。
+    cell_format が null(書式が決まらない画面)・spec が無い・同じ葉の spec が2つ以上のときは None で、モデルの行を触らない。
+    単位 = 書式の suffix、無ければ suffix_from_unit が true のとき spec.unit(無ければ unit_default)。単位が決まらなければ「と「…」」は書かない。
+    3桁区切り・0表示は grouping・null_as_zero が true のときだけ書く(true でなければ書かない。推測しない)。"""
+    hit = _spec_of(drafts, leaf)
+    if not hit:
+        return None
+    spec, cf = hit
+    if not isinstance(cf, dict) or not spec.get("label"):
+        return None
+    if leaf == spec.get("cnt"):
+        fmt, where = cf.get("cnt"), "点数欄"
+    elif spec.get("cnt"):
+        fmt, where = cf.get("kin"), "金額欄"
+    else:
+        fmt, where = cf.get("single"), None
+    if not isinstance(fmt, dict):
+        return None
+    suffix = fmt.get("suffix")
+    if not suffix and fmt.get("suffix_from_unit"):
+        suffix = spec.get("unit") or fmt.get("unit_default")
+    text = (f"「{spec['label']}」行の{where}に、" if where else f"「{spec['label']}」行に、")
+    text += ("3桁区切りの" if fmt.get("grouping") is True else "") + "数値"
+    text += (f"と「{suffix}」" if suffix else "") + "で出す"
+    if fmt.get("null_as_zero") is True:
+        text += "。値が無いときは0として出す"
+    return text, spec["label"], spec.get("nth")
+
+
+def _apply_spec_transform(api, path, leaf, drafts, log):
+    """path の写しの行のうち、画面項目が spec の label と同じものの transform を事実の文で上書きする(違うときだけ log に書く)。
+    WHY: 他の画面項目(副題・一覧など)への行は、spec の書式の対象ではないので触らない。
+    同名の項目が複数あり、行の screen_item_nth と spec.nth が食い違うものも触らない。接続先: fill の応答の項目ごとの処理。"""
+    res = _spec_transform(drafts, leaf)
+    if not res:
+        return
+    text, label, nth = res
+    for m in api["response_to_screen_mapping"]:
+        if not isinstance(m, dict) or m.get("api_field_path") != path or m.get("screen_item_name") != label:
+            continue
+        if m.get("screen_item_nth") is not None and nth is not None and m["screen_item_nth"] != nth:
+            continue
+        if m.get("transform") != text:
+            m["transform"] = text
+            log.append(f"[写し] api_spec[{api.get('action')}].response_to_screen_mapping[{path}] の transform を事実で直す")
 
 
 def _place(row, items, i):
@@ -250,6 +339,8 @@ def fill(out, log):
             top, leaf = path.split("[].", 1)
             if "." in leaf or "[" in leaf:
                 continue
+            # WHY: spec の書式は state の候補と無関係に決まる(表示行の葉の事実)ので、states の有無より先に直す(W6 b)
+            _apply_spec_transform(api, path, leaf, drafts, log)
             states = _states_for(api.get("action"), drafts, top)
             if not states:
                 continue
@@ -357,10 +448,68 @@ def _selftest():
     print("[selftest OK] _compose_mapping (N2・N3: 応答の項目を画面項目へ写す)")
 
 
+def _selftest_w6():
+    """round13 W6 の形: (1) 入れ物の項目(範囲が使用行の項目を真に含む)は候補から外れ、入れ子でない当たりは両方残る。
+    (2) cell_format ありの spec の transform が事実の文になる(cnt・kin で cnt あり・kin で cnt 無しの単位 unit)。
+    (3) cell_format が null・spec 無し・同じ葉が2つの spec のときは transform を触らない。"""
+    def it(name, a, b, **kw):
+        return dict({"item_name": name, "src": [{"file": "F.tsx", "line_start": a, "line_end": b}]}, **kw)
+
+    s = {"file": "F.tsx", "line_start": 318, "line_end": 318}
+    items = [it("入れ物", 314, 321), it("副題", 318, 318)]
+    assert _innermost(items, _items_at(items, s), s) == [1], "入れ物が候補に残った"
+    items = [it("A", 310, 320), it("B", 315, 330)]
+    s2 = {"file": "F.tsx", "line_start": 318, "line_end": 318}
+    assert _innermost(items, _items_at(items, s2), s2) == [0, 1], "入れ子でない当たりが減った"
+    # 候補の経路でも確かめる: 見出し(固定文言)を外した後に入れ物判定する
+    usage = {"rows[].days": [{"src": [s]}]}
+    items = [it("入れ物", 314, 321), it("副題", 318, 318), it("見出し", 318, 318, format="固定文言")]
+    got = _candidates({"rows"}, "days", [], {"rows[].days": [{"src": [s]}]}, items, [], {})
+    assert [i for i, _ in got] == [1], got
+
+    def F(suffix=None, from_unit=False, default=None, grouping=True, zero=None):
+        return {"suffix": suffix, "suffix_from_unit": from_unit, "unit_default": default,
+                "grouping": grouping, "null_as_zero": zero, "src": []}
+    cf = {"cnt": F("点", zero=True), "kin": F("円", zero=True), "single": F(None, True, "円", zero=True)}
+    rows = [{"cell_format": cf, "specs": [
+        {"label": "売上訂正", "kin": "k1", "cnt": "c1", "unit": None, "nth": 1},
+        {"label": "総売上", "kin": "k2", "cnt": None, "unit": None, "nth": 1},
+        {"label": "客数", "kin": "k3", "cnt": None, "unit": "人", "nth": 1},
+        {"label": "重複A", "kin": "dup", "cnt": None, "unit": None, "nth": 1},
+        {"label": "重複B", "kin": "dup", "cnt": None, "unit": None, "nth": 1}]},
+        {"cell_format": None, "specs": [{"label": "書式なし", "kin": "k9", "cnt": None, "unit": None, "nth": 1}]}]
+    drafts = [{"display_rows": rows}]
+    assert _spec_transform(drafts, "c1")[0] == "「売上訂正」行の点数欄に、3桁区切りの数値と「点」で出す。値が無いときは0として出す"
+    assert _spec_transform(drafts, "k1")[0] == "「売上訂正」行の金額欄に、3桁区切りの数値と「円」で出す。値が無いときは0として出す"
+    assert _spec_transform(drafts, "k2")[0] == "「総売上」行に、3桁区切りの数値と「円」で出す。値が無いときは0として出す"
+    assert _spec_transform(drafts, "k3")[0] == "「客数」行に、3桁区切りの数値と「人」で出す。値が無いときは0として出す"
+    assert _spec_transform(drafts, "dup") is None, "同じ葉の spec が2つなのに作った"
+    assert _spec_transform(drafts, "k9") is None, "cell_format null なのに作った"
+    assert _spec_transform(drafts, "nothing") is None
+    # grouping・null_as_zero が true でなければ、その語を書かない(推測しない)
+    cf["kin"] = F("円", grouping=None, zero=None)
+    assert _spec_transform(drafts, "k1")[0] == "「売上訂正」行の金額欄に、数値と「円」で出す"
+    # 適用: 画面項目が label と同じ行だけ上書きし、2回目は変えない。cell_format null の行は従来のまま
+    api = {"action": "a", "response_to_screen_mapping": [
+        {"api_field_path": "rows[].k2", "screen_item_name": "総売上", "transform": "そのまま表示"},
+        {"api_field_path": "rows[].k2", "screen_item_name": "副題", "transform": "副題の表示に使う"},
+        {"api_field_path": "rows[].k9", "screen_item_name": "書式なし", "transform": "そのまま表示"}]}
+    log = []
+    for p, leaf in (("rows[].k2", "k2"), ("rows[].k9", "k9")):
+        _apply_spec_transform(api, p, leaf, drafts, log)
+    t = [m["transform"] for m in api["response_to_screen_mapping"]]
+    assert t == ["「総売上」行に、3桁区切りの数値と「円」で出す。値が無いときは0として出す", "副題の表示に使う", "そのまま表示"], t
+    assert len(log) == 1, log
+    _apply_spec_transform(api, "rows[].k2", "k2", drafts, log)
+    assert len(log) == 1, "2回目で変わった"
+    print("[selftest OK] _compose_mapping W6 (入れ物の候補外し・spec の transform)")
+
+
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv:
         _selftest()
+        _selftest_w6()
     else:
         print("usage: _compose_mapping.py --selftest (fill は _units.compose から呼ばれる)")
         sys.exit(2)
