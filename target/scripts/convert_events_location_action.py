@@ -10,6 +10,7 @@
 
 import json
 import re
+import sys
 from pathlib import Path
 
 # 2026-10-05 汎用化: 中間 JSON の絶対パス直書きをやめ、機能名から組み立てる。
@@ -22,7 +23,9 @@ from pathlib import Path
 # 接続情報: どちらも _config_loader の既存アクセサで、FEATURE_NAME を明示で渡す（normalize_screen_terminology.py と同じ流儀）。
 from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv, get_screen_name, get_areas
 
-FEATURE_NAME = get_feature_name_from_argv()
+# WHY: --selftest は機能名を取らない(argv[1] を機能名にすると画面設定の読込で落ちる)。selftest のときだけ機能名を仮の値にする。
+SELFTEST_MODE = "--selftest" in sys.argv
+FEATURE_NAME = "selftest" if SELFTEST_MODE else get_feature_name_from_argv()
 INTERMEDIATE = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 # 末尾の動作動詞句 → action ラベルへの対応表（先に登場するほど優先）
@@ -33,7 +36,8 @@ ACTION_PATTERNS = [
     (r'を?切替する$',               '切替'),
     (r'からフォーカスを外す$',       'フォーカス外し'),
     (r'を?チェックする$',           'チェック'),
-    (r'を?(押す|押下)$',             '押下'),
+    # WHY: 「押下する」は「押下」の後ろに「する」が付く形なので、「押下」だけでは末尾に合わず action が空になる。
+    (r'を?(押す|押下する|押下)$',     '押下'),
     (r'を?スクロールする$',         'スクロール'),
     (r'(初期表示時|画面表示時)$',   '初期表示'),
     (r'を?入力する$',               '入力'),
@@ -220,6 +224,23 @@ def parse_trigger(trigger: str) -> dict:
     }
 
 
+def fill_action(action: str, event_code: str, draft_actions: dict) -> str:
+    """trigger から取れた動作語を返し、空なら react 下書きの同じ event_code の動作語で補う。
+    WHY: 末尾の動詞句がどの対応表にも合わない操作は trigger から action が空になる。
+         下書きは実装のハンドラ(onClick 等)から動作語を取っているので、その語で補う。補えなければ空のまま残す(推測で埋めない)。"""
+    return action or draft_actions.get(event_code, "")
+
+
+def load_draft_actions(feature: str) -> dict:
+    """{機能名}_react_draft.json の events[] から event_code → action の対応を作る。下書きが無ければ空。"""
+    p = INTERMEDIATE_DIR / f"{feature}_react_draft.json"
+    if not p.exists():
+        return {}
+    d = json.loads(p.read_text(encoding="utf-8"))
+    return {e["event_code"]: e["action"] for e in d.get("events") or []
+            if isinstance(e, dict) and e.get("event_code") and e.get("action")}
+
+
 def main():
     if not INTERMEDIATE.exists():
         raise FileNotFoundError(f"中間JSON が見つからない: {INTERMEDIATE}")
@@ -227,6 +248,7 @@ def main():
         d = json.load(f)
 
     events = d.get("events", []) or []
+    draft_actions = load_draft_actions(FEATURE_NAME)
     converted = 0
     failed = 0
     samples = []
@@ -234,6 +256,7 @@ def main():
     for e in events:
         trigger = e.get("trigger", "")
         result = parse_trigger(trigger)
+        result["action"] = fill_action(result["action"], e.get("event_code", ""), draft_actions)
         e["location"] = result["location"]
         e["action"] = result["action"]
         e["source_kind"] = classify_source_kind(
@@ -266,5 +289,32 @@ def main():
     }, ensure_ascii=False, indent=2))
 
 
+def selftest() -> int:
+    """動作語(押下する・押す)、下書きからの補い、補えないときの空欄を assert する。終了コード 0=OK / 1=NG。
+    WHY: 画面名・エリア名の設定(screen_config)が無くても動くよう、get_screen_name / get_areas を空に差し替えて確かめる。実案件の設定に依らない。"""
+    global get_screen_name, get_areas
+    saved = (get_screen_name, get_areas)
+    get_screen_name = lambda _feature: ""
+    get_areas = lambda _feature: []
+    try:
+        r = parse_trigger("サンプル画面の表示ボタンを押下する。")
+        assert r["action"] == "押下" and r["location"][-1] == "表示ボタン", r
+        r = parse_trigger("サンプル画面の表示ボタンを押す。")
+        assert r["action"] == "押下" and r["location"][-1] == "表示ボタン", r
+        assert parse_trigger("サンプル画面の表示ボタンをクリックする。")["action"] == "クリック"
+        assert fill_action("", "EV01", {"EV01": "クリック"}) == "クリック"
+        assert fill_action("押下", "EV01", {"EV01": "クリック"}) == "押下"
+        assert fill_action("", "EV09", {"EV01": "クリック"}) == ""
+    except AssertionError as e:
+        print(f"[selftest NG] {e}")
+        return 1
+    finally:
+        get_screen_name, get_areas = saved
+    print("[selftest OK] convert_events_location_action")
+    return 0
+
+
 if __name__ == "__main__":
+    if SELFTEST_MODE:
+        sys.exit(selftest())
     main()
