@@ -7,7 +7,7 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
 候補の決め方(どれも react 下書きの事実):
   a) 応答の最上位キー(rows)→ state: 単一の API だけを呼ぶイベントの失敗経路の on_success_from(state ← rows)。
      複数の API を呼ぶイベントは、失敗経路の呼出名と action の対応がソースから決まらないので使わない(推測しない)。
-  b) state[].項目 の使用箇所(field_usage の uses の行)が入る画面項目。
+  b) state[].項目 の使用箇所(field_usage の uses の行)が入る画面項目(format=固定文言 の見出しは外す)。
   c) 派生配列(filter 等)の fields に項目があるとき、配列名を表示条件に含む画面項目のうち、行が最小の1つ。
   d) 表示行の specs の kin・cnt が項目と一致し、その表示名の画面項目が1つに決まるとき。
 入れ替え: モデルの行の項目が候補に無ければ、候補の1番目へ入れ替える(transform はそのまま。log に書く)。
@@ -142,6 +142,9 @@ def _candidates(states, leaf, drafts, usage, items, derived, cache):
         for u in usage.get(f"{st}[].{leaf}", []):
             for s in u.get("src") or []:
                 for i in _items_at(items, s):
+                    # WHY: 画面の見出し(format=固定文言)は応答の値を出さない。使用行が重なっても候補にしない
+                    if items[i].get("format") == "固定文言":
+                        continue
                     hits.setdefault(i, None)
     for i in _spec_items(drafts, items, leaf):
         hits.setdefault(i, None)
@@ -232,7 +235,8 @@ def fill(out, log):
 
 def _selftest():
     """a) 候補の入れ替え(項目が候補に無い)・b) 候補の行の足し(モデルの行は残す)・c) 派生配列の項目への結び・
-    d) 候補が空の欄は触らない・e) 複数の API を呼ぶイベントの応答は結ばない・f) 2回目は何も変えない、を一時の下書きで確かめる。"""
+    d) 候補が空の欄は触らない・e) 複数の API を呼ぶイベントの応答は結ばない・f) 2回目は何も変えない・
+    g) 画面の見出し(固定文言)は使用行が重なっても候補に入らない、を一時の下書きで確かめる。"""
     import copy
     import tempfile
     import _config_loader
@@ -273,7 +277,9 @@ def _selftest():
         }
         Path(td, "S_react_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
         items = [{"item_name": "件数表示", "screen_no": "1", "src": sp(7)},
-                 {"item_name": "店名", "screen_no": "2", "src": sp(9)}]
+                 {"item_name": "店名", "screen_no": "2", "src": sp(9)},
+                 # WHY: 見出し(固定文言)は行 7 の使用行に重なるが、応答の値を出す項目ではないので候補に入れない
+                 {"item_name": "見出し", "format": "固定文言", "screen_no": "1", "src": sp(7)}]
 
         def mk():
             return {"screen_layout": {"items": copy.deepcopy(items)},
