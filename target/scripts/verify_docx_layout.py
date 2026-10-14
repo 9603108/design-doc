@@ -8,6 +8,7 @@
           仕様根拠 = 14_チェックリスト.md「docx レイアウト検証」節
 標準ライブラリのみ使用（zipfile + xml.etree.ElementTree）、新規依存ゼロ。画面固有情報を一切持たない汎用スクリプト。
 """
+import json
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -125,7 +126,55 @@ def check_empty_template_parts(parts):
     return issues
 
 
+INIT_HEADING = "▸ 初期表示後の画面項目"  # generate_docx.js buildInitItemsBlocks と同じ文言
+DOCX_PREFIX = "詳細設計書_"
+
+
+def find_intermediate(docx_path):
+    """詳細設計書_{機能名}.docx → target/intermediate/{機能名}.json。名前が合わなければ None。"""
+    # WHY: initialization.items は中間 JSON にしか無い。generate_docx.js の INPUT_JSON と同じ規則で docx の位置から引く
+    stem = docx_path.stem
+    if not stem.startswith(DOCX_PREFIX):
+        return None
+    return docx_path.parent.parent / "intermediate" / (stem[len(DOCX_PREFIX):] + ".json")
+
+
+def load_initial_items(intermediate_path):
+    data = json.loads(intermediate_path.read_text(encoding="utf-8"))
+    return ((data.get("initialization") or {}).get("items")) or []
+
+
+def check_initial_items_table(root, items):
+    """initialization.items が1件以上なのに「初期表示後の画面項目」の見出しが docx に無ければ ERROR。"""
+    # WHY: 初期処理の直後の表は生成漏れがあっても docx 上は気づけないため、件数との突き合わせで止める
+    if not items:
+        return []
+    if any(t.text and INIT_HEADING in t.text for t in root.iter(w("t"))):
+        return []
+    return [("ERROR", f"initialization.items が {len(items)} 件あるのに「{INIT_HEADING}」の表が docx に無い")]
+
+
+def selftest():
+    def doc(text):
+        return ET.fromstring(
+            f'<w:document xmlns:w="{W_NS}"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>')
+
+    one = [{"no": 1}]
+    assert check_initial_items_table(doc(INIT_HEADING), one) == []
+    errs = check_initial_items_table(doc("FR 本文"), one)
+    assert len(errs) == 1 and errs[0][0] == "ERROR"
+    assert check_initial_items_table(doc("FR 本文"), []) == []
+    assert check_initial_items_table(doc(INIT_HEADING), []) == []
+    assert find_intermediate(Path("/w/target/output/詳細設計書_POS会計レポート.docx")) == \
+        Path("/w/target/intermediate/POS会計レポート.json")
+    assert find_intermediate(Path("/w/target/output/other.docx")) is None
+    print("selftest OK")
+
+
 def main():
+    if sys.argv[1:2] == ["--selftest"]:
+        selftest()
+        return
     if len(sys.argv) < 2:
         print("Usage: verify_docx_layout.py <docx_path>", file=sys.stderr)
         sys.exit(2)
@@ -150,6 +199,13 @@ def main():
     all_issues.extend(check_bookmarks_and_hyperlinks(root))
     all_issues.extend(check_toc_update_fields(parts.get("word/settings.xml")))
     all_issues.extend(check_empty_template_parts(parts))
+    inter = find_intermediate(docx_path)
+    if inter is None:
+        all_issues.append(("INFO", "docx 名が『詳細設計書_{機能名}.docx』でないため初期表示の表の検査を飛ばした"))
+    elif not inter.exists():
+        all_issues.append(("INFO", f"中間 JSON が無いため初期表示の表の検査を飛ばした: {inter}"))
+    else:
+        all_issues.extend(check_initial_items_table(root, load_initial_items(inter)))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]
