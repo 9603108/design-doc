@@ -76,15 +76,40 @@ def _fill_physical(out, pairs, log):
             elif c.get("alias_expression"):  # fallback-ok: 式が無い列は alias_expression を入れない
                 row["alias_expression"] = c["alias_expression"]
     # WHY: logical_names は全 op 共通の表なので、同じ別名の下書き列が全部同じ列を指すときだけ補う
+    # WHY(V4): 同じ別名でも表が違えば別の列を指す(shops.name と pos_account_reports.mise_no)。
+    #          行の表と下書き列の表(c["table"])が食い違うときは、行の表の列を当てない。
+    #          下書き列の表が1つに決まるときは、行をその表へ付け替える(論理表は同じ表の他の行から取る)。
+    lt_of = {}
+    for row in out.get("logical_names") or []:  # fallback-ok: logical_names は任意の欄
+        if row.get("physical_table") and row.get("logical_table"):  # fallback-ok: 欄が空の行は表の対応に使わない
+            lt_of.setdefault(row["physical_table"], row["logical_table"])
     for row in out.get("logical_names") or []:  # fallback-ok: logical_names は任意の欄
         alias = row.get("alias_name")
         if row.get("physical_column") or not alias or not row.get("physical_table"):
             continue
-        res = {_column_of(row["physical_table"], c.get("source_columns")) for c in cand.get(alias, [])}  # fallback-ok: 候補が無い別名は空
-        if len(res) == 1 and None not in res:
-            row["physical_column"] = res.pop()
-            row["derived"] = True
-            log.append(f"INFO _compose_db_facts: logical_names {row['physical_table']}.{alias} を derived で補う")
+        pt = row["physical_table"]
+        cs = cand.get(alias, [])  # fallback-ok: 候補が無い別名は空
+        same = [c for c in cs if c.get("table") in (pt, None, "")]  # fallback-ok: 表の無い下書き列は従来どおり数える
+        if same:
+            res = {_column_of(pt, c.get("source_columns")) for c in same}  # fallback-ok: 式の列は無いことがある
+            if len(res) == 1 and None not in res:
+                row["physical_column"] = res.pop()
+                row["derived"] = True
+                log.append(f"INFO _compose_db_facts: logical_names {pt}.{alias} を derived で補う")
+            continue
+        others = {c.get("table") for c in cs}  # fallback-ok: 候補が無ければ空
+        if len(others) != 1:
+            continue
+        (t,) = others
+        pcs = {_column_of(t, c.get("source_columns")) for c in cs}  # fallback-ok: 式の列は無いことがある
+        if len(pcs) != 1 or None in pcs or t not in lt_of:
+            log.append(f"WARN _compose_db_facts: logical_names {pt}.{alias} は下書きの表 {t} の列が1つに決まらない、または論理表が無いので付け替えない")
+            continue
+        row["physical_table"] = t
+        row["logical_table"] = lt_of[t]
+        row["physical_column"] = pcs.pop()
+        row["derived"] = True
+        log.append(f"INFO _compose_db_facts: logical_names {pt}.{alias} を下書きの表 {t}.{row['physical_column']} へ付け替える(derived)")
 
 
 def _fill_when(op, a):
@@ -506,6 +531,40 @@ def selftest():
         _compose_db(num, drafts, [])
         assert strip(num["db_operations"][0]) == strip(op), (extra, num["db_operations"][0], op)
         assert num["logical_names"] == out["logical_names"], extra
+    # V4: 論理名の別名が下書き列の表と違う行は、行の表の列を当てず、下書き列の表へ付け替える(derived)
+    # WHY: 同じ別名 name が shops.name(店舗名)と pos_account_reports.mise_no を指すと、行の表だけで列を決めると mise_no に化ける
+    v4_drafts = {"apis": {"list_y": {"db_operations": [{"id": "db_op_y", "columns": [
+        {"alias_name": "name", "table": "shops", "source_columns": ["shops.name", "pos_account_reports.mise_no"]},
+        {"alias_name": "kai", "table": "pos_account_reports", "source_columns": ["pos_account_reports.kai_date"]},
+        {"alias_name": "zz", "table": "stores", "source_columns": ["stores.code", "pos_account_reports.mise_no"]},
+    ]}]}}}
+    v4_dop = v4_drafts["apis"]["list_y"]["db_operations"][0]
+    # 同じ別名 two が2つの op の下書きで別の表を指す(候補が割れる)
+    v4_dop2 = {"id": "db_op_y2", "columns": [{"alias_name": "two", "table": "shops", "source_columns": ["shops.name"]}]}
+    v4_dop3 = {"id": "db_op_y3", "columns": [{"alias_name": "two", "table": "stores", "source_columns": ["stores.code"]}]}
+    v4_out = {"logical_names": [
+        {"physical_table": "shops", "logical_table": "店舗", "physical_column": "", "logical_column": "店舗名称", "alias_name": "shop_name"},
+        {"physical_table": "pos_account_reports", "logical_table": "POS会計レポート", "physical_column": "", "logical_column": "名称(推定)", "alias_name": "name"},
+        {"physical_table": "pos_account_reports", "logical_table": "POS会計レポート", "physical_column": "", "logical_column": "会計日(推定)", "alias_name": "kai"},
+        {"physical_table": "pos_account_reports", "logical_table": "POS会計レポート", "physical_column": "", "logical_column": "別の値", "alias_name": "zz"},
+        {"physical_table": "pos_account_reports", "logical_table": "POS会計レポート", "physical_column": "", "logical_column": "二つ", "alias_name": "two"},
+        {"physical_table": "pos_account_reports", "logical_table": "POS会計レポート", "physical_column": "", "logical_column": "候補なし", "alias_name": "nothing"},
+    ]}
+    v4_log = []
+    _fill_physical(v4_out, [({"id": "db_op_y", "dataset": []}, v4_dop, None),
+                            ({"id": "db_op_y2", "dataset": []}, v4_dop2, None),
+                            ({"id": "db_op_y3", "dataset": []}, v4_dop3, None)], v4_log)
+    v4_ln = v4_out["logical_names"]
+    assert (v4_ln[1]["physical_table"], v4_ln[1]["physical_column"], v4_ln[1]["logical_table"]) == ("shops", "name", "店舗"), v4_ln[1]
+    assert v4_ln[1].get("derived") is True and v4_ln[1]["logical_column"] == "名称(推定)", v4_ln[1]
+    assert (v4_ln[2]["physical_table"], v4_ln[2]["physical_column"]) == ("pos_account_reports", "kai_date"), v4_ln[2]
+    assert v4_ln[2].get("derived") is True, v4_ln[2]
+    # 下書き列の表の論理表が無い(stores)・候補の表が2つ(two)・候補が無い(nothing)は触らない
+    for i in (3, 4, 5):
+        assert v4_ln[i]["physical_table"] == "pos_account_reports" and v4_ln[i]["physical_column"] == "" and "derived" not in v4_ln[i], v4_ln[i]
+    assert any("付け替え" in x and "name" in x for x in v4_log), v4_log
+    assert any("WARN" in x and "zz" in x for x in v4_log), v4_log
+    print("[selftest OK] _compose_db_facts V4 (別名の表が違う行は下書き列の表へ付け替える・論理表が無い・候補が割れるときは触らない)")
     print("[selftest OK] _compose_db_facts 番号振りの後の id でも同じ事実(legacy_id・action で結ぶ)")
     print("[selftest OK] _compose_db_facts F2 (副問い合わせの集計を外す・主の集計は残す)")
     print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
