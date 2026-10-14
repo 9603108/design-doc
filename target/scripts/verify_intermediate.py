@@ -26,7 +26,7 @@ from pathlib import Path
 # （このファイルに案件固有の値や絶対パスを持たないため）。使うのは main()。
 from verify_partials import DETAIL_TODO
 from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_elements, literal_text_elements, visible_initially
-from _jsx_chain import chain_for_lines
+from _jsx_chain import chain_for_lines, resolve_for_lines
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -1523,7 +1523,8 @@ def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> li
 
     判定ルール:
       initialization.items[k] と screen_layout.items[k] を名前で対にする（件数・名前が違えば対にしない）。
-      項目の src のうち最初の TSX/JSX の行範囲を chain_for_lines で読み、表示条件の鎖・disabled の鎖を取る。
+      項目の src のうち最初の TSX/JSX の行範囲を resolve_for_lines で出典の位置に結び、表示条件の鎖・disabled の鎖を取る。
+      位置で結べない項目（JSX の要素も配列の使用箇所も無い行範囲）は ERROR（差し戻し先 S1）。推測して読み飛ばさない。
       state の初期値で評価し（merge_partials と同じ関数）、評価できた値（None でない）と記載の活性・表示が違えば ERROR。
       評価が None の項目は見ない。「全項目が一色か」は見ない（正しく一色の画面で誤検出になるため）。
       TSX が読めないファイルは検査せず、ファイルごとに INFO を1件出す。
@@ -1557,9 +1558,12 @@ def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> li
             if str(s["file"]) not in missing:
                 missing.append(str(s["file"]))
             continue
-        r = chain_for_lines(str(path), ls, le)
-        if not r.get("found"):
-            continue  # JSX の外・配列の使用箇所も無い: 推測しない
+        res = resolve_for_lines(str(path), ls, le)
+        if res is None:
+            # WHY(round11 U2): 結べない項目を仮埋め（活性・表示）のまま通すと、誤った表示条件が docx まで出る（round10 の 6）。止めて S1 へ差し戻す
+            issues.append(("ERROR", f"initialization.items[{ini.get('no') or '?'}]({name}): 表示条件を出典の位置で結べない（出典 {path.name}:{ls}-{le}）。出典の行範囲を、その項目を描く JSX の要素か、データ配列の宣言に直す → 差し戻し先 S1"))
+            continue
+        r = res[0]
         dis = disabled_value(r.get("disabled_chain"), env)
         vis = chain_value(r.get("visible_chain") or [], env)
         no = ini.get("no") or "?"
@@ -1773,6 +1777,12 @@ def _selftest() -> int:
                    "initialization": {"items": [{"no": 1, "item_name": "読込中", "active": "活性", "visible": "表示"}]}}
         if [lvl for lvl, _ in check_initialization_eval(missing, {}, [])] != ["INFO"]:
             print("[selftest NG] TSX が読めないときに INFO で飛ばさない")
+            return 1
+        # WHY(round11 U2): 出典の行範囲が JSX の要素も配列の使用箇所も指さない（関数の宣言行）項目は、仮埋めで通さず ERROR（S1 へ差し戻し）
+        unlinked = {"screen_layout": {"items": [{"item_name": "読込中", "src": [{"file": str(tsx), "line_start": 1, "line_end": 1}]}]},
+                    "initialization": {"items": [{"no": 1, "item_name": "読込中", "active": "活性", "visible": "表示"}]}}
+        if [lvl for lvl, _ in check_initialization_eval(unlinked, {}, drafts_loading)] != ["ERROR"]:
+            print("[selftest NG] 出典の位置で結べない項目を ERROR にしない（仮埋めのまま通した）")
             return 1
     print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)")
     return 0
