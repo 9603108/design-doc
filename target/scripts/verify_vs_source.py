@@ -276,6 +276,12 @@ def check_messages(data, strings):
             t = norm(m.get("message") or "") if isinstance(m, dict) else ""
             if t and not _in_source(t, strings):
                 problems.append(f"[WARN] [文言] {key}[{m.get('message_id')}]: 「{t}」がソースの文字列に無い → 差し戻し先 H4")
+    # WHY: 本文は記号(：、。など)で始めない。強調要素の文言を先頭に付けて直す(N10)。run9 の MSW00001 は messages にあるので、messages と messages_backend の両方を見る
+    for key in ("messages", "messages_backend"):
+        for m in data.get(key) or []:
+            t = str(m.get("message") or "") if isinstance(m, dict) else ""
+            if t[:1] and t[:1] in "：:、。 　":
+                problems.append(f"[ERROR] [文言] {key}[{m.get('message_id')}]: 本文が記号「{t[:1]}」で始まる。強調要素の文言を先頭に付けるか記号を除く → 差し戻し先 H4")
     for ep in data.get("event_processes") or []:
         for line in ep.get("details") or []:
             for q in re.findall(r"「([^」]+)」", line) if isinstance(line, str) else []:
@@ -331,6 +337,11 @@ def check_calcs(calcs, candidates):
             vs = _name_variants((cand.get("operand_labels") or {}).get(o) or [])
             if vs and not any(v in text for v in vs):
                 problems.append(f"[WARN] [式] {where}: ソースの式 {cand['expr']} の {o}({'・'.join(sorted(vs)[:2])})が式に無い → 差し戻し先 H4")
+        # WHY: num() 等を通らないオペランドを持つ式に「値が無いときは 0」と書くと、ソースに無い扱いを書くことになる(run9 の CA1)
+        guard = cand.get("operand_guard") or {}
+        nones = [o for o in cand.get("operands") or [] if guard.get(o) == "none"]
+        if nones and _ZERO_FILL.search(c.get("remarks") or ""):
+            problems.append(f"[ERROR] [式の欠損] {where}: 値が無いときの扱いはソースに無い(オペランド {'・'.join(nones)} が num() 等を通らない)。「0 として扱う」を外す → 差し戻し先 S2")
         words = (c.get("formula") or "") + (c.get("remarks") or "")
         if "Math.floor" in cand.get("funcs", []) and not re.search(r"切り捨|切捨|FLOOR|floor", words):
             problems.append(f"[WARN] [式] {where}: ソースは Math.floor(切り捨て)だが式に切り捨ての語が無い → 差し戻し先 H4")
@@ -350,6 +361,8 @@ def check_calcs(calcs, candidates):
     return problems
 
 
+# WHY: 値が無いときを「0 として扱う」と書いた備考の形(check_calcs が見る)
+_ZERO_FILL = re.compile("0 として|値が無いとき[^。]*0|欠損[^。]*0")
 _OPERATION_TYPES = {"ComboBox", "Calendar", "Checkbox", "Input", "Button", "TextArea"}
 # jsx_elements のうち表示専用の要素(_react_facts._DISPLAY_HINT の tag と同じ)。check_items の (1)〜(3) の対象外
 _DISPLAY_TAGS = {"span", "strong", "h1", "h2", "a", "table"}
@@ -781,27 +794,72 @@ def _logical_of_physical(data):
     return out
 
 
-def check_item_remarks_units(data, apis):
+def _react_uses(react):
+    """react 下書きの field_usage を、応答の項目名(末尾の名前)ごとに使用行(file・行範囲)へ引く。呼出元: check_item_remarks_units。"""
+    out = {}
+    for f in (react or {}).get("field_usage") or []:
+        leaf = str(f.get("path") or "").replace("[]", "").split(".")[-1]
+        for u in f.get("uses") or []:
+            out.setdefault(leaf, []).extend(u.get("src") or [])
+    return out
+
+
+def _strings_in(node):
+    """JSON の値の中の文字列を全部出す。呼出元: check_item_remarks_units(手順の行)。"""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _strings_in(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings_in(v)
+
+
+def check_item_remarks_units(data, apis, react=None):
     """画面項目が結ぶ応答項目の件数(count)の単位に日付以外の列があるのに、項目の説明に「日数」「N日」と書いたものを ERROR にする(B15 b)。
+    項目との結び: (1)response_to_screen_mapping の画面項目名 (2)react 下書きの field_usage の使用行が入る画面項目(src の行範囲)。どちらでも結ぶ項目を見る。
+    WHY: mapping だけでは、店舗の選択肢(IT2)に日数の応答項目が結ばれ、日数の列を説明する会計カードの副題が見られない(run9 で数え方 0 件の原因)。
     WHY: 行数が日数になるのは、数える単位が日付の列だけのとき。店舗・レジ別の行数を日数と書くと、読み手は期間の日数と取り違える。
+    加えて、その項目の名前が「日数」を含み「行数」を含まない手順・イベントの行に出るものも ERROR にする(差し戻し先 S3)。CSV の行は見出し等の語で外す。
     差し戻し文に正しい言い方「<単位>の行数」を載せる。呼出元: main(下書きがあるとき)。"""
     items = {i.get("item_name"): i for i in (data.get("screen_layout") or {}).get("items") or [] if isinstance(i, dict)}
     logical = _logical_of_physical(data)
-    problems, seen = [], set()
+    used = _react_uses(react)
+    problems, seen, flagged = [], set(), {}
+
+    def remark(it, u, leaf):
+        if (it.get("item_name"), leaf) in seen:
+            return
+        others = [g for g in u.get("group_by") or [] if not _is_date_col(g)]
+        text = " ".join(str(it.get(k) or "") for k in ("remarks", "example"))
+        if not others or not _HAS_DAYS.search(text):
+            return
+        seen.add((it.get("item_name"), leaf))
+        unit = "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others)
+        flagged[it.get("item_name")] = unit
+        problems.append(f"[数え方] screen_layout.items[{it.get('item_name')}]: 「日数」「N日」と書くが、件数の単位は {unit} を含み日数ではない。「{unit}の行数」と書く → 差し戻し先 S1")
+
     for a in data.get("api_spec") or []:
         draft = [u for d in ((apis or {}).get(a.get("action")) or {}).get("db_operations") or [] for u in d.get("aggregate_units") or []]
+        counts = [u for u in draft if str(u.get("func")).lower() == "count" and (u.get("scope") or "main") == "main"]
         for m in a.get("response_to_screen_mapping") or []:
             it = items.get(m.get("screen_item_name"))
             leaf = _split_col(str(m.get("api_field_path") or "").replace("[]", ""))[1]
-            us = [u for u in draft if u.get("alias") == leaf and str(u.get("func")).lower() == "count" and (u.get("scope") or "main") == "main"]
-            if it is None or not us or (it.get("item_name"), leaf) in seen:
+            us = [u for u in counts if u.get("alias") == leaf]
+            if it is not None and us:
+                remark(it, us[0], leaf)
+        for u in counts:
+            for it in items.values():
+                if _overlap(it.get("src"), used.get(u.get("alias")) or []):
+                    remark(it, u, u.get("alias"))
+    for node in [data.get("front_processes"), data.get("event_processes")]:
+        for s in _strings_in(node or []):
+            if "日数" not in s or "行数" in s or "見出し" in s or "CSV" in s:
                 continue
-            others = [g for g in us[0].get("group_by") or [] if not _is_date_col(g)]
-            text = " ".join(str(it.get(k) or "") for k in ("remarks", "example"))
-            if others and _HAS_DAYS.search(text):
-                seen.add((it.get("item_name"), leaf))
-                unit = "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others)
-                problems.append(f"[数え方] screen_layout.items[{it.get('item_name')}]: 「日数」「N日」と書くが、件数の単位は {unit} を含み日数ではない。「{unit}の行数」と書く → 差し戻し先 S1")
+            for name, unit in flagged.items():
+                if name and name in s:
+                    problems.append(f"[ERROR] [数え方] 手順「{s}」が項目「{name}」の日数を書く。件数の単位は {unit} で、「{unit}の行数」と書く → 差し戻し先 S3")
     return problems
 
 
@@ -1172,6 +1230,26 @@ def selftest():
     v16 = {"no": "VL16", "field": "CSV出力", "rule": "合計行の表示", "kind": "表示切替", "src": sp(200, 232)}
     assert check_kinds([v16], [], bh16) == [], check_kinds([v16], [], bh16)
     assert len(check_kinds([dict(v16, kind="活性切替")], [], bh16)) == 1, "表示切替と活性切替の食い違いを拾わない"
+    # T18: 数え方は mapping と react の使用行の両方で項目を結ぶ。日数の手順の行は、結んだ項目の名前がある行だけ ERROR
+    t18_api = {"act": {"db_operations": [{"aggregate_units": [{"alias": "days", "func": "count", "group_by": ["s.shop_id", "s.sales_date"], "scope": "main"}]}]}}
+    t18_data = {"api_spec": [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].shop_id", "screen_item_name": "店舗"}]}],
+                "screen_layout": {"items": [{"item_name": "会計カードの副題", "remarks": "店名・日数を表示する", "example": "", "src": [{"file": "P.tsx", "line_start": 9, "line_end": 9}]}]},
+                "front_processes": [{"steps": [{"description": "会計カードの副題に日数を出す"}, {"description": "件数は店舗の行数で数える"}]}]}
+    t18_react = {"field_usage": [{"path": "rows[].days", "uses": [{"src": [{"file": "P.tsx", "line_start": 9, "line_end": 9}]}]}]}
+    got = check_item_remarks_units(t18_data, t18_api, t18_react)
+    assert len(got) == 2 and got[0].startswith("[数え方]") and got[1].startswith("[ERROR] [数え方]") and "差し戻し先 S3" in got[1], got
+    assert check_item_remarks_units(t18_data, t18_api) == [], "react の使用行が無いのに項目を結んだ"
+    # T18: 本文が記号で始まる messages・messages_backend は ERROR。code は見ない(messages[].code は message ID のまま。差異 10 は採らない)
+    bad_mb = {"messages": [{"message_id": "MSW00001", "code": "MSW00001", "message": "：この期間に取込欠損があります"}],
+              "messages_backend": [{"message_id": "MSE00002", "message": "正しい本文", "code": "MSE00002"}]}
+    errs = [g for g in check_messages(bad_mb, set()) if g.startswith("[ERROR]")]
+    assert len(errs) == 1 and "H4" in errs[0] and "messages[MSW00001]" in errs[0], errs
+    # T18: 値が無いときを 0 と書いた備考は、num() 等を通らないオペランドを持つ式だけ ERROR
+    cg = [{"id": "CC11", "label": "差引額", "expr": "r.a - r.b", "operands": ["a", "b"], "funcs": [], "literals": [],
+           "operand_labels": {"a": ["売上"], "b": ["返品"]}, "operand_guard": {"a": "num", "b": "none"}}]
+    cg_calc = [{"name": "差引額", "formula": "差引額 = 売上 - 返品", "remarks": "返品が無いときは 0 として扱う", "inputs": [{"name": "売上"}, {"name": "返品"}]}]
+    assert [g for g in check_calcs(cg_calc, cg) if g.startswith("[ERROR] [式の欠損]")], check_calcs(cg_calc, cg)
+    assert not [g for g in check_calcs([dict(cg_calc[0], remarks="")], cg) if "[式の欠損]" in g], "備考が空なのに ERROR"
     print("selftest OK")
     return 0
 
@@ -1236,7 +1314,7 @@ def main(argv=None):
     fetch_problems = check_fetch_plan(plan, data.get("front_processes"))
     # B15: 合成後の DB 名・数え方・選択肢・SQL の文字列・禁止語(ERROR)
     db_problems = check_db_names(data, bapis)
-    remark_problems = check_item_remarks_units(data, bapis)
+    remark_problems = check_item_remarks_units(data, bapis, rd_all)
     enum_problems = check_enum_mentions(data, rd_all)
     literal_problems = check_literal_transform(data, bapis)
     forbidden_problems = check_forbidden_words(data)
