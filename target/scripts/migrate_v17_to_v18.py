@@ -22,6 +22,7 @@ v18 の呼ぶ側／呼ばれる側 体系（trigger_groups / front_processes / b
 - 出力: 同ファイルを上書き（trigger_groups / front_processes / backend_processes を追加）
 - 仕様根拠: 15_中間JSONスキーマ.md「v18 メインスキーマ」セクション、SKILL.md「Phase 3-4 外部設定ファイル化」（v30）
 """
+import functools
 import json
 import sys
 
@@ -47,12 +48,14 @@ from _config_loader import (
 #          本ファイル内のアクセサ呼出すべてに FEATURE_NAME を明示で渡す（argv だけで渡しても動くように）。
 # 接続情報: 未指定なら _config_loader.resolve_feature_name が SystemExit で止める。
 #          下の PROCESS_NAMES_BY_EVENT_CODE が import 時にアクセサを呼ぶので、それより前に置く。
-FEATURE_NAME = get_feature_name_from_argv()
+# WHY: --selftest は機能名を取らない(argv[1] を機能名にすると画面設定の読込で落ちる)。selftest のときだけ機能名を仮の値にする。
+SELFTEST_MODE = "--selftest" in sys.argv
+FEATURE_NAME = "selftest" if SELFTEST_MODE else get_feature_name_from_argv()
 INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 # v30: PROCESS_NAMES_BY_EVENT_CODE は screen_config.json から動的取得（モジュールロード時に1回）
 # 意味合い: 画面別ハードコードを画面別 JSON に外出しすることで、本スクリプトは画面非依存の汎用処理になる
-PROCESS_NAMES_BY_EVENT_CODE = get_process_names_by_event_code(FEATURE_NAME)
+PROCESS_NAMES_BY_EVENT_CODE = {} if SELFTEST_MODE else get_process_names_by_event_code(FEATURE_NAME)
 
 
 def classify_trigger_kind(event: dict, default_screen_name: str = "") -> tuple:
@@ -370,8 +373,41 @@ def _renumber_init_steps(steps: list) -> list:
     return result
 
 
-def _guess_step_kind(text: str) -> str:
+# F1: 文面より react 下書きの事実(behavior の種別)を優先する。絞り込み・表示切替の behavior は入力検査ではない。
+DISPLAY_BEHAVIOR_KINDS = {"data_filter", "display_toggle", "enable_toggle"}
+
+
+@functools.lru_cache(maxsize=None)
+def _react_behaviors() -> tuple:
+    """react 下書きの behaviors[](処理の種別。_react_facts.behaviors が下書きに足す)を返す。下書きが無ければ空。
+    WHY: 下書きの行範囲(src)で、文面が指す処理と同じ behavior を引くため。読み元は FEATURE_NAME の下書き1本(apply_react_draft と同じ)。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return ()
+    try:
+        data = json.loads(draft.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    return tuple(b for b in data.get("behaviors") or [] if isinstance(b, dict))
+
+
+def _behavior_kinds_for_src(src) -> frozenset:
+    """src(行範囲の配列)と行範囲が重なる behavior の kind の集合を返す。
+    WHY: verify_vs_source.check_kinds と同じ対の取り方(behavior の src と control_src の行範囲が、処理の src と重なる)にする。
+         ここと検査で対の取り方が違うと、ここで通した kind を検査が ERROR にする。"""
+    spans = [s for s in src or [] if isinstance(s, dict)]
+    kinds = set()
+    for b in _react_behaviors():
+        bspans = [y for y in (b.get("src") or []) + (b.get("control_src") or []) if isinstance(y, dict)]
+        if b.get("kind") and any(x.get("file") == y.get("file") and x["line_start"] <= y["line_end"] and y["line_start"] <= x["line_end"]
+                                 for x in spans for y in bspans):
+            kinds.add(b["kind"])
+    return frozenset(kinds)
+
+
+def _guess_step_kind(text: str, react_kinds: frozenset = frozenset()) -> str:
     """ステップ description から kind を推定する（v29 で追加）。
+    react_kinds: 同じ処理の行範囲に重なる react behavior の kind（_behavior_kinds_for_src）。文面より優先して使う。
 
     キーワードマッチで業務分類:
     - API呼出 / fetch / POST / GET → backend_call
@@ -404,6 +440,11 @@ def _guess_step_kind(text: str) -> str:
     if any(kw in t for kw in ["リロード", "遷移", "画面へ", "別画面で起動"]):
         return "transition"
     if any(kw in t for kw in ["バリデーション", "チェック", "検証", "形式チェック", "重複チェック"]):
+        # WHY: 「チェック」は表示の絞り込み・表示切替の文にも出る(例: 表示対象を選ぶチェックボックス)。
+        #      同じ行範囲の behavior に入力検査(input_check)が無く、表示系(絞り込み・切替)だけなら入力検査にしない。
+        #      入力検査にすると verify_vs_source.check_kinds が [種別] ERROR で止めるため。
+        if react_kinds and "input_check" not in react_kinds:
+            return "screen_update"
         return "validation"
     if any(kw in t for kw in ["計算セル", "計算式", "再計算"] + extra_keywords.get("calculation", [])):
         return "calculation"
@@ -424,6 +465,7 @@ def _build_event_steps(ep: dict, ev: dict) -> list:
 
     各 step の kind は _guess_step_kind で内容から推定。
     """
+    react_kinds = _behavior_kinds_for_src(ep.get("src") or ev.get("src") or [])
     details = ep.get("details", []) or []
     if details:
         steps = []
@@ -433,7 +475,7 @@ def _build_event_steps(ep: dict, ev: dict) -> list:
                 continue
             steps.append({
                 "step_no": i,
-                "kind": _guess_step_kind(desc),
+                "kind": _guess_step_kind(desc, react_kinds),
                 "description": desc
             })
         if steps:
@@ -461,7 +503,7 @@ def _build_event_steps(ep: dict, ev: dict) -> list:
     for i, sent in enumerate(sentences, 1):
         steps.append({
             "step_no": i,
-            "kind": _guess_step_kind(sent),
+            "kind": _guess_step_kind(sent, react_kinds),
             "description": sent
         })
     return steps
@@ -939,5 +981,50 @@ def main():
     print(f"[OK] 保存先: {INTERMEDIATE_JSON}")
 
 
+def selftest() -> int:
+    """F1 の検査: 文面の「チェック」を、react 下書きの behavior の事実で入力検査にするかを決める。
+    behaviors は _react_behaviors を差し替えて与える(実ファイルに依らない)。WHY: 実ファイルで試すと案件ごとに結果が変わるため。"""
+    global _react_behaviors
+    real = _react_behaviors
+
+    def span(a, b):
+        return [{"file": "PosReport.tsx", "line_start": a, "line_end": b}]
+
+    beh = ({"kind": "data_filter", "src": span(124, 124), "control_src": span(276, 276)},
+           {"kind": "input_check", "src": span(200, 205), "control_src": []})
+    try:
+        _react_behaviors = lambda: beh
+        # 下書きの事実が無ければ文面どおり(従来の動き)
+        assert _guess_step_kind("表示対象のチェックを切り替える") == "validation"
+        # 絞り込みの behavior だけなら validation にしない
+        assert _guess_step_kind("表示対象のチェックを切り替える", frozenset({"data_filter"})) == "screen_update"
+        assert _guess_step_kind("表示対象のチェックを切り替える", frozenset({"display_toggle"})) == "screen_update"
+        # 入力検査が1つでもあれば文面どおり validation
+        assert _guess_step_kind("入力値を検証する", frozenset({"input_check"})) == "validation"
+        assert _guess_step_kind("入力値を検証する", frozenset({"data_filter", "input_check"})) == "validation"
+        # 文面が別の kind を指すものは変えない
+        assert _guess_step_kind("API を呼び出す", frozenset({"data_filter"})) == "backend_call"
+        # 行範囲が重なる behavior を引く(control_src も対象)
+        assert _behavior_kinds_for_src(span(270, 280)) == frozenset({"data_filter"})
+        assert _behavior_kinds_for_src(span(200, 201)) == frozenset({"input_check"})
+        assert _behavior_kinds_for_src(span(10, 20)) == frozenset()
+        assert _behavior_kinds_for_src([]) == frozenset()
+        # _build_event_steps: details と overview の両方で、ep の src から behavior を引く
+        s1 = _build_event_steps({"event_code": "EV05", "details": ["・表示対象のチェックを切り替える"], "src": span(270, 280)}, {})
+        assert [s["kind"] for s in s1] == ["screen_update"], s1
+        s2 = _build_event_steps({"event_code": "EV06", "details": ["・入力値を検証する"], "src": span(200, 201)}, {})
+        assert [s["kind"] for s in s2] == ["validation"], s2
+        s3 = _build_event_steps({"event_code": "EV07", "details": ["・表示対象のチェックを切り替える"], "src": span(10, 20)}, {})
+        assert [s["kind"] for s in s3] == ["validation"], s3
+        s4 = _build_event_steps({"event_code": "EV05", "overview": "表示対象のチェックを切り替える。", "src": span(270, 280)}, {})
+        assert [s["kind"] for s in s4] == ["screen_update"], s4
+    finally:
+        _react_behaviors = real
+    print("[selftest OK] migrate_v17_to_v18.step_kind")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     main()

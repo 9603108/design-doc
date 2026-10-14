@@ -457,6 +457,20 @@ def check_example_warn(frags):
     return [f"[WARN] [例示値] screen_layout.items: 例示値に {{…}} の穴が残る: {', '.join(holes)} → 差し戻し先 S1"]
 
 
+def check_composed_warn(frags):
+    """単位が合成の欄(_units.COMPOSED: db_operations の ctes・subqueries)を書いたときの [WARN]。
+    WHY: 書いた値は合成が下書きの事実で置き換えるので、終了コードにも差し戻しにもしない(差し戻し先を書くと再依頼されるため書かない)。"""
+    import _units
+    counts = {}
+    for unit, f in frags.items():
+        leaves, _ = _units.decompose(f)
+        n = sum(1 for generic, _c in leaves if generic in _units.COMPOSED)
+        if n:
+            counts[unit] = n
+    return [f"[WARN] [合成] {u}: db_operations の ctes・subqueries を {n} 欄書いた。合成が下書きの事実で置き換える(書いた値は捨てる)"
+            for u, n in sorted(counts.items())]
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -482,7 +496,7 @@ def main_units(directory, only=None):
     # WARN は終了コードに影響しない(合成で機械的に補うため)
     for w in check_h2_logical_names(frags.get("H2") or {}):
         print(w)
-    for w in check_src_warn(frags) + check_explanation_warn(frags) + check_example_warn(frags):
+    for w in check_src_warn(frags) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags):
         print(w)
     # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
     s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
@@ -690,6 +704,24 @@ def selftest_warn():
     hole_cal = {"S1": {"screen_layout": {"items": [{"item_name": "集計開始日", "example": "{集計開始日}", "item_type": "Calendar"}]}}}
     assert check_example_format(hole_cal) == [], "日付の穴を ERROR にした"
     assert [w for w in check_example_warn(hole_cal) if "集計開始日" in w], "日付の穴を WARN にしない"
+    # F2: H2 が db_operations の subqueries・ctes を書いても範囲外・重複の ERROR にしない。WARN だけ出す(差し戻し先は書かない)
+    import _units
+    spec_h2 = {"units": {"H2": {"owns": ["db_operations[].operation_type"]}}}
+    h2_sub = {"db_operations": [{"id": "db_op_x", "operation_type": "select",
+                                 "subqueries": [{"location": "WHERE", "definition": "SELECT max(d) FROM t", "filtered": False}],
+                                 "ctes": []}]}
+    assert _units.check_fragments(spec_h2, {"H2": h2_sub}) == [], "合成が埋める欄を範囲外にした"
+    w = check_composed_warn({"H2": h2_sub})
+    assert len(w) == 1 and w[0].startswith("[WARN] [合成] H2") and "差し戻し先" not in w[0], w
+    assert check_composed_warn({"H2": {"db_operations": [{"id": "db_op_x", "operation_type": "select"}]}}) == [], "書いていない H2 で WARN を出した"
+    # 合成は下書きの事実で置き換える。H2 の書いた値は捨て、下書きに無い id の欄は外す
+    rows = [{"id": "db_op_x", "subqueries": [{"definition": "作り話"}], "ctes": [{"name": "作り話"}]},
+            {"id": "db_op_y", "subqueries": [{"definition": "作り話"}]}]
+    facts = {"db_op_x": {"ctes": [{"name": "d", "definition": "SELECT 1", "from": "t", "filtered": True}],
+                         "subqueries": [{"location": "WHERE", "definition": "SELECT max(d) FROM t", "filtered": False}]}}
+    _units._set_db_op_facts(rows, facts)
+    assert rows[0]["subqueries"] == facts["db_op_x"]["subqueries"] and rows[0]["ctes"] == facts["db_op_x"]["ctes"], rows[0]
+    assert "subqueries" not in rows[1] and "ctes" not in rows[1], rows[1]
     print("[selftest OK] verify_partials.warn")
 
 

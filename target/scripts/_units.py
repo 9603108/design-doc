@@ -72,6 +72,11 @@ REQUIRED = {
     "db_operations": ["operation_type"],
 }
 
+# F2: 合成が backend 下書きの事実(apis[*].db_operations[].ctes・subqueries)で埋める欄。単位(H2)は書かない。
+# WHY: 副問い合わせ・CTE を単位に書かせると、ソースの SQL に無い作り話が混じる。単位が書いてしまった値は範囲外の ERROR にせず、
+#      check_fragments で数えずに飛ばし、compose が下書きの事実で置き換える(_fill_db_op_facts)。
+COMPOSED = {"db_operations[].subqueries", "db_operations[].ctes"}
+
 
 def _rows(composed, generic):
     node = composed
@@ -178,6 +183,9 @@ def check_fragments(spec, frags, only=None):
             continue
         mine = units[unit].get("owns") or []
         for generic, concrete in leaves:
+            if generic in COMPOSED:
+                # WHY: 合成が下書きの事実で置き換える欄なので、単位が書いても範囲外・重複の問題にしない(WARN は verify_partials が出す)
+                continue
             written.setdefault(concrete, []).append(unit)
             if not any(owns(p, generic) for p in mine):
                 who = owner_of(spec, generic)
@@ -393,6 +401,37 @@ def _initial_text(si):
     if kind == "literal":
         return {'""': "空文字", "''": "空文字", "[]": "空の一覧"}.get(raw, raw)
     return si.get("readable") or f"式: {raw}"
+
+
+def _fill_db_op_facts(out):
+    """db_operations[].ctes・subqueries を、backend 下書きの apis[*].db_operations[] の事実(同じ id の行)で置き換える(F2)。
+    呼出元: compose(_fill_src の後)。意味合い: 副問い合わせ・CTE はソースの SQL を機械が分解した事実なので、単位(H2)の書き写しは使わない。
+    単位が書いた値は捨てる(差し戻さない。check_fragments が COMPOSED の欄を飛ばす)。下書きに同じ id の行が無いときは事実が無いので欄を外す。
+    WHY: 欄を外すのは、単位が書いた値が下書きに無い SQL の作り話を残さないため。事実で埋めるのを下書きの有無に任せると、無い下書きで作り話が残る。"""
+    from _config_loader import INTERMEDIATE_DIR
+    facts = {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+        try:
+            b = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for a in (b.get("apis") or {}).values():
+            for o in a.get("db_operations") or []:
+                if isinstance(o, dict) and o.get("id"):
+                    facts[o["id"]] = o
+    _set_db_op_facts(_rows(out, "db_operations"), facts)
+
+
+def _set_db_op_facts(rows, facts):
+    """rows の各行の ctes・subqueries を、facts(id → 下書きの db_operations の行)の値で置き換える。facts に無い id の欄は外す。"""
+    for r in rows:
+        f = facts.get(r.get("id"))
+        if f is None:
+            r.pop("ctes", None)
+            r.pop("subqueries", None)
+            continue
+        r["ctes"] = copy.deepcopy(f.get("ctes") or [])
+        r["subqueries"] = copy.deepcopy(f.get("subqueries") or [])
 
 
 def _fill_initial_values(out):
@@ -637,6 +676,7 @@ def compose(spec, frags, project_config=None, log=None):
                     msgs.append({**{k: ce[k] for k in ("code", "severity", "message") if k in ce}, "message_id": mid})
                     have.add(mid)
     _fill_src(out)
+    _fill_db_op_facts(out)
     _fill_initial_values(out)
     # 参照の正規化は events を正として行う。順序: 旧コードを現行へ写す → 初期表示の発火を足す → code を下書きの実際の値へ寄せる
     _normalize_event_refs(out, log)

@@ -34,3 +34,5 @@
 
 ## 書かない欄
 - dataset_name・remarks(S2)
+- `db_operations[].subqueries`・`db_operations[].ctes`。合成が下書きの `apis.<action>.db_operations[]` から入れる(書いても合成が事実で置き換える)
+- 副問い合わせ(サブクエリ)の中の集計(SUM・MAX 等)は `aggregate` に入れない。副問い合わせは合成が `subqueries` に入れる
