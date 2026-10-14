@@ -78,6 +78,10 @@ def build_substitution_map(logical_names: list) -> tuple:
     col_map = {}
     table_map = {}
     for entry in logical_names or []:
+        # B19: derived:true は別名の行（first_date・last_date 等が kai_date を指す）。
+        # 置換の表に入れると本文の kai_date が「最初の会計日[kai_date]」に化けるため使わない。
+        if entry.get("derived"):
+            continue
         pc = entry.get("physical_column")
         lc = entry.get("logical_column")
         if pc and lc and pc not in col_map:
@@ -285,5 +289,33 @@ def main():
     print(f"[OK] 保存先: {INTERMEDIATE_JSON}")
 
 
+def _selftest():
+    """B19: derived:true の行が置換の表に入らないことを確かめる（ファイルは書き換えない）。
+
+    WHY: 合成(_compose_db_facts)が別名から補った行（first_date・last_date が kai_date を指す）を
+         置換の表に入れると、本文の kai_date が「最初の会計日[kai_date]」に化ける。
+    """
+    names = [
+        {"physical_table": "pos", "logical_table": "POS会計", "physical_column": "kai_date",
+         "logical_column": "会計日", "alias_name": "kai_date"},
+        {"physical_table": "pos", "logical_table": "POS会計(推定)", "physical_column": "kai_date",
+         "logical_column": "最初の会計日", "alias_name": "first_date", "derived": True},
+    ]
+    col_map, table_map = build_substitution_map(names)
+    assert col_map == {"kai_date": "会計日"}, col_map
+    assert table_map == {"pos": "POS会計"}, table_map
+    text = "会計日 kai_date の最初を見る"
+    out = substitute_text(text, _build_regex(list(col_map)), col_map,
+                          _build_regex(list(table_map)), table_map)
+    assert out == "会計日 会計日[kai_date] の最初を見る", out
+    # derived の行だけ先に来ても、通常の行の対応が残ること
+    rev_map, _ = build_substitution_map(list(reversed(names)))
+    assert rev_map == {"kai_date": "会計日"}, rev_map
+    print("[selftest OK] apply_logical_name_substitution (B19: derived の行を置換の表に使わない)")
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--selftest"]:
+        _selftest()
+    else:
+        main()
