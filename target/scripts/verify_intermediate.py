@@ -24,6 +24,7 @@ from pathlib import Path
 # 2026-10-05 汎用化: 機能名・中間 JSON の置き場・案件ごとの設定は _config_loader から取る
 # （このファイルに案件固有の値や絶対パスを持たないため）。使うのは main()。
 from verify_partials import DETAIL_TODO
+from _initial_eval import build_env, linked_fixed_elements, literal_text_elements, visible_initially
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -1421,16 +1422,21 @@ def check_src(merged: dict, sc: dict) -> list:
     return issues
 
 
-def check_initialization_items(merged: dict) -> list:
+def check_initialization_items(merged: dict, drafts: list = None) -> list:
     """B16 (round9): 初期処理の表の中身を検査する。
 
     判定ルール:
       (a) initialization.items の件数が screen_layout.items の件数と違う → ERROR
       (b) 全項目が「活性/表示」の一色 → ERROR（表示条件・disabled を評価できた項目が1つも無い）
-      (c) 固定文の項目（表示専用の Label で example に {…} の穴が無い）の初期値が Blank → ERROR
+      (c) 固定文の項目で、初期表示で見えるものの初期値が Blank → ERROR。
+          固定文 = react 下書きの jsx_elements のうち文字列リテラルだけの要素（text があり label が無い）に、
+          項目の名前か example の文言が一致する項目。見えるか = visible_chain（無ければ visible_if）を初期値で評価して真。
+          初期表示で見えない固定文（読込中・エラーなど）の Blank は正しいので対象外。
     WHY: merge_partials.build_initialization は評価できない項目を仮埋めの「活性/表示」で出す。
          後段の検査が無いと、その仮埋めのまま docx に出ても止まらないため。
-    接続情報: 入力 = merged['initialization']['items'] / merged['screen_layout']['items'] / 出力 = [(level, message), ...] / 呼出元 = main()
+         固定文の判定は example の形（{…} の有無）では行わない。実行時の値（総売上など）を固定文と誤認するため。
+    接続情報: 入力 = merged['initialization']['items'] / merged['screen_layout']['items'] / drafts（react 下書きの一覧。省略時は (c) を判定しない）
+              / 出力 = [(level, message), ...] / 呼出元 = main()
     """
     issues = []
     init_items = (merged.get("initialization") or {}).get("items") or []
@@ -1439,18 +1445,33 @@ def check_initialization_items(merged: dict) -> list:
         issues.append(("ERROR", f"initialization.items が {len(init_items)} 件で screen_layout.items の {len(sl_items)} 件と一致しない（画面項目と同数にする）"))
     if init_items and all(str(i.get("active") or "") == "活性" and str(i.get("visible") or "") == "表示" for i in init_items):
         issues.append(("ERROR", "initialization.items が全項目「活性/表示」の一色（表示条件・disabled を評価できた項目が1つも無い。仮埋めのまま）"))
-    # 固定文の判定: 表示専用の Label で example に {…} の穴が無く、文字がある項目
-    # WHY: 固定文は画面に書かれた文言そのものなので、初期値を Blank にする理由が無い
-    fixed_names = set()
+    # (c) 固定文の判定。state の初期値で表示条件を評価する（merge_partials と同じ評価器・同じ下書きの事実）
+    drafts = drafts or []
+    env = build_env([si for d in drafts for si in d.get("state_initials") or [] if isinstance(si, dict)],
+                    [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)])
+    literal = literal_text_elements(drafts)
+    visible_fixed = set()
     for s in sl_items:
-        ex = str(s.get("example") or "").strip()
-        if str(s.get("item_type") or "").lower() == "label" and ex and not re.search(r"[{}]", ex):
-            fixed_names.add(str(s.get("item_name") or "").strip())
+        linked = linked_fixed_elements([s.get("item_name"), s.get("example")], literal)
+        if any(visible_initially(el, env) is True for el in linked):
+            visible_fixed.add(str(s.get("item_name") or "").strip())
     for i in init_items:
         name = str(i.get("item_name") or "").strip()
-        if name in fixed_names and str(i.get("initial_value") or "") == "Blank":
-            issues.append(("ERROR", f"initialization.items[{i.get('no') or '?'}]({name}): 固定文の項目の初期値が Blank（画面に書かれた文言を初期値に入れる）"))
+        if name in visible_fixed and str(i.get("initial_value") or "") == "Blank":
+            issues.append(("ERROR", f"initialization.items[{i.get('no') or '?'}]({name}): 初期表示で見える固定文の初期値が Blank（画面に書かれた文言を初期値に入れる）"))
     return issues
+
+
+def _load_react_drafts() -> list:
+    """機能の react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
+    WHY: merge_partials.load_react_drafts と同じ集まりを見て、初期表示の判定の事実を揃える（merge_partials は argv を読むため import しない）。"""
+    drafts = []
+    for p in sorted(INTERMEDIATE_DIR.glob("*_react_draft.json")):
+        try:
+            drafts.append(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return drafts
 
 
 def check_event_action(merged: dict) -> list:
@@ -1549,9 +1570,26 @@ def _selftest() -> int:
         {"no": 1, "item_name": "店舗", "active": "活性", "visible": "表示", "initial_value": "Blank"},
         {"no": 2, "item_name": "注記", "active": "活性", "visible": "表示", "initial_value": "Blank"},
     ]}, "screen_layout": sl_ok}
-    msgs = [m for _, m in check_initialization_items(bad_init)]
+    # 注記は文字列リテラル「注記」の要素に名前で結ばれ、初期表示で見える。初期値が Blank なので固定文の ERROR
+    lit = [{"jsx_elements": [{"text": "注記", "visible_chain": []}]}]
+    msgs = [m for _, m in check_initialization_items(bad_init, lit)]
     if not (any("一色" in m for m in msgs) and any("固定文" in m for m in msgs)):
         print(f"[selftest NG] 初期処理の一色・固定文の ERROR が出ない: {msgs}")
+        return 1
+    # 固定文でも初期表示で見えないもの（読込中など）の Blank は正しい。見える固定文の値が入っていれば ERROR は出ない
+    hidden = [{"jsx_elements": [{"text": "注記", "visible_chain": [{"cond": "loading", "kind": "ternary_then"}]}],
+               "state_initials": [{"state": "loading", "kind": "literal", "initial": "false"}]}]
+    if any("固定文" in m for _, m in check_initialization_items(bad_init, hidden)):
+        print("[selftest NG] 初期表示で見えない固定文の Blank を ERROR にした")
+        return 1
+    if check_initialization_items(good, lit):
+        print("[selftest NG] 見える固定文に文言が入っているのに ERROR が出た")
+        return 1
+    # 例が文字列（{…} なし）の Label でも、下書きの文字列リテラルに結ばれないもの（総売上など）は固定文にしない
+    calc = {"initialization": {"items": [{"no": 1, "item_name": "総売上", "active": "非活性", "visible": "表示", "initial_value": "Blank"}]},
+            "screen_layout": {"items": [{"item_name": "総売上", "item_type": "Label", "example": "1,250,000 円"}]}}
+    if check_initialization_items(calc, lit):
+        print("[selftest NG] 実行時の値の Label を固定文にした")
         return 1
     if not any("一致しない" in m for _, m in check_initialization_items({"initialization": {"items": good["initialization"]["items"][:1]}, "screen_layout": sl_ok})):
         print("[selftest NG] 初期処理の件数の不一致が出ない")
@@ -1663,7 +1701,7 @@ def main():
     # 2026-10-13 案 A4: 出典(src)の無い記述は WARN、対象外のファイル・作り話の行番号は ERROR
     all_issues.extend(check_src(merged, sc))
     # B16 (round9): 初期処理の表（件数・一色・固定文）、動作語の空、構成図の ID、共通ロジックの呼出元
-    all_issues.extend(check_initialization_items(merged))
+    all_issues.extend(check_initialization_items(merged, _load_react_drafts()))
     all_issues.extend(check_event_action(merged))
     all_issues.extend(check_diagram_ids(merged))
     all_issues.extend(check_common_logic_callers(merged))

@@ -19,7 +19,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from _initial_eval import build_env, chain_value, disabled_value
+from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_elements, literal_text_elements, visible_initially
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -156,7 +156,8 @@ def _visibility(elements: list, env: dict) -> tuple:
     WHY: 表示条件の鎖・disabled の式を state の初期値で評価し、評価できないものは「条件付き(式)」と書く。"""
     if not elements:
         return "活性", "表示"  # 仮埋め（結ぶ要素が無い項目。B16 が全項目一色を検出する）
-    visible = {_VIS_LABEL[chain_value(el.get("visible_chain") or [], env)] for el in elements}
+    # WHY: 鎖が無い要素は visible_if（条件の式）で初期表示を決める。鎖だけを見ると「読込中…」が出ている扱いになる（run9）
+    visible = {_VIS_LABEL[visible_initially(el, env)] for el in elements}
     active = {
         {True: "非活性", False: "活性", None: "条件付き(式)"}[disabled_value(el.get("disabled_chain"), env)]
         for el in elements
@@ -175,7 +176,7 @@ def _initial_value(item: dict, states: dict, options: dict, elements: list = Non
     if si:
         return _initial_text_from_state(si, options.get(name, {}))
     for el in elements or []:
-        if el.get("text") and not el.get("label") and chain_value(el.get("visible_chain") or [], env or {}) is True:
+        if el.get("text") and not el.get("label") and visible_initially(el, env or {}) is True:
             return str(el["text"])
     # fallback-ok: 結ぶ state も表示される固定文も無い項目は、合成欄の既存値、無ければ Blank（事実が無いので決めない）
     return item.get("initial_value") or "Blank"
@@ -229,11 +230,13 @@ def build_initialization(events: list, screen_layout: dict, db_operations: list 
     options = _option_texts(drafts)
     env = build_env(_all_states(drafts), _all_derived(drafts))
     elements = _elements_by_name(drafts)
+    literal = literal_text_elements(drafts)  # 固定文の要素（文字列リテラルだけで決まるもの）
 
     items = []
     for sl_item in screen_layout.get("items", []):
         name = str(sl_item.get("item_name") or "").strip()
-        els = elements.get(name, [])
+        # WHY: 名前で結ぶ要素が無い Label（設計上の名前「画面見出し」と JSX の文言「POS会計レポート」が違う）は、画面に書かれた文言（example）で固定文に結ぶ
+        els = elements.get(name) or linked_fixed_elements([name, str(sl_item.get("example") or "")], literal)
         active, visible = _visibility(els, env)
         items.append({
             "no": len(items) + 1,
@@ -375,6 +378,8 @@ def _selftest_initialization() -> int:
             {"text": "合計", "visible_chain": [{"cond": "rows.length > 1", "kind": "and"}]},
             {"text": "読込中…", "visible_chain": [{"cond": "loading", "kind": "ternary_then"}]},
             {"text": "注記文", "visible_chain": []},
+            {"tag": "h1", "text": "業務見出し", "visible_chain": []},
+            {"text": "エラー文", "visible_chain": [], "visible_if": "loading"},
             {"text": "式の注記", "visible_chain": [{"cond": "f(from)", "kind": "and"}]},
             {"label": "CSV出力", "visible_chain": [], "disabled_chain": [{"cond": "!rows.length", "kind": "disabled"}]},
         ],
@@ -393,6 +398,9 @@ def _selftest_initialization() -> int:
         {"item_name": "CSV出力", "item_type": "Button"},
         {"item_name": "未設定の項目", "item_type": "Label"},
         {"item_name": "手書きの項目", "item_type": "Label", "initial_value": "手書き"},
+        {"item_name": "画面見出し", "item_type": "Label", "example": "業務見出し"},
+        {"item_name": "読込中表示", "item_type": "Label", "example": "読込中…"},
+        {"item_name": "エラー表示", "item_type": "Label", "example": "エラー文"},
     ]}
     events = [{"event_code": "EV00", "content": "初期表示の概要"}, {"event_code": "EV01", "content": ""}]
     dbs = [{"id": "db_op_a", "api_endpoint": {"action": "list_a"}},
@@ -414,6 +422,9 @@ def _selftest_initialization() -> int:
         "CSV出力": ("非活性", "表示", "Blank"),
         "未設定の項目": ("活性", "表示", "Blank"),
         "手書きの項目": ("活性", "表示", "手書き"),
+        "画面見出し": ("活性", "表示", "業務見出し"),  # 名前は違うが example の文言で h1 に結ぶ（初期表示で見える）
+        "読込中表示": ("活性", "非表示", "Blank"),  # visible_chain が空で visible_if=loading（初期は偽）
+        "エラー表示": ("活性", "非表示", "Blank"),  # 同上
     }
     got = build_initialization(events, screen, dbs, drafts)
     vals = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in got["items"]}

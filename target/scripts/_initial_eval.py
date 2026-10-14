@@ -286,6 +286,35 @@ def disabled_value(disabled_chain: list, env: dict):
     return truth(last.get("cond") or "", env)
 
 
+def literal_text_elements(drafts: list) -> list:
+    """react 下書きの jsx_elements のうち、中身が文字列リテラルだけで決まる要素（text があり label が無い）の一覧。
+    WHY: 固定文は JSX の文字列そのもの（見出し・注記・読込中の文言など）。{error} や DB の値のように実行時に決まる要素は text に入らないので、ここに出ない。"""
+    return [el for d in drafts or [] for el in d.get("jsx_elements") or []
+            if isinstance(el, dict) and str(el.get("text") or "").strip() and not el.get("label")]
+
+
+def linked_fixed_elements(names: list, elements: list) -> list:
+    """画面項目の名前の候補（item_name・example）と文言が一致する固定文の要素の一覧。どれとも一致しなければ空（推測で結ばない）。
+    WHY: 画面項目の item_name は設計上の名前（例「画面見出し」）で、JSX の文言（例「POS会計レポート」）と一致しないことがある。
+         画面に書かれた文言は example なので、example も候補にする。"""
+    keys = {str(n).strip() for n in names or [] if str(n or "").strip()}
+    return [el for el in elements or [] if str(el.get("text") or "").strip() in keys]
+
+
+def visible_initially(el: dict, env: dict):
+    """要素が初期表示で見えるか（True / False / None = 決まらない）。
+    visible_chain があれば鎖を評価する。無ければ visible_if（条件の式）を評価する。どちらも無ければ常に表示。
+    WHY: run9 の「読込中…」は visible_chain が空で、visible_if に loading だけを持つ（{loading && <span>…</span>}）。
+         鎖だけ見ると、初期表示で出ていない文言を出ている扱いにしてしまう。"""
+    chain = el.get("visible_chain") or []
+    if chain:
+        return chain_value(chain, env)
+    cond = el.get("visible_if")
+    if cond:
+        return truth(str(cond), env)
+    return True
+
+
 def selftest() -> int:
     """式の評価・派生配列・表示条件の鎖・活性の判定を assert する。終了コード 0=OK / 1=NG。"""
     env = build_env(
@@ -340,6 +369,27 @@ def selftest() -> int:
         return 1
     if disabled_value([{"cond": "dyn", "kind": "disabled"}], env) is not None:
         print("[selftest NG] disabled_value(dyn)")
+        return 1
+    # visible_chain が空でも visible_if の式で初期表示を決める（読込中など）。鎖があれば鎖を優先する
+    if visible_initially({"visible_chain": [], "visible_if": "loading"}, env) is not False:
+        print("[selftest NG] visible_initially(visible_if=loading)")
+        return 1
+    if visible_initially({"visible_chain": [], "visible_if": None}, env) is not True:
+        print("[selftest NG] visible_initially(条件なし)")
+        return 1
+    if visible_initially({"visible_chain": [{"cond": "rows.length > 1", "kind": "and"}], "visible_if": "loading"}, env) is not False:
+        print("[selftest NG] visible_initially(鎖の優先)")
+        return 1
+    # 固定文は文字列リテラルだけの要素。名前か example の文言で結ぶ（ラベル付きの要素は固定文ではない）
+    lit = literal_text_elements([{"jsx_elements": [
+        {"text": "見出し", "visible_chain": []},
+        {"label": "店舗", "text": "店舗", "visible_chain": []},
+    ]}])
+    if [el["text"] for el in linked_fixed_elements(["画面見出し", "見出し"], lit)] != ["見出し"]:
+        print("[selftest NG] linked_fixed_elements")
+        return 1
+    if linked_fixed_elements(["店舗"], lit) != []:
+        print("[selftest NG] linked_fixed_elements(label 付きを固定文にした)")
         return 1
     print("[selftest OK] _initial_eval")
     return 0
