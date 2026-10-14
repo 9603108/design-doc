@@ -31,6 +31,11 @@ _CALL = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(")
 _CATCH_BLOCK = re.compile(r"\s*catch\s*(?:\([^)]*\))?\s*\{")
 _FINALLY_BLOCK = re.compile(r"\s*finally\s*\{")
 _CHAIN = re.compile(r"\.(then|catch|finally)\s*\(")
+# 引数の先頭の (x) => / x => の x(on_success_from の「d.」を外すため)
+_LAMBDA_PARAM = re.compile(r"\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*")
+# const d = await ...(try 形で、受け取った応答の変数名)
+_AWAIT_VAR = re.compile(r"\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*await\b")
+_MEMBER = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
 
 
 def _end(text, i):
@@ -59,6 +64,17 @@ def _end(text, i):
 
 def _uniq(xs):
     return list(dict.fromkeys(xs))
+
+
+def _member_of(expr, par):
+    """set の引数 expr が「par.<メンバー連鎖>」なら <メンバー連鎖> を返す。par 無し・par だけ・式の場合は None。
+
+    意味合い: 応答の何を state に入れたか(shops ← rows)の事実。単純なメンバーでなければ推測で埋めない。
+    """
+    if not par or not expr.startswith(par + "."):
+        return None
+    rest = expr[len(par) + 1:]
+    return rest if _MEMBER.fullmatch(rest) else None
 
 
 def _setter_map(sources):
@@ -101,6 +117,12 @@ def _promise_chain(b, setters):
     if not parts["catch"]:
         return None
     succ = _uniq([st for a in parts["then"] for st, _ in _set_calls(a, setters)])
+    succ_from = {}
+    for a in parts["then"]:
+        lp = _LAMBDA_PARAM.match(a)
+        par = lp.group(1) if lp else ""
+        for st, v in _set_calls(a, setters):
+            succ_from.setdefault(st, _member_of(v, par))
     fails = [sc for a in parts["catch"] for sc in _set_calls(a, setters)]
     fail = _uniq([st for st, _ in fails])
     return {
@@ -112,6 +134,7 @@ def _promise_chain(b, setters):
         "untouched_on_failure": [s for s in succ if s not in fail],
         "failure_text": fails[0][1] if fails else "",
         "failure_state": fails[0][0] if fails else "",
+        "on_success_from": succ_from,
         "start": m.start(),
         "end": stop,
     }
@@ -136,6 +159,11 @@ def _try_chain(b, setters):
     fails = _set_calls(b[cb:ce], setters)
     fail = _uniq([st for st, _ in fails])
     succ = _uniq([st for st, _ in _set_calls(b[tb:te], setters)])
+    av = _AWAIT_VAR.search(b[tb:te])
+    par = av.group(1) if av else ""
+    succ_from = {}
+    for st, v in _set_calls(b[tb:te], setters):
+        succ_from.setdefault(st, _member_of(v, par))
     return {
         "call": awaits[-1] if awaits else "",
         "before_call": [f"{st}={v}" for st, v in _set_calls(b[:tm.start()], setters)],
@@ -145,6 +173,7 @@ def _try_chain(b, setters):
         "untouched_on_failure": [s for s in succ if s not in fail],
         "failure_text": fails[0][1] if fails else "",
         "failure_state": fails[0][0] if fails else "",
+        "on_success_from": succ_from,
         "start": tm.start(),
         "end": end,
     }
@@ -192,7 +221,7 @@ def extract(links, sources):
             seen.add(key)
             entry = {"event": code}
             for k in ("call", "before_call", "on_success", "on_failure", "in_finally",
-                      "untouched_on_failure", "failure_text", "failure_state"):
+                      "untouched_on_failure", "failure_text", "failure_state", "on_success_from"):
                 entry[k] = f[k]
             entry["src"] = src
             out.append(entry)
@@ -620,6 +649,22 @@ def _expr_end(text, i):
     return len(text)
 
 
+def _operand_guards(expr, par, ops):
+    """式の各オペランド(par.列)が、値の欠損を num(・Number(・?? 0・|| 0 で受けているかを {列: "num"|"none"} で返す。
+
+    意味合い: num() 等を通らない列は、欠損のとき式の結果がどうなるかソースに書かれていない事実になる。
+    全ての出現が受けられているときだけ num にする(1か所でも素のまま使えば none)。
+    """
+    out = {}
+    for o in ops:
+        occ = list(re.finditer(rf"\b{re.escape(par)}\.{re.escape(o)}\b", expr))
+        wrapped = bool(occ) and all(
+            re.search(r"\b(?:num|Number)\(\s*$", expr[:x.start()]) or re.match(r"\s*(?:\?\?|\|\|)\s*0\b", expr[x.end():])
+            for x in occ)
+        out[o] = "num" if wrapped else "none"
+    return out
+
+
 def _col_names(text):
     """定数配列の {label, csv, kin, cnt} から 列名 → [画面での名前(label・csv)] を作る。呼出元: calc_candidates。"""
     names = {}
@@ -660,6 +705,7 @@ def calc_candidates(sources):
                 "literals": _uniq(re.findall(r"(?<![\w.])\d+(?:\.\d+)?", expr)),
                 "guards": [f"{tm.group(1)} が 0 のとき {tm.group(2).strip()}"] if tm else [],
                 "operand_labels": {o: names[o] for o in ops if o in names},
+                "operand_guard": _operand_guards(expr, m.group(1), ops),
                 "in": "フロント",
                 "src": [{"file": str(p), "line_start": text.count("\n", 0, s) + 1, "line_end": text.count("\n", 0, e) + 1}]})
     return {"calc_candidates": out}
@@ -1302,6 +1348,8 @@ def selftest_calc():
         "  { label: \"点数\", kin: \"n\" },\n"
         "  { label: \"差\", calc: (r) => r.s3 - r.n, added: true },\n"
         "  { label: \"平均\", calc: (r) => (r.n ? Math.floor(r.s3 / r.n) : 0) },\n"
+        # fallback-ok: operand_guard の num 形(num()・?? 0・|| 0 で受ける式)を検査するための入力
+        "  { label: \"税\", calc: (r) => (num(r.s3) ?? 0) - (r.n || 0) },\n"
         "];\n"
     )
     try:
@@ -1309,8 +1357,11 @@ def selftest_calc():
             p = Path(d) / "S.tsx"
             p.write_text(tsx, encoding="utf-8")
             got = calc_candidates([p])["calc_candidates"]
-        assert [c["label"] for c in got] == ["差", "平均"], got
-        a, b = got
+        assert [c["label"] for c in got] == ["差", "平均", "税"], got
+        a, b, t = got
+        assert a["operand_guard"] == {"s3": "none", "n": "none"}, f"guard(差): {a}"
+        assert b["operand_guard"] == {"n": "none", "s3": "none"}, f"guard(平均): {b}"
+        assert t["operand_guard"] == {"s3": "num", "n": "num"}, f"guard(税): {t}"
         assert a["expr"] == "r.s3 - r.n" and a["operands"] == ["s3", "n"] and a["operators"] == ["-"], a
         assert b["expr"] == "r.n ? Math.floor(r.s3 / r.n) : 0" and b["funcs"] == ["Math.floor"], b
         assert b["literals"] == ["0"] and b["guards"] == ["n が 0 のとき 0"], b
@@ -1534,7 +1585,13 @@ def derived_arrays(sources):
             continue
         text = Path(p).read_text(encoding="utf-8")
         for m in _DERIVED_ARR.finditer(text):
+            arg = text[m.end():_end(text, m.end() - 1)]
+            lp = _LAMBDA_PARAM.match(arg)
+            par = lp.group(1) if lp else ""
+            lam = arg[lp.end():].strip() if lp else arg.strip()
+            fields = _uniq(re.findall(rf"\b{re.escape(par)}\.(\w+)", lam)) if par else []
             out.append({"name": m.group(1), "source": m.group(2), "op": m.group(3),
+                        "fields": fields, "lambda_expr": lam,
                         "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1,
                                  "line_end": text.count("\n", 0, m.end()) + 1}]})
     return {"derived_arrays": out}
@@ -1585,6 +1642,7 @@ def selftest_chain():
         assert bt["disabled_chain"][-1] == {"cond": "!rows.length", "kind": "disabled"}, bt
         assert ip["visible_chain"] == [{"cond": "w", "kind": "map"}] and ip["disabled_chain"] is None, ip
         assert len(der) == 1 and (der[0]["name"], der[0]["source"], der[0]["op"]) == ("w", "rows", "filter"), der
+        assert der[0]["fields"] == ["days"] and der[0]["lambda_expr"] == "r.days > 0", f"fields/lambda: {der[0]}"
     except AssertionError as e:
         print(f"[selftest NG] chain {e}")
         return 1
@@ -1632,6 +1690,8 @@ def selftest():
         assert a["on_success"] == ["rows"] and a["on_failure"] == ["error"], f"on_success/on_failure: {a}"
         assert a["in_finally"] == ["loading=false"] and a["untouched_on_failure"] == ["rows"], f"finally/untouched: {a}"
         assert a["failure_text"] == "String(e)" and a["failure_state"] == "error", f"failure_text: {a}"
+        assert a["on_success_from"] == {"rows": "rows"}, f"on_success_from(then): {a}"
+        assert b["on_success_from"] == {"rows": "rows"}, f"on_success_from(try): {b}"
         assert a["src"] == [{"file": str(p), "line_start": 8, "line_end": 8}], f"src(chain): {a['src']}"
         assert b["call"] == "fetchY" and b["on_failure"] == ["error"] and b["untouched_on_failure"] == ["rows"], f"try: {b}"
         assert b["in_finally"] == ["loading=false"], f"try finally: {b}"
