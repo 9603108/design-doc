@@ -349,7 +349,8 @@ def add_fetch_order_step(steps, plan):
         desc = "、".join(names[:-1]) + "と" + names[-1] + "の取得は並行して進める(先の応答を待たない)"
     else:
         desc = names[0] + "の応答を待って" + "、その応答を待って".join(n + "を取得する" for n in names[1:])
-    steps.insert(idx[0], {"kind": "state_update", "description": desc})
+    # WHY: 取得の順は画面の状態を変えない(データ読込)。state_update にすると状態更新の手順に見える(docx の種別は「データ読込」)。
+    steps.insert(idx[0], {"kind": "data_load", "description": desc})
     return True
 
 
@@ -1509,6 +1510,7 @@ def selftest_fetch_plan():
     try:
         st = mk()
         assert add_fetch_order_step(st, {"mode": "parallel"}) and len(st) == 4 and st[0]["description"] == "店舗の一覧と会計レポートの取得は並行して進める(先の応答を待たない)", st
+        assert st[0]["kind"] == "data_load", f"取得の順は data_load(画面の状態を変えない): {st[0]}"
         assert not add_fetch_order_step(st, {"mode": "parallel"}) and len(st) == 4, "足した後は足さない"
         st = mk()
         assert add_fetch_order_step(st, {"mode": "serial"}) and st[0]["description"] == "店舗の一覧の応答を待って会計レポートを取得する", st

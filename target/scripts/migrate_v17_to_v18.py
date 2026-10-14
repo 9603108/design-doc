@@ -291,6 +291,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
         event_to_id["EV00"] = "F001"
 
     # それ以外の event_processes を F002 以降に
+    csv_codes = _csv_trigger_codes()
     idx = 2
     for ep in event_processes:
         ev_code = ep.get("event_code", "")
@@ -305,7 +306,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
         event_to_id[ev_code] = process_id
 
         ev = event_map.get(ev_code, {})
-        steps = _build_event_steps(ep, ev)
+        steps = _build_event_steps(ep, ev, csv_codes)
 
         # v30: overview は override 優先、なければ _derive_short_overview で自動短縮
         # 意味合い: 業務目的1文に絞ることで「概要」と「steps」の重複を防ぐ
@@ -354,6 +355,20 @@ def _fetch_mode():
     except (OSError, ValueError, AttributeError):
         return None
     return (plan or {}).get("mode")
+
+
+def _csv_trigger_codes() -> frozenset:
+    """react 下書きの csv_exports[].trigger_events(CSV を出すイベントの event_code)の集合を返す。下書きが無い・読めないときは空。
+    WHY: CSV 出力の手順の種別を、文面の語だけでなく CSV 出力の事実で決めるため(_build_event_steps が読む)。読み元は _fetch_mode と同じ下書き1本。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return frozenset()
+    try:
+        data = json.loads(draft.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(code for c in (data.get("csv_exports") or []) if isinstance(c, dict)
+                     for code in (c.get("trigger_events") or []))
 
 
 def _with_fetch_order(steps: list) -> list:
@@ -545,7 +560,7 @@ def _is_screen_rule_line(text: str) -> bool:
     return any(w in text for w in _SCREEN_RULE_WORDS)
 
 
-def _build_event_steps(ep: dict, ev: dict) -> list:
+def _build_event_steps_by_text(ep: dict, ev: dict) -> list:
     """event_processes[ev_code] の details / overview から front_processes[].steps[] を生成（v29 句点分解）。
 
     優先順序:
@@ -597,6 +612,22 @@ def _build_event_steps(ep: dict, ev: dict) -> list:
             "kind": _guess_step_kind(sent, react_kinds),
             "description": sent
         })
+    return steps
+
+
+def _build_event_steps(ep: dict, ev: dict, csv_codes: frozenset = frozenset()) -> list:
+    """_build_event_steps_by_text の結果に、CSV 出力の事実を足す(V9 b)。
+
+    WHY: CSV 出力の手順は文面に CSV・ダウンロードの語が無いと既定の state_update に倒れる(例: 「直近に確定した期間の結果を表示する」)。
+         そのイベントが csv_codes(react 下書きの csv_exports[].trigger_events)に出るなら、既定に倒れた step だけ file_output にする。
+         語が当たった kind(branch など)と、CSV を出さないイベントの step は変えない。
+    csv_codes: CSV を出すイベントの event_code の集合(呼出元は build_front_processes。_csv_trigger_codes で読む)。
+    """
+    steps = _build_event_steps_by_text(ep, ev)
+    if ep.get("event_code") in csv_codes:
+        for s in steps:
+            if s["kind"] == "state_update":
+                s["kind"] = "file_output"
     return steps
 
 
@@ -1119,6 +1150,13 @@ def selftest() -> int:
         assert [s["step_no"] for s in s5] == [1], s5
         s6 = _build_event_steps({"event_code": "EV09", "details": ["・ボタンを押せないようにする", "・取得を始める", "・結果を表示する"], "src": span(10, 20)}, {})
         assert [s["step_no"] for s in s6] == [1, 2] and [s["description"] for s in s6] == ["取得を始める", "結果を表示する"], s6
+        # V9 b: CSV 出力のイベント(csv_codes)は、既定の state_update だけ file_output にする。語が当たった kind(branch)と他のイベントは変えない
+        det = {"details": ["・直近に確定した期間の結果を表示する", "・店舗が指定された場合は絞り込む", "・結果をCSVファイルとしてダウンロードする"], "src": span(10, 20)}
+        c1 = _build_event_steps(dict(det, event_code="EV10"), {}, frozenset({"EV10"}))
+        assert [s["kind"] for s in c1] == ["file_output", "branch", "file_output"], c1
+        c2 = _build_event_steps(dict(det, event_code="EV11"), {}, frozenset({"EV10"}))
+        assert [s["kind"] for s in c2] == ["state_update", "branch", "file_output"], c2
+        assert [s["kind"] for s in _build_event_steps(dict(det, event_code="EV10"), {})] == ["state_update", "branch", "file_output"]
     finally:
         _react_behaviors = real
 
