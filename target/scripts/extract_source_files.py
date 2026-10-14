@@ -307,6 +307,52 @@ def upgrade_backend_files(old_backend: list) -> list:
     return result
 
 
+def _imported_shared_modules(backend: list, root) -> list:
+    """入口・共通モジュールの .py が import する、同じディレクトリの .py を shared_module として返す（1段のみ）。
+
+    2026-10-14 T11 対応:
+    目的: backend_files に載るのは入口ファイル(handler.py)と設定の共通モジュールだけで、入口が import する
+          同じディレクトリの queries.py 等が一覧から漏れていた。import を読んで足す。
+    意味合い: import 先を辿るのは1段だけ（渡された一覧に載るファイルの import のみ）。
+              ドットを含む import（a.b）・相対 import・標準ライブラリ・同じディレクトリに無い名前は足さない。
+              既に一覧にあるパスは重複させない。
+    接続情報: main が upgrade_backend_files と共通モジュールの追加の後に呼ぶ。project_root が無い・
+              存在しないときは何も返さない（従来どおり）。説明は file_descriptions → ファイル先頭の順で埋める。
+    """
+    if root is None or not root.is_dir():
+        return []
+    file_descs = get_file_descriptions(FEATURE_NAME)
+    known = {b["path"] for b in backend}
+    found = []
+    for b in list(backend):
+        if b.get("kind") not in ("backend", "shared_module") or not b["path"].endswith(".py"):
+            continue
+        src = root / b["path"]
+        if not src.is_file():
+            continue
+        try:
+            tree = ast.parse(src.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError:
+            continue
+        modules = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.append(node.module)
+        for mod in modules:
+            if "." in mod:
+                continue
+            rel = (Path(b["path"]).parent / f"{mod}.py").as_posix()
+            if rel in known or not (root / rel).is_file():
+                continue
+            known.add(rel)
+            name = f"{mod}.py"
+            desc = next((d[name] for d in file_descs.values() if isinstance(d, dict) and name in d), "")
+            found.append({"path": rel, "kind": "shared_module", "description": desc or _head_description(root / rel)})
+    return found
+
+
 def main():
     if not INTERMEDIATE_JSON.exists():
         print(f"[ERROR] 中間JSONが見つかりません: {INTERMEDIATE_JSON}", file=sys.stderr)
@@ -351,6 +397,10 @@ def main():
                 "kind": "shared_module",
                 "description": m.get("description", "共通モジュール")
             })
+
+    # 2b. 2026-10-14 T11: 入口・共通モジュールが import する同じディレクトリの .py を追加（1段のみ。
+    #     目的は一覧から queries.py 等が漏れないこと。詳細は _imported_shared_modules）
+    new_backend += _imported_shared_modules(new_backend, _project_root())
 
     # 3. meta から source_html_path を削除（個人パスのため設計書として不要）
     if "source_html_path" in meta:
