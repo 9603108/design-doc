@@ -278,6 +278,48 @@ def _align_message_ids(out, draft_msgs):
             r["message_id"] = rename[r["message_id"]]
 
 
+# WHY: 本文の先頭の記号(：:、。)は、ソースで強調要素(見出し)の後ろに続く文の区切りとして書かれたもの。
+# 見出しを本文の先頭に戻さないと、画面で「：この期間に…」のように記号だけが残る。
+_MSG_LEAD_SIGN = re.compile(r"^[：:、。\s]+")
+
+
+def _react_jsx_elements():
+    """react 下書きの jsx_elements(画面の要素と出典つき)を全部取る。
+    呼出元: compose(_clean_message_text の前)。意味合い: 本文の先頭に付ける見出しは、ソースの強調要素(strong・b)の文言を正とする。
+    下書きが無ければ []。"""
+    from _config_loader import INTERMEDIATE_DIR
+    els = []
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        els += [e for e in d.get("jsx_elements") or [] if isinstance(e, dict)]
+    return els
+
+
+def _clean_message_text(out, jsx):
+    """messages_backend の本文が句読点・コロン(：:、。)や空白で始まるとき、ソースで同じファイルの同じ行から始まる強調要素(strong・b)の文言を先頭に付ける。
+    呼出元: compose(_expand_messages・_align_message_ids の後)。意味合い: 見出し(例「取込欠損の疑い」)の後ろに続く文として書かれた本文の字面は、
+    ソースの強調要素から取った見出しと合わせて読む。要素が無ければ先頭の記号と空白だけ除く(見出しを推測で作らない)。
+    出典(src)の先頭の行とファイルが一致する要素だけを使う。文は分割しない(本文の字面はそのまま)。message_id・code は触らない。"""
+    heads = {}
+    for e in jsx or []:
+        if not isinstance(e, dict) or e.get("tag") not in ("strong", "b") or not str(e.get("text") or "").strip():
+            continue
+        for s in e.get("src") or []:
+            heads.setdefault((s.get("file"), s.get("line_start")), e["text"].strip())
+    for m in out.get("messages_backend") or []:
+        if not isinstance(m, dict) or not isinstance(m.get("message"), str) or not _MSG_LEAD_SIGN.match(m["message"]):
+            continue
+        first = (m.get("src") or [{}])[0] if m.get("src") else {}
+        head = heads.get((first.get("file"), first.get("line_start")))
+        if head:
+            m["message"] = head + m["message"].lstrip()  # 記号は残す(「見出し：本文」)
+        else:
+            m["message"] = _MSG_LEAD_SIGN.sub("", m["message"], count=1)
+
+
 def _expand_messages(out, expansions):
     """messages_backend の型文({key} など)を、下書きが持つ呼出ごとの実際の文面(from・to・shop_id の実引数で展開したもの)へ置き換える。
     呼出元: compose(_align_message_ids の前)。意味合い: 画面に出る文言はソースの実行時の文字列なので、型文のままだと
@@ -678,6 +720,7 @@ def compose(spec, frags, project_config=None, log=None):
     # 1呼出1件で置き換える。画面項目名への言い換えはしない。展開できない穴は残す(verify_intermediate が ERROR にする)
     _expand_messages(out, expansions)
     _align_message_ids(out, draft_msgs)
+    _clean_message_text(out, _react_jsx_elements())  # N10: 本文の先頭の記号を除き、ソースの見出しを前に付ける
     if common or auth_desc:
         for api in out.get("api_spec") or []:
             if auth_desc and not api.get("auth"):
@@ -979,7 +1022,47 @@ def _selftest_b0():
     print("[selftest OK] _units B0 (_run_fillers / _fill_error_codes / common_errors / 処理名の保持 / [重複])")
 
 
+def _selftest_message_text():
+    """_clean_message_text を確かめる(同じ行の strong・b を見出しにする / 同じ行でもファイルが違えば使わない / 記号の無い本文は触らない /
+    出典が無い本文は記号だけ除く / 見出しが無い記号だけの本文は記号を除く)。_react_jsx_elements は下書きの有無で [] と要素を返す。"""
+    import tempfile
+    import _config_loader
+    F, G = "/src/PosReport.tsx", "/src/Other.tsx"
+    jsx = [{"tag": "strong", "text": "取込欠損の疑い", "src": [{"file": F, "line_start": 292, "line_end": 292}]},
+           {"tag": "b", "text": "注意", "src": [{"file": F, "line_start": 320, "line_end": 320}]},
+           {"tag": "span", "text": "無関係", "src": [{"file": F, "line_start": 330, "line_end": 330}]},
+           {"tag": "strong", "text": "別ファイルの見出し", "src": [{"file": G, "line_start": 310, "line_end": 310}]}]
+    out = {"messages_backend": [
+        {"message_id": "MSW00001", "code": "MSW00001", "severity": "warning", "message": "：この期間に上書きの疑いがあります。", "src": [{"file": F, "line_start": 292, "line_end": 294}]},
+        {"message_id": "MSW00002", "code": "MSW00002", "severity": "warning", "message": "：注意内容です。", "src": [{"file": F, "line_start": 320, "line_end": 320}]},
+        {"message_id": "MSW00003", "code": "MSW00003", "severity": "warning", "message": "。前の行の文です。", "src": [{"file": F, "line_start": 300, "line_end": 300}]},
+        {"message_id": "MSW00004", "code": "MSW00004", "severity": "warning", "message": "、別ファイルの文", "src": [{"file": F, "line_start": 310, "line_end": 310}]},
+        {"message_id": "MSW00005", "code": "MSW00005", "severity": "warning", "message": "、出典が無い文"},
+        {"message_id": "MSW00006", "code": "MSW00006", "severity": "warning", "message": "通常の文です。", "src": [{"file": F, "line_start": 292, "line_end": 292}]},
+    ]}
+    _clean_message_text(out, jsx)
+    got = {m["message_id"]: m["message"] for m in out["messages_backend"]}
+    assert got == {"MSW00001": "取込欠損の疑い：この期間に上書きの疑いがあります。",
+                   "MSW00002": "注意：注意内容です。",
+                   "MSW00003": "前の行の文です。",
+                   "MSW00004": "別ファイルの文",
+                   "MSW00005": "出典が無い文",
+                   "MSW00006": "通常の文です。"}, got
+    assert all(m["code"] == m["message_id"] for m in out["messages_backend"]), out  # message_id・code は触らない
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            assert _react_jsx_elements() == [], "下書きが無いのに要素が出た"
+            (Path(td) / "x_react_draft.json").write_text(json.dumps({"jsx_elements": jsx}, ensure_ascii=False), encoding="utf-8")
+            assert _react_jsx_elements() == jsx
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    print("[selftest OK] _units._clean_message_text / _react_jsx_elements")
+
+
 if __name__ == "__main__":
     _selftest_b0()
     _selftest_initial_values()
     _selftest_compose_facts()
+    _selftest_message_text()
