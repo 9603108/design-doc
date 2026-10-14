@@ -2889,6 +2889,8 @@ function sectionProcessDetails(data, maps) {
  *
  * 接続情報: 入力 = kind (string) / 出力 = 業務担当者語彙のラベル
  *           15_中間JSONスキーマ.md「front_processes（呼ばれるフロント処理）」節のフィールド表の steps[].kind の行と整合する変換表
+ * 目的: step の種別を、業務担当者が読める語（「データ読込」「画面更新」など）で表に出す。
+ * 役割: 未知の kind は生の値をそのまま返す（表示の欠落を防ぐため）。note は round13 W10 で追加（「補足」）。
  */
 function mapKindToLabel(kind) {
   const map = {
@@ -2910,8 +2912,12 @@ function mapKindToLabel(kind) {
     file_output: 'ファイル出力',
     error_handling: 'エラー処理',
     logging: '操作ログ',
-    logging_call: 'ログ呼出'
+    logging_call: 'ログ呼出',
+    // round13 W10: 説明文の種別 note（W9 が migrate_v17_to_v18 で入れる）を業務担当者向けに「補足」と表示する。
+    //      種別を決める側は W9。ここはラベルの対応だけを持つ（表の形・他の種別の表示は変えない）。
+    note: '補足'
   };
+  // fallback-ok: 未知の kind は生の値を返す既存の挙動。表示の欠落を防ぐため変えない
   return map[kind] || kind || '—';
 }
 
