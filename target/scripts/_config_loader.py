@@ -26,6 +26,7 @@ v30 で screen_config.json 1ファイル集約により、新画面追加時は�
 # 汎用化: sys.argv[1] / FEATURE_NAME 環境変数対応のため resolve_feature_name() ヘルパー追加
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -470,6 +471,24 @@ def get_trigger_dispatch(feature_name: str = None) -> dict:
     return load_screen_config(feature_name).get("trigger_dispatch", {})
 
 
+def _area_label_id(area_no) -> str:
+    """構成図のエリア番号を、id_scheme.json の area の prefix と番号で表す（A1 → AR1）。
+
+    意味合い: 構成図のラベルを、エリア表と同じ ID 体系（AR 形）にそろえる。
+              旧表記 A# 以外（既に AR 形・空・文字列でない値）はそのまま返す。
+    WHY: 旧表記のまま出ると、構成図と他の表で同じエリアの ID が食い違うため。
+    接続情報: prefix は get_id_prefix("area")（id_scheme.json の categories[].key="area"）から取る。
+              prefix が取れないとき（id_scheme.json が無い等）は旧表記のまま返す。
+    """
+    if not isinstance(area_no, str):
+        return area_no
+    m = re.match(r"^A(\d+)$", area_no)
+    prefix = get_id_prefix("area")
+    if not m or not prefix:
+        return area_no
+    return f"{prefix}{m.group(1)}"
+
+
 def _auto_screen_structure(feature_name: str = None):
     """screen_config に screen_structure が無いとき、中間JSON の screen_layout から nested spec を機械生成する。
 
@@ -494,7 +513,8 @@ def _auto_screen_structure(feature_name: str = None):
         note = "、".join(names)
         if len(note) > 40:
             note = note[:39] + "…"
-        children.append({"label": f"{a.get('area_no', '')} {a.get('area_name', '')}".strip(), "note": note})
+        label_no = _area_label_id(a.get("area_no", ""))
+        children.append({"label": f"{label_no} {a.get('area_name', '')}".strip(), "note": note})
     root_label = layout.get("screen_name") or ""
     try:
         root_label = root_label or get_screen_name(fn)
@@ -533,7 +553,69 @@ def get_all_diagram_ids(feature_name: str = None) -> list:
     return ids
 
 
+def selftest() -> int:
+    """構成図（screen_structure）のエリアラベルが AR 形になることを確かめる自己検査。
+
+    意味合い: 一時フォルダに合成した中間 JSON と screen_config だけで検査する。
+              実在の画面・案件の設定には依らない（固定の画面名を使わない）。
+    WHY: 検査の対象は get_diagram_spec の公開経路。内部関数だけ見ると呼出側での組立ての誤りを見逃すため。
+    """
+    import tempfile
+    global INTERMEDIATE_DIR, ID_SCHEME_PATH
+    saved_dir, saved_scheme = INTERMEDIATE_DIR, ID_SCHEME_PATH
+    fn = "selftest_feature"
+    layout = {
+        "screen_layout": {
+            "screen_name": "",
+            "areas": [
+                {"area_no": "A1", "area_name": "ヘッダ"},
+                {"area_no": "AR2", "area_name": "グリッド"},
+                {"area_no": "", "area_name": "無番号"},
+            ],
+            "items": [
+                {"item_name": "検索", "area_ref": "A1"},
+                {"item_name": "明細", "area_ref": "AR2"},
+            ],
+        }
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            INTERMEDIATE_DIR = Path(tmp)
+            (Path(tmp) / f"{fn}.json").write_text(json.dumps(layout, ensure_ascii=False), encoding="utf-8")
+            (Path(tmp) / f"{fn}_screen_config.json").write_text(
+                json.dumps({"screen_name": "テスト画面", "diagrams": {}}, ensure_ascii=False), encoding="utf-8")
+            clear_cache()
+            _ID_SCHEME_CACHE.clear()
+
+            assert get_id_prefix("area") == "AR", "id_scheme.json の area prefix が AR で無い"
+            assert _area_label_id("A1") == "AR1", "A1 が AR1 になっていない"
+            assert _area_label_id("AR2") == "AR2", "AR 形が変わってしまった"
+            assert _area_label_id("") == "", "空の area_no が変わってしまった"
+
+            spec = get_diagram_spec("screen_structure", fn)
+            root = spec["spec"]["structure"][0]
+            assert root["label"] == "テスト画面", root["label"]
+            children = root["children"][0]["children"]
+            labels = [c["label"] for c in children]
+            assert labels == ["AR1 ヘッダ", "AR2 グリッド", "無番号"], labels
+            notes = [c["note"] for c in children]
+            assert notes == ["検索", "明細", ""], notes
+
+            # id_scheme.json が読めないときは旧表記のまま（構成図の生成を止めない）
+            ID_SCHEME_PATH = Path(tmp) / "no_such_id_scheme.json"
+            _ID_SCHEME_CACHE.clear()
+            assert _area_label_id("A1") == "A1", "prefix が取れないときに旧表記で返らない"
+        finally:
+            INTERMEDIATE_DIR, ID_SCHEME_PATH = saved_dir, saved_scheme
+            _ID_SCHEME_CACHE.clear()
+            clear_cache()
+    print("[OK] selftest: screen_structure のエリアラベル（AR 形）")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     # 動作確認: sys.argv[1] / FEATURE_NAME 環境変数のいずれかで決定された（どちらも無ければ SystemExit）
     # feature_name について各セクションを読んで件数表示する（汎用化）
     feature = get_feature_name_from_argv()
