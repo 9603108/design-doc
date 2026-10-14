@@ -19,6 +19,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from _initial_eval import build_env, chain_value, disabled_value
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -123,14 +124,62 @@ def _initial_text_from_state(si: dict, options: dict) -> str:
     return si.get("readable") or f"式: {raw}"
 
 
-def _initial_value(item: dict, states: dict, options: dict) -> str:
-    """画面項目1件の初期値。結ぶ state があればその初期値（事実）、無ければ合成欄に既にある値、それも無ければ Blank。
-    意味合い: 初期値が無い項目だけ Blank にする。全項目を Blank に固定すると、下書きにある初期値の事実を捨ててしまう。"""
+def _all_states(drafts: list) -> list:
+    """全ての react 下書きの state_initials を1本の並びにする（評価の環境に使う）。"""
+    return [si for d in drafts for si in d.get("state_initials") or [] if isinstance(si, dict)]
+
+
+def _all_derived(drafts: list) -> list:
+    """全ての react 下書きの derived_arrays を1本の並びにする。B5 の配線で入る欄。無い下書きは飛ばす（推測で埋めない）。"""
+    return [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)]
+
+
+def _elements_by_name(drafts: list) -> dict:
+    """画面項目の名前 → その名前の jsx 要素の一覧（label か text が一致）。表示条件（visible_chain）と活性（disabled_chain）を見るため。"""
+    out = {}
+    for d in drafts:
+        for el in d.get("jsx_elements") or []:
+            if not isinstance(el, dict):
+                continue
+            key = str(el.get("label") or el.get("text") or "").strip()
+            if key:
+                out.setdefault(key, []).append(el)
+    return out
+
+
+_VIS_LABEL = {True: "表示", False: "非表示", None: "条件付き(式)"}
+
+
+def _visibility(elements: list, env: dict) -> tuple:
+    """画面項目の（活性, 表示）。結ぶ jsx 要素が無ければ仮埋め（活性・表示）のまま。
+    要素が複数あって結果が割れるときは「条件付き(式)」にする（どれが画面の項目かを推測しない）。
+    WHY: 表示条件の鎖・disabled の式を state の初期値で評価し、評価できないものは「条件付き(式)」と書く。"""
+    if not elements:
+        return "活性", "表示"  # 仮埋め（結ぶ要素が無い項目。B16 が全項目一色を検出する）
+    visible = {_VIS_LABEL[chain_value(el.get("visible_chain") or [], env)] for el in elements}
+    active = {
+        {True: "非活性", False: "活性", None: "条件付き(式)"}[disabled_value(el.get("disabled_chain"), env)]
+        for el in elements
+    }
+    return (active.pop() if len(active) == 1 else "条件付き(式)",
+            visible.pop() if len(visible) == 1 else "条件付き(式)")
+
+
+def _initial_value(item: dict, states: dict, options: dict, elements: list = None, env: dict = None) -> str:
+    """画面項目1件の初期値。結ぶ state があればその初期値（事実）。無ければ、同じ名前の表示専用の固定文のうち
+    表示条件が真のものの文言（画面に書かれた文言そのもの）。どちらも無ければ合成欄の既存値、それも無ければ Blank。
+    意味合い: 初期値が無い項目だけ Blank にする。全項目を Blank に固定すると、下書きの事実を捨ててしまう。
+    WHY: 固定文は表示されている文言がそのまま初期の表示なので、Blank にすると事実を落とす。表示条件が偽・評価不能なら出さない。"""
     name = str(item.get("item_name") or "").strip()
     si = states.get(name)
     if si:
         return _initial_text_from_state(si, options.get(name, {}))
+    for el in elements or []:
+        if el.get("text") and not el.get("label") and chain_value(el.get("visible_chain") or [], env or {}) is True:
+            return str(el["text"])
+    # fallback-ok: 結ぶ state も表示される固定文も無い項目は、合成欄の既存値、無ければ Blank（事実が無いので決めない）
     return item.get("initial_value") or "Blank"
+
 
 
 def _initial_db_refs(db_operations: list, drafts: list) -> list:
@@ -167,7 +216,9 @@ def _initial_db_refs(db_operations: list, drafts: list) -> list:
 def build_initialization(events: list, screen_layout: dict, db_operations: list = None, drafts: list = None) -> dict:
     """初期処理セクションを最小テンプレで生成。
     EV00 が events にあれば content を Overview に転載、なければデフォルト文を入れる。
-    items は screen_layout から Button 以外を抜粋（仮実装）"""
+    items は screen_layout の全項目（Button・Link を含む。画面項目と同数にする）。
+    活性・表示・初期値は react 下書きの事実（state の初期値・表示条件の鎖・disabled の式）を評価して入れる（round9 B7）。
+    WHY: Button や Link を除くと、CSV 出力などの非活性の事実が表から消える。全項目を仮埋めのままにすると、下書きの事実を捨てる。"""
     ev00 = next((e for e in events if e.get("event_code") == "EV00"), None)
     overview = ev00["content"] if ev00 else "画面初期表示処理（詳細はWave 3充実化で展開）"
 
@@ -176,19 +227,21 @@ def build_initialization(events: list, screen_layout: dict, db_operations: list 
         drafts = load_react_drafts()
     states = _state_by_label(drafts)
     options = _option_texts(drafts)
+    env = build_env(_all_states(drafts), _all_derived(drafts))
+    elements = _elements_by_name(drafts)
 
     items = []
     for sl_item in screen_layout.get("items", []):
-        # Button 以外を初期表示テーブルの対象に（01_画面レイアウト.md の対象基準準用）
-        if sl_item.get("item_type") in ("Button", "Link"):
-            continue
+        name = str(sl_item.get("item_name") or "").strip()
+        els = elements.get(name, [])
+        active, visible = _visibility(els, env)
         items.append({
             "no": len(items) + 1,
             "screen_no": sl_item.get("screen_no", ""),
             "item_name": sl_item.get("item_name", ""),
-            "active": "活性",       # 仮埋め
-            "visible": "表示",      # 仮埋め
-            "initial_value": _initial_value(sl_item, states, options),  # 事実（下書きの state_initials）が無い項目だけ Blank
+            "active": active,
+            "visible": visible,
+            "initial_value": _initial_value(sl_item, states, options, els, env),  # 事実（下書き）が無い項目だけ Blank
         })
 
     return {
@@ -297,8 +350,11 @@ def apply_unit_details(event_processes: list, unit_eps: list) -> None:
 
 
 def _selftest_initialization() -> int:
-    """初期処理の表の初期値（結ぶ state・選択肢の表示名・式・未設定・Blank・既存値の維持）と db_operations_ref（初期表示が呼ぶ API の id）を、
-    一時の下書きで確かめる。終了コード 0=OK / 1=NG。"""
+    """初期処理の表の初期値（結ぶ state・選択肢の表示名・式・未設定・Blank・既存値の維持）、活性・表示（表示条件の鎖・disabled）、
+    db_operations_ref（初期表示が呼ぶ API の id）を、一時の下書きと実ソースの TSX で確かめる。終了コード 0=OK / 1=NG。"""
+    import _initial_eval
+    if _initial_eval.selftest() != 0:
+        return 1
     drafts = [{
         "events": [{"event_code": "EV00", "action": "初期表示"}, {"event_code": "EV01", "action": "クリック"}],
         "event_processes": [{"event_code": "EV00", "calls": [{"action": "list_a"}]}],
@@ -309,10 +365,18 @@ def _selftest_initialization() -> int:
             {"state": "group", "kind": "literal", "initial": '"register"', "readable": None, "bound": [{"label": "集計単位"}]},
             {"state": "kind2", "kind": "literal", "initial": '"shop"', "readable": None, "bound": [{"label": "別の選択欄"}]},
             {"state": "showDead", "kind": "literal", "initial": "false", "readable": None, "bound": [{"label": "空欄項目も表示"}]},
+            {"state": "rows", "kind": "literal", "initial": "[]", "readable": None, "bound": []},
+            {"state": "loading", "kind": "literal", "initial": "false", "readable": None, "bound": []},
         ],
+        "derived_arrays": [{"name": "w", "source": "rows", "op": "filter"}],
         "jsx_elements": [
             {"label": "集計単位", "options": [{"value": "register", "text": "レジ別（現行と同じ）"}, {"value": "shop", "text": "店舗別（レジ合算）"}]},
             {"label": "店舗", "options": [{"value": "", "text": "- 全店 -"}]},
+            {"text": "合計", "visible_chain": [{"cond": "rows.length > 1", "kind": "and"}]},
+            {"text": "読込中…", "visible_chain": [{"cond": "loading", "kind": "ternary_then"}]},
+            {"text": "注記文", "visible_chain": []},
+            {"text": "式の注記", "visible_chain": [{"cond": "f(from)", "kind": "and"}]},
+            {"label": "CSV出力", "visible_chain": [], "disabled_chain": [{"cond": "!rows.length", "kind": "disabled"}]},
         ],
     }]
     screen = {"items": [
@@ -322,6 +386,11 @@ def _selftest_initialization() -> int:
         {"item_name": "別の選択欄", "item_type": "ComboBox"},
         {"item_name": "空欄項目も表示", "item_type": "Checkbox"},
         {"item_name": "表示", "item_type": "Button"},
+        {"item_name": "合計", "item_type": "Label"},
+        {"item_name": "読込中…", "item_type": "Label"},
+        {"item_name": "注記文", "item_type": "Label"},
+        {"item_name": "式の注記", "item_type": "Label"},
+        {"item_name": "CSV出力", "item_type": "Button"},
         {"item_name": "未設定の項目", "item_type": "Label"},
         {"item_name": "手書きの項目", "item_type": "Label", "initial_value": "手書き"},
     ]}
@@ -330,35 +399,57 @@ def _selftest_initialization() -> int:
            {"id": "db_op_b", "api_endpoint": {"action": "list_b"}},
            {"id": "db_op_c", "api_endpoint": {"action": "list_c"}}]
 
+    # 期待は (活性, 表示, 初期値)。合計・読込中…は偽の条件で隠れる。式の注記は評価できず「条件付き(式)」。CSV出力は rows が空なので非活性
+    want = {
+        "集計開始日": ("活性", "表示", "当月1日(UTC+9時間基準)"),
+        "店舗": ("活性", "表示", "- 全店 -"),
+        "集計単位": ("活性", "表示", "レジ別（現行と同じ）"),
+        "別の選択欄": ("活性", "表示", "shop"),
+        "空欄項目も表示": ("活性", "表示", "false"),
+        "表示": ("活性", "表示", "Blank"),
+        "合計": ("活性", "非表示", "Blank"),
+        "読込中…": ("活性", "非表示", "Blank"),
+        "注記文": ("活性", "表示", "注記文"),
+        "式の注記": ("活性", "条件付き(式)", "Blank"),
+        "CSV出力": ("非活性", "表示", "Blank"),
+        "未設定の項目": ("活性", "表示", "Blank"),
+        "手書きの項目": ("活性", "表示", "手書き"),
+    }
     got = build_initialization(events, screen, dbs, drafts)
-    vals = {i["item_name"]: i["initial_value"] for i in got["items"]}
-    want = {"集計開始日": "当月1日(UTC+9時間基準)", "店舗": "- 全店 -", "集計単位": "レジ別（現行と同じ）",
-            "別の選択欄": "shop", "空欄項目も表示": "false", "未設定の項目": "Blank", "手書きの項目": "手書き"}
+    vals = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in got["items"]}
     if vals != want:
-        print(f"[selftest NG] initial_value {vals}")
+        print(f"[selftest NG] 初期処理の表 {vals}")
+        return 1
+    if len(got["items"]) != len(screen["items"]):
+        print("[selftest NG] 件数が画面項目と一致しない（Button・Link を除いている）")
         return 1
     if got["db_operations_ref"] != ["db_op_a", "db_op_b"]:
         print(f"[selftest NG] db_operations_ref {got['db_operations_ref']}")
         return 1
-    # 実ソースの TSX から作った事実（_react_facts の jsx_elements・state_initials）でも、選択肢の表示名に置き換わること。
-    # WHY: 手書きの下書きだけ確かめると、下書きが options を出さない従来の形で空振りしても気づけないため
+    # 実ソースの TSX から作った事実（_react_facts の jsx_elements・state_initials・derived_arrays）でも同じ判定になること。
+    # WHY: 手書きの下書きだけ確かめると、下書きの欄の名前がずれても気づけないため
     import tempfile
     import _react_facts
     tsx = (
         "export default function S() {\n"
-        "  const [shopId, setShopId] = useState<number | \"\">(\"\");\n"
-        "  const [group, setGroup] = useState<PosGroup>(\"register\");\n"
+        "  const [shopId, setShopId] = useState(\"\");\n"
+        "  const [group, setGroup] = useState(\"register\");\n"
+        "  const [rows, setRows] = useState([]);\n"
         "  return (\n"
         "    <div>\n"
         "      <label>店舗</label>\n"
-        "      <select value={shopId} onChange={(e) => setShopId(Number(e.target.value))}>\n"
+        "      <select value={shopId} onChange={(e) => setShopId(e.target.value)}>\n"
         "        <option value=\"\">- 全店 -</option>\n"
         "      </select>\n"
+        "      {rows.length > 1 && (\n"
+        "        <span>合計</span>\n"
+        "      )}\n"
         "      <label>集計単位</label>\n"
-        "      <select value={group} onChange={(e) => setGroup(e.target.value as PosGroup)}>\n"
+        "      <select value={group} onChange={(e) => setGroup(e.target.value)}>\n"
         "        <option value=\"register\">レジ別（現行と同じ）</option>\n"
         "        <option value=\"shop\">店舗別（レジ合算）</option>\n"
         "      </select>\n"
+        "      <button disabled={!rows.length}>CSV出力</button>\n"
         "    </div>\n"
         "  );\n"
         "}\n"
@@ -367,17 +458,22 @@ def _selftest_initialization() -> int:
         tp = Path(td) / "S.tsx"
         tp.write_text(tsx, encoding="utf-8")
         real = [{"jsx_elements": _react_facts.jsx_elements([tp])["jsx_elements"],
-                 "state_initials": _react_facts.state_initials([tp])["state_initials"]}]
+                 "state_initials": _react_facts.state_initials([tp])["state_initials"],
+                 "derived_arrays": _react_facts.derived_arrays([tp])["derived_arrays"]}]
     rb = build_initialization(events, {"items": [{"item_name": "店舗", "item_type": "ComboBox"},
-                                                 {"item_name": "集計単位", "item_type": "ComboBox"}]}, [], real)
-    rv = {i["item_name"]: i["initial_value"] for i in rb["items"]}
-    if rv != {"店舗": "- 全店 -", "集計単位": "レジ別（現行と同じ）"}:
-        print(f"[selftest NG] 実ソースの選択肢の表示名 {rv}")
+                                                 {"item_name": "集計単位", "item_type": "ComboBox"},
+                                                 {"item_name": "合計", "item_type": "Label"},
+                                                 {"item_name": "CSV出力", "item_type": "Button"}]}, [], real)
+    rv = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in rb["items"]}
+    if rv != {"店舗": ("活性", "表示", "- 全店 -"), "集計単位": ("活性", "表示", "レジ別（現行と同じ）"),
+              "合計": ("活性", "非表示", "Blank"), "CSV出力": ("非活性", "表示", "Blank")}:
+        print(f"[selftest NG] 実ソースの初期処理の表 {rv}")
         return 1
 
-    # 下書きが無いときは従来どおり Blank（既存値の項目を除く）と空の参照になる
+    # 下書きが無いときは仮埋め（活性・表示）と Blank、空の参照になる
     bare = build_initialization(events, screen, dbs, [])
-    if {i["item_name"]: i["initial_value"] for i in bare["items"]}["集計単位"] != "Blank" or bare["db_operations_ref"] != []:
+    bv = {i["item_name"]: (i["active"], i["visible"], i["initial_value"]) for i in bare["items"]}
+    if bv["集計単位"] != ("活性", "表示", "Blank") or bv["CSV出力"] != ("活性", "表示", "Blank") or bare["db_operations_ref"] != []:
         print("[selftest NG] 下書き無しの初期処理")
         return 1
     print("[selftest OK] merge_partials.initialization")
