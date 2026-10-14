@@ -484,7 +484,6 @@ def _detail_lines(link, called, failures=()):
 #      モデルが書いた同趣旨の行を落とす。
 _FACT_MATCH = {
     "start": ["取得の開始時"], "success": ["取得に成功"], "failure": ["取得に失敗"], "empty": ["0件のとき"],
-    "csv.escape": ["値の中の二重引用符"], "csv.total_blank": ["合計行では"],
     "continuous.stale": ["後から届く"], "continuous.loading": ["最初に返った応答"],
 }
 # WHY: 空に戻す書き込み(null・空配列・空文字)は「空にする」と書く。値の表記の違いを文に持ち込まない
@@ -554,34 +553,139 @@ def _event_facts(link, failures, names):
     return facts
 
 
-def _csv_fact_map(csv_exports):
-    """CSV 出力の事実を、trigger_events の event_code ごとの fact_lines の形で返す。呼出元: main()。
+# WHY: CSV の処理順(見出し → データ行 → 合計行 → 二重引用符 → Blob → ファイル名)を seq の固定番号にする。
+#      apply_react_draft(T5)が seq の昇順に並べ、モデルの同趣旨の行は match の語で落とす。
+#      行が無いときは番号を詰めない(seq は処理順の位置そのもの)。
+_CSV_SEQ_MATCH = {1: ["見出し"], 2: ["データ行"], 3: ["合計行"], 4: ["二重引用符"],
+                  5: ["文字コード", "BOM", "区切り", "改行", "Blob"], 6: ["ファイル名", "ダウンロード"]}
+_SEP_WORDS = {" ": "半角スペース区切り", ",": "カンマ区切り", chr(9): "タブ区切り"}
+# WHY: 合計行の when の式は画面の言い方にする(表示行数の判定)。型に当たらない式は式のまま出す
+_WHEN_WORDS = [(r"\s*\w+\.length\s*>\s*1\s*", "表示が2行以上"),
+               (r"\s*\w+\.length\s*>\s*0\s*", "表示が1行以上")]
 
-    csv.escape: 値の中の二重引用符の重ね方(quote.escape がある時だけ)。
-    csv.total_blank: 合計行(total_row がある時)で値が空の列。名前は見出しの同じ位置の固定見出し。
-    WHY: 見出しと行の列が1対1に並ぶのは、その前に展開(spread)が無い列だけ。展開の後の列は位置で言い、名前は推測しない。
+
+def _sep_text(sep):
+    """区切り文字を画面の言い方にする。表に無い区切りは「x」区切りと書く(推測で訳さない)。"""
+    return _SEP_WORDS.get(sep, "「" + sep + "」区切り")
+
+
+def _when_text(when):
+    """合計行の when を画面の言い方にする。型に当たらない式は式のまま返す。"""
+    for pat, words in _WHEN_WORDS:
+        if re.fullmatch(pat, when):
+            return words
+    return when
+
+
+def _file_name(tpl, names):
+    """ファイル名の ${式} を、state 名(names)が画面項目名に決まるものだけ項目名にする。決まらない式は残す。"""
+    def rep(m):
+        expr = m.group(1)
+        return names.get(expr) or names.get(expr.split(".")[0]) or m.group(0)
+    return re.sub(r"\$\{([^}]+)\}", rep, tpl)
+
+
+def _csv_items(c, display_rows):
+    """見出しの展開(spread)の元の配列の項目(表示行の specs)。展開が無い・元が表示行に無いときは空。"""
+    spread = (c.get("header") or {}).get("spread") or []
+    m = re.match(r"\.\.\.\s*(\w+)", spread[0].get("raw", "")) if spread else None
+    if not m:
+        return []
+    for row in display_rows or []:
+        if row.get("array") == m.group(1):
+            return row.get("specs", [])
+    return []
+
+
+def _csv_seq_facts(c, names, display_rows):
+    """1つの CSV 出力の処理順の事実(seq 1〜6)を返す。取れない欄は行ごと出さない(推測で埋めない)。"""
+    facts, src = [], c.get("src", [])
+    fixed = (c.get("header") or {}).get("fixed") or []
+    cols = (c.get("row_builder") or {}).get("columns") or []
+
+    def add(seq, key, text):
+        facts.append({"key": key, "text": text, "position": "seq", "seq": seq,
+                      "match": _CSV_SEQ_MATCH[seq], "src": src})
+
+    # 1 見出し行: 固定列の後に、展開元の項目(表示行の全項目。dead も含む。点数があれば2列)
+    items, dead = [], False
+    for spec in _csv_items(c, display_rows):
+        nm = spec.get("csv") or spec.get("label")
+        dead = dead or bool(spec.get("dead"))
+        items += [nm + "(点数)", nm + "(金額)"] if spec.get("cnt") else [nm]
+    if fixed or items:
+        text = "見出し行: " + "、".join(fixed + items) + "の順に並べる"
+        if dead:
+            text += "(表示の切替に関係なく全項目を出す)"
+        add(1, "csv.header", text)
+
+    # 2 データ行: 表示中の行ごとに固定列の値、続けて見出しの項目の値。区切りは機械で出た分だけ書く
+    parts = [f + ("(二重引用符で囲む)" if i < len(cols) and cols[i].get("quoted") else "")
+             for i, f in enumerate(fixed)]
+    text = "データ行: 表示中の行ごとに" + ("、".join(parts) + "の値を並べ、" if parts else "") + "見出しの項目の値を並べる"
+    seps = []
+    vs = (c.get("row_builder") or {}).get("value_separator")
+    if vs is not None:
+        seps.append("列の区切りは" + _sep_text(vs))
+    # WHY: header の join は全体の区切り(seq 5 で書く)、[…] は行の並びの join なので、列の中の値の区切りだけ書く
+    for j in c.get("joins") or []:
+        if j.get("target") not in ("[…]", "header"):
+            seps.append(j["target"] + "の値は" + _sep_text(j["separator"]) + "で連結する")
+    if seps:
+        text += "。" + "。".join(seps)
+    add(2, "csv.row", text)
+
+    # 3 合計行: total_row がある時だけ。空欄の列と、空でない合計の値を分けて書く
+    tr = c.get("total_row")
+    if tr is not None:
+        text = "合計行: " + _when_text(tr.get("when", "")) + "のとき最後に1行足す"
+        blank, vals = [], []
+        for i, col in enumerate(cols):
+            if col.get("kind") != "ternary":
+                continue
+            name = fixed[i] if i < len(fixed) and not any(x.get("kind") == "spread" for x in cols[:i]) else f"{i + 1}列目"
+            tv = col.get("total_value", "")
+            if tv in _EMPTY_VALUES + ("",):
+                blank.append(name)
+            else:
+                lit = tv[1:-1] if len(tv) >= 2 and tv[0] == tv[-1] and tv[0] in "\"'`" else None
+                vals.append(name + "は" + (f"「{lit}」" if lit is not None else tv))
+        if blank:
+            text += "。合計行では " + "・".join(blank) + " は空欄にする"
+        if vals:
+            text += "。合計行の値は " + "、".join(vals)
+        add(3, "csv.total_blank" if blank else "csv.total", text)
+
+    # 4 二重引用符の重ね方(quote.escape がある時だけ)
+    if (c.get("quote") or {}).get("escape"):
+        add(4, "csv.escape", "値の中の二重引用符は2つ重ねる")
+
+    # 5 全体の連結・文字コード・Blob
+    bits = []
+    if c.get("separator") is not None:
+        bits.append("区切りは「" + c["separator"] + "」")
+    if c.get("line_break"):
+        bits.append("改行は " + c["line_break"])
+    text = "全体を連結する" + ("(" + "、".join(bits) + ")" if bits else "")
+    if c.get("bom"):
+        text += "。先頭に BOM を付ける"
+    text += "。" + (c["mime"] + " の " if c.get("mime") else "") + "Blob にする"
+    add(5, "csv.blob", text)
+
+    # 6 ファイル名
+    if c.get("file_name_template"):
+        add(6, "csv.filename", "ファイル名は「" + _file_name(c["file_name_template"], names) + "」で保存する")
+    return facts
+
+
+def _csv_fact_map(csv_exports, display_rows=(), names=None):
+    """CSV 出力の処理順の事実を、trigger_events の event_code ごとの fact_lines(position=seq)で返す。呼出元: main()。
+
+    WHY: 見出し・データ行・合計行・引用符・Blob・ファイル名の順は TSX の書き方から機械で決まるので、モデルに書かせず下書きが持つ。
     """
     out = {}
     for c in csv_exports:
-        facts = []
-        if (c.get("quote") or {}).get("escape"):
-            facts.append({"key": "csv.escape", "text": "値の中の二重引用符は2つ重ねる", "position": "end",
-                          "match": _FACT_MATCH["csv.escape"], "src": c.get("src", [])})
-        cols = (c.get("row_builder") or {}).get("columns") or []
-        fixed = (c.get("header") or {}).get("fixed") or []
-        blank = []
-        for i, col in enumerate(cols):
-            if c.get("total_row") is None or col.get("kind") != "ternary":
-                continue
-            if col.get("total_value", "") not in _EMPTY_VALUES + ("",):
-                continue
-            if i < len(fixed) and not any(x.get("kind") == "spread" for x in cols[:i]):
-                blank.append(fixed[i])
-            else:
-                blank.append(f"{i + 1}列目")
-        if blank:
-            facts.append({"key": "csv.total_blank", "text": f"合計行では {'・'.join(blank)} は空欄にする",
-                          "position": "end", "match": _FACT_MATCH["csv.total_blank"], "src": c.get("src", [])})
+        facts = _csv_seq_facts(c, names or {}, display_rows)
         for code in c.get("trigger_events", []):
             out.setdefault(code, []).extend(facts)
     return out
@@ -703,8 +807,9 @@ def _row_specs(body, count):
             am = re.search(rf"\b{name}\s*:\s*['\"]([^'\"]*)['\"]", ob)
             return am.group(1) if am else None
 
+        # WHY: dead の項目は画面の表示切替で隠れても、CSV の見出しには全項目出る(表示と CSV の差の事実)
         specs.append({"label": label, "csv": attr("csv"), "kin": attr("kin"), "cnt": attr("cnt"),
-                      "nth": count[label]})
+                      "nth": count[label], "dead": ("dead: true" in ob) or ("dead:true" in ob)})
     return specs
 
 
@@ -843,7 +948,8 @@ def main(argv=None):
     draft["display_rows"] = _display_rows(sources)
     draft["continuous_operation"] = _continuous_ops(links, sources)
     # 目的: CSV と連続操作の事実の行を、trigger の event_processes[].fact_lines に入れる(案 B5 b・c)
-    _attach_facts(draft, _csv_fact_map(draft["csv_exports"]))
+    # 目的: CSV の処理順(seq 1〜6)を、表示行の全項目(dead を含む)とファイル名の式の画面項目名で組む。接続: _csv_fact_map
+    _attach_facts(draft, _csv_fact_map(draft["csv_exports"], draft["display_rows"], names))
     _attach_facts(draft, _continuous_fact_map(draft["continuous_operation"]))
     write_draft(draft, Path(args.out))
     # api.ts から抜いた断片は下書きと同じフォルダへ、<機能名>_api_excerpt.ts として書く(機能名は config の名前から)
@@ -917,13 +1023,14 @@ export default function Screen() {
         assert ("取得に成功したときは、rows を応答の内容に置き換える", "after_calls", "success") in facts["EV01"], facts["EV01"]
         assert any(t.startswith("取得に失敗したときは、error") and p == "after_calls" for t, p, _ in facts["EV01"]), facts["EV01"]
         assert any(k.startswith("continuous.") and p == "end" and "上書きする" in t for t, p, k in facts["EV01"]), facts["EV01"]
-        assert ("値の中の二重引用符は2つ重ねる", "end", "csv.escape") in facts["EV02"], facts["EV02"]
-        assert ("合計行では 日付 は空欄にする", "end", "csv.total_blank") in facts["EV02"], facts["EV02"]
+        assert ("値の中の二重引用符は2つ重ねる", "seq", "csv.escape") in facts["EV02"], facts["EV02"]
+        assert any(k == "csv.total_blank" and p == "seq" and "日付 は空欄にする" in t
+                   for t, p, k in facts["EV02"]), facts["EV02"]
         assert draft["continuous_operation"][0]["event"] == "EV01", draft["continuous_operation"]
         assert "読込中の再操作を防ぐ仕組みは無い" in draft["continuous_operation"][0]["fact"], draft["continuous_operation"][0]
         assert draft["display_rows"][0]["specs"] == [
-            {"label": "小計", "csv": "小計(税込)", "kin": "s3", "cnt": None, "nth": 1},
-            {"label": "小計", "csv": None, "kin": "s4", "cnt": None, "nth": 2},
+            {"label": "小計", "csv": "小計(税込)", "kin": "s3", "cnt": None, "nth": 1, "dead": False},
+            {"label": "小計", "csv": None, "kin": "s4", "cnt": None, "nth": 2, "dead": False},
         ], draft["display_rows"]
         assert any(a.get("name") == "visible" and a.get("source") == "rows" for a in draft.get("derived_arrays", [])), \
             f"derived_arrays: {draft.get('derived_arrays')}"
@@ -932,6 +1039,44 @@ export default function Screen() {
         return 1
     except Exception as e:
         print(f"[selftest NG] B5 例外: {e!r}")
+        return 1
+    return 0
+
+
+def _selftest_t4():
+    """CSV の処理順(seq 1〜6)・dead の項目・点数の2列・合計行の when の訳・ファイル名の画面項目名を、_csv_fact_map に直接渡して assert する。
+
+    呼出元: selftest()。意味合い: 1つの CSV 出力から seq の事実が機械で組まれることを確かめる。終了コード 0=OK / 1=NG。
+    """
+    dr = [{"array": "LEFT", "labels": ["小計", "旧項目"], "src": [], "specs": [
+        {"label": "小計", "csv": "小計1(値引前)", "kin": "s1", "cnt": "c1", "nth": 1, "dead": False},
+        {"label": "旧項目", "csv": None, "kin": "s2", "cnt": None, "nth": 1, "dead": True}]}]
+    cv = {"function": "exp", "trigger_events": ["EV07"], "file_name_template": "pos_${applied.from}.csv",
+          "mime": "text/csv;charset=utf-8", "bom": True, "separator": ",", "line_break": "CRLF",
+          "quote": {"fn": "q", "escape": '"→""', "uses_count": 1},
+          "header": {"fixed": ["開始日", "店舗"],
+                     "spread": [{"raw": "...LEFT.filter(c => showDead || !c.dead).map(c => c.label)", "cnt_suffixes": []}]},
+          "total_row": {"when": "rows.length > 1"},
+          "row_builder": {"columns": [
+              {"kind": "ternary", "expr": "r ? r.days : ''", "quoted": False, "row_value": "r.days", "total_value": ""},
+              {"kind": "ternary", "expr": "r ? shop : '合計'", "quoted": True, "row_value": "shop", "total_value": '"合計"'},
+              {"kind": "spread", "expr": "...", "quoted": False}],
+              "value_separator": " "},
+          "joins": [{"target": "dates", "separator": " "}], "src": []}
+    try:
+        got = _csv_fact_map([cv], dr, {"applied": "適用期間"})["EV07"]
+        f = {x["seq"]: x for x in got}
+        assert sorted(f) == [1, 2, 3, 4, 5, 6], f"seq: {sorted(f)}"
+        assert all(x["position"] == "seq" for x in got), "position は seq"
+        assert "小計1(値引前)(点数)、小計1(値引前)(金額)" in f[1]["text"], f[1]["text"]
+        assert "旧項目" in f[1]["text"] and "表示の切替に関係なく" in f[1]["text"], f[1]["text"]
+        assert "半角スペース区切り" in f[2]["text"], f[2]["text"]
+        assert "表示が2行以上のとき" in f[3]["text"] and "開始日 は空欄にする" in f[3]["text"], f[3]["text"]
+        assert "店舗は「合計」" in f[3]["text"], f[3]["text"]
+        assert f[5]["text"].startswith("全体を連結する"), f[5]["text"]
+        assert f[6]["text"] == "ファイル名は「pos_適用期間.csv」で保存する", f[6]["text"]
+    except AssertionError as e:
+        print(f"[selftest NG] T4 {e}")
         return 1
     return 0
 
@@ -1003,6 +1148,8 @@ def selftest():
         print(f"[selftest NG] {e}")
         return 1
     if _selftest_b5():
+        return 1
+    if _selftest_t4():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0
