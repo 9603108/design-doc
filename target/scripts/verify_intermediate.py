@@ -19,12 +19,14 @@
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 # 2026-10-05 汎用化: 機能名・中間 JSON の置き場・案件ごとの設定は _config_loader から取る
 # （このファイルに案件固有の値や絶対パスを持たないため）。使うのは main()。
 from verify_partials import DETAIL_TODO
-from _initial_eval import build_env, linked_fixed_elements, literal_text_elements, visible_initially
+from _initial_eval import build_env, chain_value, disabled_value, linked_fixed_elements, literal_text_elements, visible_initially
+from _jsx_chain import chain_for_lines
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
@@ -1462,6 +1464,70 @@ def check_initialization_items(merged: dict, drafts: list = None) -> list:
     return issues
 
 
+def _resolve_src_file(file: str, project_root: str):
+    """src.file の実在するパスを返す。絶対パスはそのまま、相対パスは project_root 基準も見る。無ければ None。
+    WHY: 出典の file は案件ごとに絶対パスと project_root 基準の相対が混ざるため、両方を見る。"""
+    for cand in (Path(file), Path(project_root or ".") / file):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> list:
+    """B16 差異6 (2026-10-14): 初期処理の活性・表示を、画面項目の出典（src の TSX の行範囲）から再評価して検査する。
+
+    判定ルール:
+      initialization.items[k] と screen_layout.items[k] を名前で対にする（件数・名前が違えば対にしない）。
+      項目の src のうち最初の TSX/JSX の行範囲を chain_for_lines で読み、表示条件の鎖・disabled の鎖を取る。
+      state の初期値で評価し（merge_partials と同じ関数）、評価できた値（None でない）と記載の活性・表示が違えば ERROR。
+      評価が None の項目は見ない。「全項目が一色か」は見ない（正しく一色の画面で誤検出になるため）。
+      TSX が読めないファイルは検査せず、ファイルごとに INFO を1件出す。
+    WHY: merge_partials は名前で結べない項目を仮埋めの「活性/表示」で出す。後段で止めないと、誤った表示条件が docx まで出るため。
+    接続情報: 入力 = merged['initialization']['items'] / merged['screen_layout']['items'] / sc（project_root）/ drafts（state の初期値）
+              / 出力 = [(level, message), ...] / 呼出元 = main()
+    """
+    issues = []
+    init_items = (merged.get("initialization") or {}).get("items") or []
+    sl_items = (merged.get("screen_layout") or {}).get("items") or []
+    if len(init_items) != len(sl_items):
+        return issues  # 件数の不一致は check_initialization_items が ERROR にする
+    drafts = drafts or []
+    env = build_env([si for d in drafts for si in d.get("state_initials") or [] if isinstance(si, dict)],
+                    [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)])
+    root = sc.get("project_root") or "."
+    missing = []
+    for ini, sl in zip(init_items, sl_items):
+        name = str(sl.get("item_name") or "").strip()
+        if str(ini.get("item_name") or "").strip() != name:
+            continue
+        srcs = [s for s in sl.get("src") or [] if isinstance(s, dict) and str(s.get("file") or "").endswith((".tsx", ".jsx"))]
+        if not srcs:
+            continue
+        s = srcs[0]
+        ls, le = s.get("line_start"), s.get("line_end")
+        if not (isinstance(ls, int) and isinstance(le, int)):
+            continue
+        path = _resolve_src_file(str(s["file"]), root)
+        if path is None:
+            if str(s["file"]) not in missing:
+                missing.append(str(s["file"]))
+            continue
+        r = chain_for_lines(str(path), ls, le)
+        if not r.get("found"):
+            continue  # JSX の外・配列の使用箇所も無い: 推測しない
+        dis = disabled_value(r.get("disabled_chain"), env)
+        vis = chain_value(r.get("visible_chain") or [], env)
+        no = ini.get("no") or "?"
+        where = f"出典 {path.name}:{ls}-{le}"
+        if dis is not None and str(ini.get("active") or "") != ("非活性" if dis else "活性"):
+            issues.append(("ERROR", f"initialization.items[{no}]({name}): 活性の記載「{ini.get('active')}」が表示条件の評価（{'非活性' if dis else '活性'}）と違う。{where} の disabled に合わせる"))
+        if vis is not None and str(ini.get("visible") or "") != ("表示" if vis else "非表示"):
+            issues.append(("ERROR", f"initialization.items[{no}]({name}): 表示の記載「{ini.get('visible')}」が表示条件の評価（{'表示' if vis else '非表示'}）と違う。{where} の表示条件に合わせる"))
+    for f in missing:
+        issues.append(("INFO", f"initialization.items の表示条件を検査できない（TSX が読めない）: {f}"))
+    return issues
+
+
 def _load_react_drafts() -> list:
     """機能の react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
     WHY: merge_partials.load_react_drafts と同じ集まりを見て、初期表示の判定の事実を揃える（merge_partials は argv を読むため import しない）。"""
@@ -1604,7 +1670,39 @@ def _selftest() -> int:
     if not check_common_logic_callers({"common_logic": [{"no": "CL1", "used_by_processes_ids": []}]}):
         print("[selftest NG] 呼出元の空が出ない")
         return 1
-    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元")
+    # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価する。
+    # 記載が評価と違えば ERROR、評価が決まらない・TSX が無い項目は見ない（INFO のみ）
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "init.tsx"
+        tsx.write_text("export default function P() {\n  return (\n    <div>\n"
+                       "      {loading && <p>読込中</p>}\n"
+                       "      <button disabled={loading}>保存</button>\n"
+                       "    </div>\n  );\n}\n", encoding="utf-8")
+        drafts_loading = [{"state_initials": [{"state": "loading", "kind": "literal", "initial": "false"}]}]
+        sl_src = {"items": [
+            {"item_name": "読込中", "src": [{"file": str(tsx), "line_start": 4, "line_end": 4}]},
+            {"item_name": "保存", "src": [{"file": str(tsx), "line_start": 5, "line_end": 5}]},
+        ]}
+
+        def merged_of(vis1: str, act2: str) -> dict:
+            return {"screen_layout": sl_src, "initialization": {"items": [
+                {"no": 1, "item_name": "読込中", "active": "活性", "visible": vis1},
+                {"no": 2, "item_name": "保存", "active": act2, "visible": "表示"},
+            ]}}
+
+        if check_initialization_eval(merged_of("非表示", "活性"), {}, drafts_loading):
+            print("[selftest NG] 評価と記載が一致しているのに ERROR が出た")
+            return 1
+        bad = [m for lvl, m in check_initialization_eval(merged_of("表示", "非活性"), {}, drafts_loading) if lvl == "ERROR"]
+        if not (len(bad) == 2 and any("表示の記載" in m for m in bad) and any("活性の記載" in m for m in bad)):
+            print(f"[selftest NG] 表示・活性の食い違いが出ない: {bad}")
+            return 1
+        missing = {"screen_layout": {"items": [{"item_name": "読込中", "src": [{"file": "/nonexistent/x.tsx", "line_start": 1, "line_end": 1}]}]},
+                   "initialization": {"items": [{"no": 1, "item_name": "読込中", "active": "活性", "visible": "表示"}]}}
+        if [lvl for lvl, _ in check_initialization_eval(missing, {}, [])] != ["INFO"]:
+            print("[selftest NG] TSX が読めないときに INFO で飛ばさない")
+            return 1
+    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)")
     return 0
 
 
@@ -1705,6 +1803,8 @@ def main():
     all_issues.extend(check_event_action(merged))
     all_issues.extend(check_diagram_ids(merged))
     all_issues.extend(check_common_logic_callers(merged))
+    # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価して照合する
+    all_issues.extend(check_initialization_eval(merged, sc, _load_react_drafts()))
 
     errors = [i for i in all_issues if i[0] == "ERROR"]
     warns = [i for i in all_issues if i[0] == "WARN"]
@@ -1724,6 +1824,13 @@ def main():
             print(f"  [{lvl}] {msg}")
         if len(warns) > 30:
             print(f"  ...他 {len(warns) - 30} 件のWARN省略")
+        print()
+
+    infos = [i for i in all_issues if i[0] == "INFO"]
+    if infos:
+        print("--- INFO（検査を飛ばした理由。判定には使わない） ---")
+        for lvl, msg in infos:
+            print(f"  [{lvl}] {msg}")
         print()
 
     if not errors and not warns:
