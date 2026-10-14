@@ -7,7 +7,7 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
 候補の決め方(どれも react 下書きの事実):
   a) 応答の最上位キー(rows)→ state: 単一の API だけを呼ぶイベントの失敗経路の on_success_from(state ← rows)。
      複数の API を呼ぶイベントは、失敗経路の呼出名と action の対応がソースから決まらないので使わない(推測しない)。
-  b) state[].項目 の使用箇所(field_usage の uses の行)が入る画面項目(format=固定文言 の見出しは外す)。
+  b) state[].項目 の使用箇所(field_usage の uses の行)が入る画面項目(format=固定文言 の見出しは外す。React の key だけの使用は外す)。
   c) 派生配列(filter 等)の fields に項目があるとき、配列名を表示条件に含む画面項目のうち、行が最小の1つ。
   d) 表示行の specs の kin・cnt が項目と一致し、その表示名の画面項目が1つに決まるとき。
 入れ替え: モデルの行の項目が候補に無ければ、候補の1番目へ入れ替える(transform はそのまま。log に書く)。
@@ -135,11 +135,36 @@ def _spec_items(drafts, items, leaf):
     return hit
 
 
+def _is_key_use(u):
+    """使用が React の key だけのもの(element が「… の key」)。画面に出ない値なので応答の値の写し先にしない。
+    WHY: key は画面の項目ではない(rows[].shop_id の key が会計カードの副題に結ばれた。round12 V6)。"""
+    return bool(re.search(r"の key$", str(u.get("element") or "")))
+
+
+def _key_only(usage, states, leaf):
+    """応答の項目 leaf の使用が1件以上あり、全部 key だけのとき True(写しの行を消す根拠)。使用が無ければ False。"""
+    uses = [u for st in sorted(states) for u in usage.get(f"{st}[].{leaf}", [])]
+    return bool(uses) and all(_is_key_use(u) for u in uses)
+
+
+def _drop_rows(api, path, log):
+    """path の写しの行を消す(使用が key だけで候補が無いとき)。行が無ければ何もしない(冪等)。"""
+    maps = api["response_to_screen_mapping"]
+    keep = [m for m in maps if not (isinstance(m, dict) and m.get("api_field_path") == path)]
+    if len(keep) == len(maps):
+        return
+    log.append(f"[写し] api_spec[{api.get('action')}].response_to_screen_mapping[{path}] の行を消す(使用が React の key だけ)")
+    maps[:] = keep
+
+
 def _candidates(states, leaf, drafts, usage, items, derived, cache):
     """応答の項目 leaf の候補 [(画面項目の index, 派生の式 または None)] を items の順に返す。None は直接の使用。"""
     hits = {}
     for st in sorted(states):
         for u in usage.get(f"{st}[].{leaf}", []):
+            # WHY: key だけの使用は画面に出ない値なので、候補にも入れない(V6)
+            if _is_key_use(u):
+                continue
             for s in u.get("src") or []:
                 for i in _items_at(items, s):
                     # WHY: 画面の見出し(format=固定文言)は応答の値を出さない。使用行が重なっても候補にしない
@@ -231,6 +256,9 @@ def fill(out, log):
             cands = _candidates(states, leaf, drafts, usage, items, derived, cache)
             if cands:
                 _write_rows(api, path, cands, items, log)
+            elif _key_only(usage, states, leaf):
+                # WHY: 使用が key だけで候補が無い項目は、モデルが書いた写しの行も消す(V6)
+                _drop_rows(api, path, log)
 
 
 def _selftest():
@@ -270,7 +298,10 @@ def _selftest():
                 {"event": "EV03", "call": "fetchZ", "on_success": ["rows"], "on_success_from": {"rows": "rows"}}],
             "field_usage": [
                 {"path": "rows[].name", "uses": [{"src": sp(7)}, {"src": sp(9)}]},
-                {"path": "rows[].code", "uses": [{"src": sp(9)}]},
+                # WHY: key と値の併用の形。key の使用(行 7)は候補に入れず、値の使用(行 9)だけで決まる
+                {"path": "rows[].code", "uses": [{"element": "Card の key", "src": sp(7)}, {"src": sp(9)}]},
+                # WHY: key だけの使用の形。候補が無いので、モデルが書いた写しの行は消える
+                {"path": "rows[].sid", "uses": [{"element": "Card の key", "src": sp(9)}]},
                 {"path": "rows[].days", "uses": [{"src": sp(3)}]}],
             "derived_arrays": [{"name": "w", "source": "rows", "op": "filter", "fields": ["days"],
                                 "lambda_expr": "r.days > 0", "src": sp(3)}],
@@ -288,6 +319,7 @@ def _selftest():
                             {"api_field_path": "rows[].name", "screen_item_name": "店名", "transform": "T1", "screen_no": "2"},
                             {"api_field_path": "rows[].code", "screen_item_name": "件数表示", "transform": "T2", "screen_no": "1"},
                             {"api_field_path": "rows[].days", "screen_item_name": "店名", "transform": "T3", "screen_no": "2"},
+                            {"api_field_path": "rows[].sid", "screen_item_name": "店名", "transform": "T6", "screen_no": "2"},
                             {"api_field_path": "rows[].zz", "screen_item_name": "店名", "transform": "T4", "screen_no": "2"}]},
                         {"action": "get_z", "response_to_screen_mapping": [
                             {"api_field_path": "rows[].name", "screen_item_name": "件数表示", "transform": "T5", "screen_no": "1"}]}]}
@@ -318,7 +350,10 @@ def _selftest():
     assert by["rows[].code"]["screen_no"] == "2", by["rows[].code"]
     assert by["rows[].days"]["screen_no"] == "1", by["rows[].days"]
     assert [(m["screen_item_name"], m["transform"]) for m in z["response_to_screen_mapping"]] == [("件数表示", "T5")], z
-    assert len(log) == 3, log
+    # WHY: 4件 = 書き換え2件(days・code)・足し1件(件数表示)・key だけの行の削除1件(sid)
+    assert len(log) == 4, log
+    assert not any("rows[].sid" in m["api_field_path"] and "店名" in m["screen_item_name"] and m["transform"] == "T6"
+                   for m in x["response_to_screen_mapping"]), x["response_to_screen_mapping"]
     print("[selftest OK] _compose_mapping (N2・N3: 応答の項目を画面項目へ写す)")
 
 
