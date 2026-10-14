@@ -272,6 +272,83 @@ def _rename_logical_names(out, drafts, log):
                 it["display_name"] = by_name[it["display_name"]]
 
 
+def _bare(name):
+    """論理名の末尾の「(推定)」を除く(名前の比較専用)。"""
+    s = str(name or "")  # fallback-ok: None は空文字として比べる(比較専用)
+    return s[:-len(SUFFIX)] if s.endswith(SUFFIX) else s
+
+
+def _unify_same_expression(out, drafts, log):
+    """backend 下書きの全 API の列を式(expression の空白を詰めたもの)で束ね、別名が2つ以上ある束は
+    logical_names の論理名を1つに揃える。dataset・where・group_by・order_by の同じ別名の行も同じ名前にする。
+    呼出元: _compose_db(_rename_logical_names の後、論理表名へ「(推定)」を付ける前)。
+    WHY(W5/(d)): 同じ式の列が API ごとに別名(shop_name と name)で出ると、H2 が別々の論理名(店舗名称・名称)を付け、
+         同じ列が帳票の中で2通りに見える。式が同じなら同じ列なので、論理名を1つに寄せる。
+    選び方: 出所が事実(_RENAME_SOURCES)の名前があればそれ(複数なら決まらない)。無ければ、一方が他方を末尾に含むとき
+         長い方(店舗名称 ⊃ 名称)。どちらでもなければ揃えず WARN。
+    やらない事: 式が違う列(min(kai_date) と max(kai_date))は束ねない。物理名は触らない。H2 の行は消さない。"""
+    bundles = {}  # 空白を詰めた式 -> {別名: [下書き列, ...]}
+    for d in drafts:
+        for a in (d.get("apis") or {}).values():  # fallback-ok: 下書きの apis は任意
+            for dop in (a or {}).get("db_operations") or []:  # fallback-ok: 下書きの欄は任意
+                for c in dop.get("columns") or []:  # fallback-ok: 列は任意
+                    ex, al = _nows(c.get("expression")), c.get("alias_name")
+                    if ex and al:
+                        bundles.setdefault(ex, {}).setdefault(al, []).append(c)
+    lns = out.get("logical_names") or []  # fallback-ok: logical_names は任意
+    if not lns:
+        return
+    # 旧名が複数の別名に付いているときは、句の行の置換を表と旧名だけでは決められない(_rename_logical_names と同じ配慮)
+    aliases_of = {}
+    for r in lns:
+        if r.get("logical_column"):  # fallback-ok: 列名の無い行は対象外
+            aliases_of.setdefault((r.get("logical_table") or "", _bare(r["logical_column"])), set()).add(r.get("alias_name"))  # fallback-ok: 表・別名の無い行も数える
+    renames = []  # (別名, 論理表, 旧名(推定なし), 新名)
+    for ex, by_alias in sorted(bundles.items()):
+        if len(by_alias) < 2:
+            continue
+        rows = [r for r in lns if r.get("alias_name") in by_alias and r.get("logical_column")]  # fallback-ok: 行が無い別名は対象外
+        raw = {r["logical_column"] for r in rows}
+        names = sorted({_bare(x) for x in raw})
+        if len(names) < 2:
+            continue  # 行が無い・既に揃っている
+        facts = {c.get("logical_name") for cs in by_alias.values() for c in cs
+                 if c.get("logical_name_source") in _RENAME_SOURCES and c.get("logical_name")}  # fallback-ok: 出所の無い列は事実にしない
+        if len(facts) == 1:
+            pick = _bare(next(iter(facts)))
+        elif len(facts) > 1:
+            log.append(f"WARN _compose_db_facts: 式 {ex} の別名 {sorted(by_alias)} は事実の論理名が複数あり {sorted(facts)}、揃えない")
+            continue
+        else:
+            longest = max(names, key=len)
+            if all(longest.endswith(n) for n in names):
+                pick = longest
+            else:
+                log.append(f"WARN _compose_db_facts: 式 {ex} の別名 {sorted(by_alias)} の論理名 {names} は包含関係に無く、揃えない")
+                continue
+        # 「(推定)」の有無は、選んだ名前を持つ行に合わせる(事実の名前には付けない)
+        new = pick + SUFFIX if (pick + SUFFIX) in raw else pick
+        for r in rows:
+            if r["logical_column"] != new:
+                old = _bare(r["logical_column"])
+                renames.append((r.get("alias_name"), r.get("logical_table") or "", old, new))  # fallback-ok: 表名の無い行は表を空として扱う
+                r["logical_column"] = new
+                log.append(f"INFO _compose_db_facts: 同じ式 {ex} の列の論理名 {old} を {new} へ揃える({r.get('alias_name')})")
+    if not renames:
+        return
+    for op in out.get("db_operations") or []:  # fallback-ok: db_operations は任意
+        for al, lt, old, new in renames:
+            for row in op.get("dataset") or []:  # fallback-ok: dataset は任意
+                if row.get("alias_name") == al and _bare(row.get("logical_column")) == old:
+                    row["logical_column"] = new
+            if len(aliases_of.get((lt, old), ())) != 1:  # fallback-ok: 旧名が複数の別名に付くときは句の行を触らない
+                continue
+            for key in ("where", "group_by", "order_by"):
+                for row in op.get(key) or []:  # fallback-ok: 句は任意
+                    if (row.get("logical_table") or "") == lt and _bare(row.get("logical_column")) == old:  # fallback-ok: 欄が空の行は一致しない
+                        row["logical_column"] = new
+
+
 def _ws(s):
     """空白を1つに詰めて小文字にする(字面の比較専用)。"""
     return " ".join(str(s or "").split()).lower()  # fallback-ok: None は空文字として比べる(比較専用)
@@ -335,6 +412,7 @@ def _compose_db(out, drafts, log):
             if row.get("condition"):  # fallback-ok: 条件の無い joins は対象外
                 row["condition"] = _translate_condition(row["condition"], aliases, pt2lt, col, log)
     _rename_logical_names(out, drafts, log)         # c0) 論理名を事実の出所の名前へ寄せる(下の(推定)の前)
+    _unify_same_expression(out, drafts, log)        # c0b) 同じ式の列の論理名を1つに揃える(W5。(推定)の前)
     for r in lns:                                   # c) 論理表名の「(推定)」
         if r.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
             r["logical_table"] = _sfx(r["logical_table"])
@@ -564,6 +642,35 @@ def selftest():
         assert v4_ln[i]["physical_table"] == "pos_account_reports" and v4_ln[i]["physical_column"] == "" and "derived" not in v4_ln[i], v4_ln[i]
     assert any("付け替え" in x and "name" in x for x in v4_log), v4_log
     assert any("WARN" in x and "zz" in x for x in v4_log), v4_log
+    # W5: 2つの API の同じ式の列(shop_name=店舗名称・name=名称)は長い方へ揃え、式の違う列(first_date・last_date)は変えない
+    w5_col = lambda al, ex, ln, src: {"alias_name": al, "expression": ex, "logical_name": ln, "logical_name_source": src}
+    w5_cols1 = [w5_col("shop_name", "COALESCE(s.name, 'x')", "店舗名称", "guess"), w5_col("first_date", "min(p.kai_date)", "", "")]  # fallback-ok: テスト用の列の入力(既定値ではない)
+    w5_cols2 = [w5_col("name", "COALESCE(s.name,  'x')", "名称", "guess"), w5_col("last_date", "max(p.kai_date)", "", "")]  # fallback-ok: テスト用の列の入力(既定値ではない)
+    w5_drafts = [{"apis": {"a1": {"db_operations": [{"id": "d1", "columns": w5_cols1}]},
+                           "a2": {"db_operations": [{"id": "d2", "columns": w5_cols2}]}}}]
+    w5_ln = lambda al, lc: {"physical_table": "shops", "logical_table": "店舗マスタ", "physical_column": "", "logical_column": lc, "alias_name": al}
+    w5_out = {"logical_names": [w5_ln("shop_name", "店舗名称(推定)"), w5_ln("name", "名称(推定)"),
+                                w5_ln("first_date", "最初の日"), w5_ln("last_date", "最後の日")],
+              "db_operations": [{"id": "x", "dataset": [{"alias_name": "name", "logical_table": "店舗マスタ", "logical_column": "名称(推定)"}],
+                                 "order_by": [{"logical_table": "店舗マスタ", "logical_column": "名称(推定)"}]}]}
+    w5_log = []
+    _unify_same_expression(w5_out, w5_drafts, w5_log)
+    assert [r["logical_column"] for r in w5_out["logical_names"]] == ["店舗名称(推定)", "店舗名称(推定)", "最初の日", "最後の日"], w5_out["logical_names"]
+    assert w5_out["db_operations"][0]["dataset"][0]["logical_column"] == "店舗名称(推定)", w5_out["db_operations"][0]
+    assert w5_out["db_operations"][0]["order_by"][0]["logical_column"] == "店舗名称(推定)", w5_out["db_operations"][0]
+    snap5 = copy.deepcopy(w5_out)
+    _unify_same_expression(w5_out, w5_drafts, [])
+    assert w5_out == snap5, "W5 not idempotent"
+    # 包含関係に無い(別々の名前)ときは揃えず WARN。事実の出所の名前があればそれに揃える
+    w5_out2 = {"logical_names": [w5_ln("shop_name", "店舗名称"), w5_ln("name", "名前")]}
+    w5_log2 = []
+    _unify_same_expression(w5_out2, w5_drafts, w5_log2)
+    assert [r["logical_column"] for r in w5_out2["logical_names"]] == ["店舗名称", "名前"] and any("WARN" in x for x in w5_log2), (w5_out2, w5_log2)
+    w5_fact = copy.deepcopy(w5_drafts)
+    w5_fact[0]["apis"]["a2"]["db_operations"][0]["columns"][0].update({"logical_name": "店名", "logical_name_source": "docstring"})
+    _unify_same_expression(w5_out2, w5_fact, [])
+    assert [r["logical_column"] for r in w5_out2["logical_names"]] == ["店名", "店名"], w5_out2
+    print("[selftest OK] _compose_db_facts W5 (同じ式の列の論理名を揃える・式が違う列は変えない・決まらないときは WARN)")
     print("[selftest OK] _compose_db_facts V4 (別名の表が違う行は下書き列の表へ付け替える・論理表が無い・候補が割れるときは触らない)")
     print("[selftest OK] _compose_db_facts 番号振りの後の id でも同じ事実(legacy_id・action で結ぶ)")
     print("[selftest OK] _compose_db_facts F2 (副問い合わせの集計を外す・主の集計は残す)")
