@@ -9,7 +9,8 @@
 - 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない
 - logical_names にも columns の列を全部書く(同じ表・同じ列は1行にまとめてよい)
 - dataset の physical_column は columns[].real_column の列の部分(表.列 の列)を写す。kind が alias_only の列は real_column が空で、下書きの physical_column に入っている値は別名なので、physical_column に書かない(空にし、別名は logical_column と alias_name で示す)。physical_table は columns[].real_column の表の部分(空なら table)。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
-- 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く
+- 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)・ui_label_guess(画面の語からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く
+- logical_name_source が docstring・comment・csv_header・ui_label の候補は、下書きの語をそのまま使う(合成が事実の名前へ寄せるので、書き換えない)
   (例: 店舗ID(推定))。ソースや DDL でより確かな名前が分かれば、それに置き換えて「(推定)」を外してよい
 - 候補が空の列も省かない。式(expression)と別名から論理名を付け、「(推定)」を付ける
 - 列の省略は `verify_partials.py --units` が [列の省略] の ERROR で止め、欠けた列名を挙げて差し戻す
