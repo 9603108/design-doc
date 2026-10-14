@@ -648,6 +648,33 @@ def _alias_arrays(sources):
     return out
 
 
+_NULL_FALLBACK = re.compile(r"\?\?\s*(\"\"|''|[^\s)]+)")
+_FORMAT_CALL = re.compile(r"toLocaleString\s*\(|Intl\.NumberFormat|\.toFixed\s*\(")
+_DECL = re.compile(r"\b(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)")
+_IMPORT = re.compile(r"^import\s+([^;]+?)\s+from\s+[\"']", re.M)
+
+
+def _fixed_col_text(name, col):
+    """データ行の固定列の言い方。値の取り出しが `?? <リテラル>` の列は、値が無い(null)ときの値を文に足す。
+
+    WHY: `r.reji_no ?? ""` の列は null のとき空文字で出る。CSV の空と null を取り違えないよう、その事実を書く。
+    """
+    fb = _NULL_FALLBACK.search(col.get("row_value") or "")
+    notes = ["二重引用符で囲む"] if col.get("quoted") else []
+    if fb:
+        lit = fb.group(1)
+        notes.append("値が無い(null)ときは空文字" if lit in ('""', "''") else f"値が無い(null)ときは「{lit}」")
+    return name + ("(" + "。".join(notes) + ")" if notes else "")
+
+
+def _same_total_text(name, col, names):
+    """合計行の同じ式の列の言い方。表示の確定の欄(applied.from)は「確定済みの<項目名>の値」、決まらない式は式のまま出す。"""
+    expr = col.get("expr") or ""
+    if "." in expr and names.get(expr):
+        return f"{name}は確定済みの{names[expr]}の値"
+    return f"{name}は(式: {expr})の値"
+
+
 def _csv_seq_facts(c, names, display_rows, aliases=None):
     """1つの CSV 出力の処理順の事実(seq 1〜6)を返す。取れない欄は行ごと出さない(推測で埋めない)。"""
     facts, src = [], c.get("src", [])
@@ -679,7 +706,7 @@ def _csv_seq_facts(c, names, display_rows, aliases=None):
         if col.get("kind") == "same" and "." in expr and names.get(expr):
             parts.append(f"{f}(確定済みの{names[expr]}の値)")
         else:
-            parts.append(f + ("(二重引用符で囲む)" if col.get("quoted") else ""))
+            parts.append(_fixed_col_text(f, col))
     spread_expr = " ".join((x.get("expr") or "") for x in cols if x.get("kind") == "spread")
     has_cnt = re.search(r"\.cnt\s*\?", spread_expr)
     has_calc = re.search(r"\.calc\s*\?", spread_expr)
@@ -703,6 +730,9 @@ def _csv_seq_facts(c, names, display_rows, aliases=None):
             seps.append(j["target"] + "の値は" + _sep_text(j["separator"]) + "で連結する")
     if seps:
         text += "。" + "。".join(seps)
+    # WHY: CSV の関数が整形の関数を呼ばないとき(formats_numbers が false)は、画面の桁区切りを CSV に持ち込まないと書く
+    if c.get("formats_numbers") is False:
+        text += "。数値は桁区切りにせず、そのまま出す"
     add(2, "csv.row", text)
 
     # 3 合計行: total_row がある時だけ。空欄の列と、空でない合計の値を分けて書く
@@ -711,9 +741,19 @@ def _csv_seq_facts(c, names, display_rows, aliases=None):
         text = "合計行: " + _when_text(tr.get("when", "")) + "のとき最後に1行足す"
         blank_q, blank_plain, vals = [], [], []
         for i, col in enumerate(cols):
-            if col.get("kind") != "ternary":
-                continue
+            kind = col.get("kind")
             name = fixed[i] if i < len(fixed) and not any(x.get("kind") == "spread" for x in cols[:i]) else f"{i + 1}列目"
+            # WHY: 同じ式の列(開始日・終了日)と展開の列(各項目の合算)も合計行の値なので書く。式と合計の呼出から読める分だけ
+            if kind == "same":
+                vals.append(_same_total_text(name, col, names))
+                continue
+            if kind == "spread":
+                agg = ((c.get("row_builder") or {}).get("total_call") or {}).get("agg_expr")
+                if agg:
+                    vals.append("続く各項目は全行の合算" if "sum" in agg.lower() else f"続く各項目は{agg}で求めた値")
+                continue
+            if kind != "ternary":
+                continue
             tv = col.get("total_value", "")
             if tv in _EMPTY_VALUES + ("",):
                 # WHY: 引用符つきの空(q(""))と無記入は CSV の上で別の値なので、分けて書く
@@ -765,6 +805,87 @@ def _csv_fact_map(csv_exports, display_rows=(), names=None, aliases=None):
         for code in c.get("trigger_events", []):
             out.setdefault(code, []).extend(facts)
     return out
+
+
+def _decl_body(text, i):
+    """宣言の名前の後ろ(i)から本体の終わりまでを返す。本体は深さ0の { の対、無ければ深さ0の ; まで。
+
+    WHY: 引数の型注釈の { で本体を切らないよう、( と [ の中は深さに数える。
+    """
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif depth == 0 and c == ";":
+            return text[i:j]
+        elif depth == 0 and c == "{":
+            return text[i:_close(text, j) + 1]
+    return text[i:]
+
+
+def _imported_names(text):
+    """import 文で持ち込む名前の集まり。別ファイルの関数を CSV が呼ぶ形を見分けるのに使う。"""
+    out = set()
+    for m in _IMPORT.finditer(text):
+        for part in re.split(r"[,{}]", m.group(1)):
+            w = part.strip().split(" as ")[-1].strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", w):
+                out.add(w)
+    return out
+
+
+def _formatter_names(sources):
+    """TSX・JSX の中で数値を桁区切り・小数に整形する関数の名前の集まり。呼出元: _csv_formats_numbers()。
+
+    整形の元は toLocaleString( ・Intl.NumberFormat・.toFixed( を本体に持つ宣言。それを呼ぶ宣言も、本体の呼出を辿って含める(fmt を包む関数など)。
+    WHY: 整形の関数は画面の中に入れ子で書かれることが多い(Card の中の fmt)。モジュール直下だけを見ると CSV の呼出を取り逃す。
+    """
+    decls = {}
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _DECL.finditer(text):
+            decls.setdefault(m.group(1), []).append(_decl_body(text, m.end()))
+    fmt = {n for n, bodies in decls.items() if any(_FORMAT_CALL.search(b) for b in bodies)}
+    grew = True
+    while grew:
+        grew = False
+        for n, bodies in decls.items():
+            if n not in fmt and any(re.search(rf"\b{re.escape(f)}\s*\(", b) for b in bodies for f in fmt):
+                fmt.add(n)
+                grew = True
+    return fmt
+
+
+def _csv_formats(c, fmt):
+    """1つの CSV 出力の関数本体が数値を整形するか。True・False、判定できないときは None。
+
+    WHY: 別ファイルから import した関数を CSV が呼ぶと、その中で整形しているかは見えない。False と言い切らず None にする。
+    """
+    src = (c.get("src") or [None])[0]
+    if not src:
+        return None
+    text = Path(src["file"]).read_text(encoding="utf-8")
+    body = "\n".join(text.splitlines()[src["line_start"] - 1:src["line_end"]])
+    if _FORMAT_CALL.search(body) or any(re.search(rf"\b{re.escape(f)}\s*\(", body) for f in fmt):
+        return True
+    if any(re.search(rf"\b{re.escape(n)}\s*\(", body) for n in _imported_names(text) - fmt):
+        return None
+    return False
+
+
+def _csv_formats_numbers(csv_exports, sources):
+    """各 CSV 出力に formats_numbers を足す(true=値を整形する / false=整形しない / null=判定できない)。呼出元: main()。
+
+    WHY: 画面の桁区切りを CSV に持ち込むかは、CSV の関数が整形の関数を呼ぶかで決まる。モデルに推測させず、下書きの事実にする(V5・V7 が読む)。
+    """
+    fmt = _formatter_names(sources)
+    for c in csv_exports:
+        c["formats_numbers"] = _csv_formats(c, fmt)
 
 
 def _continuous_fact_map(ops):
@@ -1005,6 +1126,8 @@ def main(argv=None):
     draft.update(facts)
     # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
     draft.update(_react_facts.csv_exports(links, sources))
+    # 目的: 各 CSV 出力が数値を整形するか(formats_numbers)を下書きに足す。データ行の文の「桁区切りにしない」と、V7 の検査が読む
+    _csv_formats_numbers(draft["csv_exports"], sources)
     # 目的: 計算式の候補(定数配列の calc)を下書きに足し、verify_vs_source.check_calcs が H4 の calculations と突き合わせる(B1)。接続: _react_facts.calc_candidates
     draft.update(_react_facts.calc_candidates(sources))
     # 目的: 入力・操作系の JSX 要素(label・種別の目安)を下書きに足し、verify_vs_source.check_items が画面項目と突き合わせる(B2)。接続: _react_facts.jsx_elements
@@ -1253,6 +1376,70 @@ def _selftest_u6():
     return 0
 
 
+def _selftest_v5():
+    """合計行の同じ式の列・展開の列、データ行の `?? リテラル` の既定値、CSV の整形の判定(formats_numbers)を assert する。
+
+    呼出元: selftest()。意味合い: 合計行が同じ式の列と展開の列まで書かれること、null のときの値を書くこと、
+    CSV の関数が整形の関数を呼ぶか(入れ子の関数の辿り・直の呼出・別ファイルの import)を小さな TSX で確かめる。終了コード 0=OK / 1=NG。
+    """
+    import tempfile
+    names = {"applied.from": "集計開始日"}
+    # fallback-ok: 実データの列の式(r.reji_no ?? "")を再現する試験の入力。null のとき空文字になることを書く事実の確認
+    fallback_expr = 'r ? r.reji_no ?? "" : ""'
+    cv = {"function": "exp", "trigger_events": ["EV08"], "file_name_template": None,
+          "header": {"fixed": ["開始日", "レジNO"], "spread": [{"raw": "...LEFT", "cnt_suffixes": []}]},
+          "total_row": {"when": "rows.length > 1"},
+          "row_builder": {"columns": [
+              {"kind": "same", "expr": "applied.from", "quoted": False},
+              {"kind": "ternary", "expr": fallback_expr, "quoted": False,
+               "row_value": 'r.reji_no ?? ""', "total_value": '""'},
+              {"kind": "spread", "expr": "...", "quoted": False}],
+              "value_separator": " ", "total_call": {"lines": "lines", "agg_arg": "rows", "agg_expr": "sumAggs(rows)"}},
+          "joins": [], "src": []}
+    try:
+        got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
+        assert "開始日(確定済みの集計開始日の値)、レジNO(値が無い(null)ときは空文字)" in got[2]["text"], got[2]["text"]
+        assert "桁区切り" not in got[2]["text"], "formats_numbers が無いのに整形の文が出た"
+        assert "開始日は確定済みの集計開始日の値" in got[3]["text"], got[3]["text"]
+        assert "続く各項目は全行の合算" in got[3]["text"], got[3]["text"]
+        assert got[3]["key"] == "csv.total_blank" and "レジNO は無記入にする" in got[3]["text"], got[3]
+        cv["row_builder"]["total_call"]["agg_expr"] = "tally(rows)"
+        got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
+        assert "続く各項目はtally(rows)で求めた値" in got[3]["text"], got[3]["text"]
+        cv["formats_numbers"] = False
+        got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
+        assert got[2]["text"].endswith("。数値は桁区切りにせず、そのまま出す"), got[2]["text"]
+        # 整形の判定: 入れ子の関数の辿り・直の呼出は true、別ファイルの import は判定できず null、整形なしは false
+        csv_head = "  const exportCsv = () => {"
+        cases = {
+            "transitive": (["const fmt = (n) => n.toLocaleString();", "export default function P() {",
+                            "  function rowsToCsv(rows) {", "    return rows.map((r) => fmt(r.kin)).join(\",\");", "  }"],
+                           ["rowsToCsv(rows);"], True),
+            "direct": (["export default function P() {"], ["rows.map((r) => r.kin.toLocaleString()).join(\",\");"], True),
+            "imported": (['import { fmtYen } from "./yen";', "export default function P() {"],
+                         ["rows.map((r) => fmtYen(r.kin)).join(\",\");"], None),
+            "plain": (["const money = (n) => n.toLocaleString();", "export default function P() {"],
+                      ["rows.map((r) => r.kin).join(\",\");"], False),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for case, (head, call, want) in cases.items():
+                tp = Path(td) / f"{case}.tsx"
+                lines = head + [csv_head, f"    const body = {call[0]}", "    const blob = new Blob([body]);", "  };",
+                                "  return null;", "}"]
+                tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                a = lines.index(csv_head)
+                c = {"src": [{"file": str(tp), "line_start": a + 1, "line_end": a + 4}]}
+                _csv_formats_numbers([c], [tp])
+                assert c["formats_numbers"] is want, f"{case}: {c['formats_numbers']!r} != {want!r}"
+    except AssertionError as e:
+        print(f"[selftest NG] V5 {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] V5 例外: {e!r}")
+        return 1
+    return 0
+
+
 def selftest():
     """最小の api.ts と TSX(ラッパー経由・useEffect 連鎖・解決不能の1件)で、解析と組立の期待値を assert する。
 
@@ -1324,6 +1511,8 @@ def selftest():
     if _selftest_t4():
         return 1
     if _selftest_u6():
+        return 1
+    if _selftest_v5():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0
