@@ -1067,7 +1067,80 @@ def check_cl_csv_format(common_logic, csv_exports):
     return problems
 
 
+# --- W11: 例示値の行数の矛盾(新1)と、書式を落とした transform の写し(新3の保険)。どちらも ERROR。検査だけで、例示値・transform は書き換えない ---
+# WHY: 「N行」の数だけを見る。「1行目」「2行以上」のような数は、表の行数と一致しなければ見ない
+_ROW_COUNT = re.compile(r"(\d+)\s*行(?!目)")
+_EXCLUDE_WORDS = re.compile(r"除く|除いた|除き")
+
+
+def check_row_count_example(items, display_rows):
+    """画面項目の example・remarks が書く「N行」が、「空欄項目(dead)を除く」と言いながら除かない行数になっていないかを見る(新1。ERROR)。
+    下書きの display_rows ごとに、全行数 T(specs の数)と dead を除いた行数 L を取る。文(「。」と改行で切る)ごとに「N行」を拾い、
+    N が T のどれかに一致し L のどれにも一致しないとき、同じ文に「除く・除いた・除き」があれば ERROR(例 左段22行（空欄項目を除く）)。
+    WHY: S1 は表の行数に dead の行を含めたまま「空欄項目を除く」と書く(run12 の IT17)。dead は画面で隠れるので読み手は除いた数だと読む。
+    呼出元: main(display_rows のある下書きがあるとき)。差し戻し先は S1(例示値は S1 が書く)。dead の欄が無い spec は dead でないとみなす。"""
+    ts, ls = [], []
+    for r in display_rows or []:
+        specs = [s for s in r.get("specs") or [] if isinstance(s, dict)]
+        if specs:
+            ts.append(len(specs))
+            ls.append(sum(1 for s in specs if not s.get("dead")))
+    if not ts:
+        return []
+    problems = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        bad = []
+        for k in ("example", "remarks"):
+            for sent in re.split(r"[。\n]", str(it.get(k) or "")):
+                if not _EXCLUDE_WORDS.search(sent):
+                    continue
+                bad += [n for n in dict.fromkeys(int(x) for x in _ROW_COUNT.findall(sent)) if n in ts and n not in ls and n not in bad]
+        # WHY: 1項目に1行(左段・右段の2つの数が同じ誤りでも指摘は1件。差し戻しの数を増やさない)
+        if bad:
+            problems.append(f"[ERROR] [例示値] screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')}): 例示値の {'・'.join(f'{n}行' for n in bad)} は空欄項目を含む行数(除くと {'・'.join(str(x) for x in dict.fromkeys(ls))}行) → 差し戻し先 S1")
+    return problems
+
+
+def check_transform_format(api_spec, items, display_rows):
+    """response_to_screen_mapping の transform が、画面の書式(format の「#,##0」)を落として「そのまま…」で始まるものを ERROR にする(新3の保険)。
+    対: api_field_path の葉が display_rows の spec の kin・cnt に一致し、写し先の画面項目(screen_item_name)の format に「#,##0」がある行。
+    WHY: 画面は3桁区切りと単位で出すのに、transform が「そのまま表示」だと読み手は生の値が出ると読む(run12 の 55 件)。
+    合成(_compose_mapping)がセルの書式の事実から transform を作るので、合成の後は 0 件になる。作れずに「そのまま」が残ったときに止める保険。
+    呼出元: main(display_rows のある下書きがあるとき)。差し戻し先は S2(api_spec の transform は S2 が持つ)。"""
+    leaves = {x for r in display_rows or [] for s in r.get("specs") or [] if isinstance(s, dict) for x in (s.get("kin"), s.get("cnt")) if x}
+    by_name = {i.get("item_name"): i for i in items or [] if isinstance(i, dict)}
+    problems = []
+    for a in api_spec or []:
+        for m in a.get("response_to_screen_mapping") or []:
+            path = str(m.get("api_field_path") or "")
+            leaf = path.replace("[]", "").rsplit(".", 1)[-1]
+            it = by_name.get(m.get("screen_item_name"))
+            fmt = str((it or {}).get("format") or "")
+            if leaf in leaves and "#,##0" in fmt and str(m.get("transform") or "").startswith("そのまま"):
+                problems.append(f"[ERROR] [写し] api_spec[{a.get('action')}].response_to_screen_mapping[{path}]: 画面は {fmt} で出すが transform が「{m.get('transform')}」 → 差し戻し先 S2")
+    return problems
+
+
 def selftest():
+    # W11: 例示値の行数(T=22・L=14 の表)と書式を落とした transform
+    w11_rows = [{"array": "LEFT", "specs": [{"label": f"r{i}", "kin": f"k{i}", "cnt": None, "dead": i >= 14} for i in range(22)]}]
+    w11_it = lambda ex, rm="", fmt="": [{"no": "IT17", "item_name": "合計カードの会計表", "example": ex, "remarks": rm, "format": fmt}]
+    got = check_row_count_example(w11_it("左段22行・右段17行（空欄項目を除く）"), w11_rows)
+    assert len(got) == 1 and got[0].startswith("[ERROR] [例示値] screen_layout.items[IT17]") and "22行" in got[0] and "除くと 14行" in got[0] and "差し戻し先 S1" in got[0], got
+    assert check_row_count_example(w11_it("左段22行・右段17行"), w11_rows) == [], "除く無しは通す"
+    assert check_row_count_example(w11_it("1行目", "2行以上のとき表示する。1行目を除く"), w11_rows) == [], "T・L に一致しない数は見ない"
+    assert check_row_count_example(w11_it("左段14行（空欄項目を除く）"), w11_rows) == [], "L に一致する数は通す"
+    assert check_row_count_example(w11_it("左段22行（空欄項目を除く）"), []) == [] and check_row_count_example([], w11_rows) == []
+    w11_map = [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].k0", "screen_item_name": "総売上", "transform": "そのまま表示"}]}]
+    w11_items = [{"item_name": "総売上", "format": "#,##0 円"}]
+    got = check_transform_format(w11_map, w11_items, w11_rows)
+    assert len(got) == 1 and got[0].startswith("[ERROR] [写し]") and "k0" in got[0] and "差し戻し先 S2" in got[0], got
+    ok_map = [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].k0", "screen_item_name": "総売上", "transform": "3桁区切りの数値と「円」で出す"}]}]
+    assert check_transform_format(ok_map, w11_items, w11_rows) == []
+    assert check_transform_format(w11_map, [{"item_name": "総売上", "format": "固定文言"}], w11_rows) == [], "書式に #,##0 が無ければ通す"
+    assert check_transform_format([{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].id", "screen_item_name": "総売上", "transform": "そのまま表示"}]}], w11_items, w11_rows) == [], "spec の葉でなければ通す"
     # 事実(別名・集計・CTE・副問合せ・例外の code)の照合
     col = lambda al, kind, real_c="", src=(), expr="x": {"alias": al, "alias_name": al, "kind": kind, "real_column": real_c, "source_columns": list(src),
                                                          "expression": expr, "is_expression": kind == "alias_only"}
@@ -1520,7 +1593,9 @@ def main(argv=None):
     # V7: 表示切替の文面と CSV の動き(新5)、CSV の整形の有無と文(新9)。判定の材料は react 下書きの failure_effects・csv_exports
     state_problems = check_state_setters(data.get("validations") or data.get("validations_frontend"), beh, rd_all.get("failure_effects"), rd_all.get("csv_exports"))
     csv_format_problems = check_cl_csv_format(data.get("common_logic"), rd_all.get("csv_exports"))
-    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems + state_problems + csv_format_problems
+    # W11: 例示値の行数の矛盾・書式を落とした transform(ERROR)。display_rows が無い下書きでは何も言わない
+    w11_problems = (check_row_count_example(items, disp_rows) + check_transform_format(data.get("api_spec"), items, disp_rows)) if disp_rows else []
+    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems + state_problems + csv_format_problems + w11_problems
     for p in all_lines:
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
@@ -1539,6 +1614,7 @@ def main(argv=None):
     # U12: FR の手順に画面規則を書いていないか(ERROR。差し戻し先 S3)
     print(f"[INFO] 画面規則の照合(FR の手順に押せ・活性などを書いた行): ERROR {len(front_problems)} 件")
     print(f"[INFO] 表示切替の文面と CSV の動き・CSV の整形の照合: ERROR {len(state_problems) + len(csv_format_problems)} 件")
+    print(f"[INFO] 例示値の行数・transform の書式の照合: ERROR {len(w11_problems)} 件")
     # WHY: 終了コードは、WARN の接頭辞が無い行(ERROR)が1件でもあれば 1。WARN だけでは止めない
     return 1 if any(not p.startswith("[WARN]") for p in all_lines) else 0
 
