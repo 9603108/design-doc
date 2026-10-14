@@ -535,6 +535,16 @@ def _guess_step_kind(text: str, react_kinds: frozenset = frozenset()) -> str:
     return "state_update"
 
 
+# WHY: ボタンの活性・押せる条件の語。verify_vs_source.py の画面規則の検査(U12)と同じ語で判定する。
+#      この行が FR の steps に入ると U12 の検査で ERROR になって止まる。画面規則は VL と項目の備考に書く。
+_SCREEN_RULE_WORDS = ("押せ", "押下でき", "活性", "無効", "disabled")
+
+
+def _is_screen_rule_line(text: str) -> bool:
+    """ボタンの活性・押せる条件の行か。案件の語では決め打ちせず、画面規則の語だけで判定する。"""
+    return any(w in text for w in _SCREEN_RULE_WORDS)
+
+
 def _build_event_steps(ep: dict, ev: dict) -> list:
     """event_processes[ev_code] の details / overview から front_processes[].steps[] を生成（v29 句点分解）。
 
@@ -549,12 +559,13 @@ def _build_event_steps(ep: dict, ev: dict) -> list:
     details = ep.get("details", []) or []
     if details:
         steps = []
-        for i, d in enumerate(details, 1):
+        for d in details:
             desc = str(d).lstrip("・-*•").strip()
-            if not desc:
+            # WHY: モデルが画面規則を details に書いても、ここで機械的に外す(手順は処理本体だけにする)。step_no は詰め直す。
+            if not desc or _is_screen_rule_line(desc):
                 continue
             steps.append({
-                "step_no": i,
+                "step_no": len(steps) + 1,
                 "kind": _guess_step_kind(desc, react_kinds),
                 "description": desc
             })
@@ -1102,6 +1113,12 @@ def selftest() -> int:
         assert [s["kind"] for s in s3] == ["validation"], s3
         s4 = _build_event_steps({"event_code": "EV05", "overview": "表示対象のチェックを切り替える。", "src": span(270, 280)}, {})
         assert [s["kind"] for s in s4] == ["screen_update"], s4
+        # U12 後続: 押せる・活性・無効の行は手順に入れない(表示の行は残す)。step_no は詰め直す
+        s5 = _build_event_steps({"event_code": "EV08", "details": ["・集計結果が0件のときは CSV 出力ボタンを押せないようにする", "・結果の一覧を表示する", "・出力ボタンは活性にする", "・無効な行は除く"], "src": span(10, 20)}, {})
+        assert [s["description"] for s in s5] == ["結果の一覧を表示する"], s5
+        assert [s["step_no"] for s in s5] == [1], s5
+        s6 = _build_event_steps({"event_code": "EV09", "details": ["・ボタンを押せないようにする", "・取得を始める", "・結果を表示する"], "src": span(10, 20)}, {})
+        assert [s["step_no"] for s in s6] == [1, 2] and [s["description"] for s in s6] == ["取得を始める", "結果を表示する"], s6
     finally:
         _react_behaviors = real
 
