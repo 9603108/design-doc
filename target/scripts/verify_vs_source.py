@@ -196,16 +196,18 @@ def check_items(items, jsx, display_rows=None):
     """S1 の screen_layout.items[] を react 下書きの jsx_elements と突き合わせる(B2。WARN)。
     (1) ラベルを持つ JSX 要素に同じ字面の item_name が無い [画面項目] 欠け / (2) 入力・操作系の item に対の JSX 要素が無い
     [画面項目] ソースに無い項目 / (3) item_type と item_type_hint が違う [種別]。
-    (4) display_rows(定数配列の行名)が item_name に全部ある(無ければ ERROR。WARN の接頭辞を付けない)。行名に括弧書きを足した item_name(「小計（現金計）」)も ERROR。
+    (4) display_rows(定数配列の行名)が item_name に全部ある(無ければ ERROR。WARN の接頭辞を付けない)。既存の行名に括弧書きを足した item_name(「小計（現金計）」)は ERROR。行名そのもの・jsx の label と字面が一致する項目名は通す。
     表示専用の要素(Label・Grid・Link。label は空)は (1)〜(3) の対象外。jsx が None なら (4) だけ見る。
     呼出元: main(最終)・verify_partials.check_unit_extras(S1 の単位)。"""
     by_name = {i.get("item_name"): i for i in items if isinstance(i, dict)}
     labels = list(dict.fromkeys(lb for r in display_rows or [] for lb in _row_labels(r)))
     lack = [lb for lb in labels if lb not in by_name]
-    # WHY: 行名に括弧書きを足した項目名(「小計（現金計）」)は行名と字面が違うので、表示行の名前が1つに決まらない。行名どおりに書かせる
+    # WHY: 行名そのもの(括弧付きの行名も含む)や react の jsx の label と一字一句同じ項目名は、括弧書きの足し方ではないので通す
+    known = set(labels) | {j["label"] for j in jsx or [] if isinstance(j, dict) and j.get("label")}
+    # WHY: 既存の行名に括弧書きを足した項目名(「小計（現金計）」)は行名と字面が違うので、表示行の名前が1つに決まらない。行名どおりに書かせる
     split = [f"[画面項目] screen_layout.items[{name}]: 表示行の行名「{lb}」に括弧書きを足した名前 → 行名どおり「{lb}」と書く(差し戻し先 S1)"
-             for name in by_name if isinstance(name, str) for lb in labels
-             if name != lb and name.startswith(lb) and name[len(lb):len(lb) + 1] in ("（", "(")]
+             for name in by_name if isinstance(name, str) and name not in known for lb in labels
+             if name.startswith(lb) and name[len(lb):len(lb) + 1] in ("（", "(")]
     disp = ([f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1"]
             if lack else []) + split
     if jsx is None:
@@ -959,6 +961,14 @@ def selftest():
     assert len(got) == 1 and "差し戻し先 S2" in got[0] and "backend_processes" in got[0], got
     # B15 f: 行名に括弧書きを足した項目名は ERROR。表示専用の行名の欠けも ERROR(接頭辞の WARN は付けない)
     got = check_items([{"item_name": "小計（現金計）"}, {"item_name": "小計"}], [], [{"specs": [{"label": "小計"}]}])
+    assert len(got) == 1 and "括弧書き" in got[0] and not got[0].startswith("[WARN]"), got
+    # 正例: 行名そのものが括弧付き(display_rows の labels・specs[].label と一字一句同じ)は通す
+    assert check_items([{"item_name": "小計（税込売上金額）"}], None, [{"labels": ["小計（税込売上金額）"]}]) == []
+    assert check_items([{"item_name": "小計（値引後 税抜売上金額）"}], None, [{"specs": [{"label": "小計（値引後 税抜売上金額）"}]}]) == []
+    # 正例: jsx の文字列リテラルと一字一句同じ項目名は通す(行名 小計 に対して括弧付きの jsx の label)
+    assert check_items([{"item_name": "小計"}, {"item_name": "小計（現金計）"}], [{"tag": "Label", "label": "小計（現金計）", "item_type_hint": "Label"}], [{"specs": [{"label": "小計"}]}]) == []
+    # 負例: 既存の行名「小計」に括弧を足し、jsx にも同じ字面が無いものは ERROR のまま
+    got = check_items([{"item_name": "小計"}, {"item_name": "小計（現金計）"}], None, [{"specs": [{"label": "小計"}]}])
     assert len(got) == 1 and "括弧書き" in got[0] and not got[0].startswith("[WARN]"), got
     got = check_items([], None, [{"specs": [{"label": "返品"}]}])
     assert len(got) == 1 and "返品" in got[0] and not got[0].startswith("[WARN]"), got
