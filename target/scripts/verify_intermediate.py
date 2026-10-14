@@ -470,13 +470,24 @@ def check_screen_terminology(merged: dict) -> list:
     return issues
 
 
-def check_item_name_duplication(merged: dict) -> list:
+def check_item_name_duplication(merged: dict, drafts: list = None) -> list:
     """A8 新設（2026-07-18）: 同一エリア内での item_name 重複を検出する。
     意味合い: 業務担当者が §4.3 画面項目一覧を読む際、同一エリア内に同名項目が複数あると
               どちらの項目を指しているか区別できず可読性が落ちる（14_チェックリスト.md「孤立処理・記述精度チェック」対応）。
+    W2(2026-10-14 run12): drafts（react 下書き）の display_rows が同名の行を描く数以下なら WARN にしない（小計・合計など、描く行の反復）。
+    接続情報: 入力 = merged['screen_layout']['items'] / drafts（_load_react_drafts() の結果。無ければ従来どおり全件 WARN）/ 呼出元 = main()
     """
     issues = []
     items = (merged.get("screen_layout", {}) or {}).get("items", []) or []
+    # WHY(W2): 下書きの display_rows[].specs[].label を全行で数える。同名の項目が画面項目で複数あっても、
+    #      描く行が同じ名前を同数出すなら、画面の反復として正しく、重複の WARN は誤検出になるため
+    draft_counts = {}
+    for d in drafts or []:
+        for row in (d.get("display_rows") or []):
+            for sp in (row.get("specs") or []):
+                lb = str(sp.get("label") or "").strip() if isinstance(sp, dict) else ""
+                if lb:
+                    draft_counts[lb] = draft_counts.get(lb, 0) + 1
     by_area = {}
     for it in items:
         name = it.get("item_name")
@@ -486,7 +497,8 @@ def check_item_name_duplication(merged: dict) -> list:
         by_area.setdefault(area, {}).setdefault(name, []).append(it.get("no"))
     for area, name_map in by_area.items():
         for name, nos in name_map.items():
-            if len(nos) > 1:
+            # WHY(W2): 画面項目の同名の数が、下書きの同名の行の数を上回るときだけ WARN にする（下書きが無いときは draft_counts が空で従来どおり）
+            if len(nos) > 1 and len(nos) > draft_counts.get(str(name).strip(), 0):
                 issues.append(("WARN", f"screen_layout.items[] area_ref={area} 内で item_name='{name}' が重複（no={nos}）"))
     return issues
 
@@ -1589,9 +1601,9 @@ def check_initialization_eval(merged: dict, sc: dict, drafts: list = None) -> li
         no = ini.get("no") or "?"
         where = f"出典 {path.name}:{ls}-{le}"
         if dis is not None and str(ini.get("active") or "") != ("非活性" if dis else "活性"):
-            issues.append(("ERROR", f"initialization.items[{no}]({name}): 活性の記載「{ini.get('active')}」が表示条件の評価（{'非活性' if dis else '活性'}）と違う。{where} の disabled に合わせる"))
+            issues.append(("ERROR", f"initialization.items[{no}]({name}): 活性の記載「{ini.get('active')}」が表示条件の評価（{'非活性' if dis else '活性'}）と違う。{where} の disabled に合わせる → 差し戻し先 S1（項目の出典 src を、その項目を描く JSX の行範囲に直す）"))
         if vis is not None and str(ini.get("visible") or "") != ("表示" if vis else "非表示"):
-            issues.append(("ERROR", f"initialization.items[{no}]({name}): 表示の記載「{ini.get('visible')}」が表示条件の評価（{'表示' if vis else '非表示'}）と違う。{where} の表示条件に合わせる"))
+            issues.append(("ERROR", f"initialization.items[{no}]({name}): 表示の記載「{ini.get('visible')}」が表示条件の評価（{'表示' if vis else '非表示'}）と違う。{where} の表示条件に合わせる → 差し戻し先 S1（項目の出典 src を、その項目を描く JSX の行範囲に直す）"))
     for f in missing:
         issues.append(("INFO", f"initialization.items の表示条件を検査できない（TSX が読めない）: {f}"))
     return issues
@@ -1919,6 +1931,35 @@ def _selftest() -> int:
     if len([1 for lvl, _ in check_initialization_dup({"initialization": {"items": nest_in}, "screen_layout": {"items": out_sl}}) if lvl == "ERROR"]) != 1:
         print("[selftest NG] 出典の範囲の外の文言まで取った重複を ERROR にしない")
         return 1
+    # W2(2026-10-14 run12): 活性・表示の不一致の ERROR は差し戻し先 S1 を文末に持ち、run_units.parse_sendbacks で S1 に入る。
+    # 下書きの display_rows で同名の行が画面項目の数以上にあれば、同名の項目は WARN にしない（小計・合計の反復）
+    from run_units import parse_sendbacks
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx_w2 = Path(tmp) / "w2.tsx"
+        tsx_w2.write_text("export default function P() {\n  return (\n    <div>\n"
+                          "      {loading && <p>読込中</p>}\n"
+                          "      <button disabled={loading}>保存</button>\n"
+                          "    </div>\n  );\n}\n", encoding="utf-8")
+        drafts_w2 = [{"state_initials": [{"state": "loading", "kind": "literal", "initial": "true"}]}]
+        mis_w2 = {"screen_layout": {"items": [
+            {"item_name": "保存", "src": [{"file": str(tsx_w2), "line_start": 5, "line_end": 5}]}]},
+            "initialization": {"items": [{"no": 2, "item_name": "保存", "active": "活性", "visible": "表示"}]}}
+        mis_errs = [m for lvl, m in check_initialization_eval(mis_w2, {}, drafts_w2) if lvl == "ERROR"]
+        if not (len(mis_errs) == 1 and "→ 差し戻し先 S1" in mis_errs[0] and parse_sendbacks(mis_errs[0]) == {"S1": [mis_errs[0]]}):
+            print(f"[selftest NG] 活性の不一致の ERROR に差し戻し先 S1 が付かない: {mis_errs}")
+            return 1
+    dup3 = {"screen_layout": {"items": [{"no": i + 1, "item_name": "小計", "area_ref": "AR1"} for i in range(3)]}}
+    dup4 = {"screen_layout": {"items": [{"no": i + 1, "item_name": "小計", "area_ref": "AR1"} for i in range(4)]}}
+    w2_drafts = [{"display_rows": [{"specs": [{"label": "小計"}, {"label": "小計"}]}, {"specs": [{"label": "小計"}]}]}]
+    if check_item_name_duplication(dup3, w2_drafts):
+        print("[selftest NG] 下書きの同名の行の数までの画面項目の同名を WARN にした")
+        return 1
+    if len(check_item_name_duplication(dup4, w2_drafts)) != 1:
+        print("[selftest NG] 下書きの同名の行の数を上回る画面項目の同名を WARN にしない")
+        return 1
+    if len(check_item_name_duplication(dup3)) != 1:
+        print("[selftest NG] 下書きが無いときに同名の WARN を出さない")
+        return 1
     print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)・出典の無い項目・初期値の重複")
     return 0
 
@@ -2001,7 +2042,8 @@ def main():
     #           への検証側対応。description_details[] 配列があれば OK 判定 (詳細は配列で 1 要素 1 文)。
     all_issues.extend(check_description_granularity(merged, verify_overrides))
     # A8（2026-07-18）: 同一エリア内 item_name 重複 / overview 文言使い回し検出（可読性の底上げ）
-    all_issues.extend(check_item_name_duplication(merged))
+    # W2(2026-10-14): 下書きの描く行の数を渡し、同名の反復を重複として止めない
+    all_issues.extend(check_item_name_duplication(merged, _load_react_drafts()))
     all_issues.extend(check_overview_duplication(merged))
 
     # 2026-10-12: 論理・物理テーブル名の仮表記 / 1.1・1.2 のファイル説明・種別 / messages.code の ID 形式
