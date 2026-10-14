@@ -191,8 +191,25 @@ def _expr_fact(expr):
     return t, null
 
 
+def _merge_facts(facts):
+    """同じ別名の式の事実を1つに合わせる。型は1通りに決まるときだけ決め、null 可は1つでも NULL を返す式があれば可。
+    WHY: 集計単位で式が変わる列(店舗別だけ NULL::varchar、レジ別は p.reji_no)は、選び方によって NULL になり得る1列。
+         どれか1つでも NULL なら null 可、全部が非 null と分かったときだけ非 null。型が食い違うときは決めない。"""
+    ts = {t for t, _ in facts if t}
+    if len(ts) > 1:
+        return None
+    ns = [n for _, n in facts]
+    if True in ns:
+        null = True
+    elif all(n is False for n in ns):
+        null = False
+    else:
+        null = None
+    return (ts.pop() if ts else None), null
+
+
 def _column_facts(bd):
-    """backend 下書きの列ごとの事実 {別名: (SQL の型名, null 可)}。同じ別名が2通り以上の事実を持つとき(SQL ごとに型が違う)は決めない。"""
+    """backend 下書きの列ごとの事実 {別名: (SQL の型名, null 可)}。同じ別名の複数の式は _merge_facts で1つに合わせる(型が違うときは決めない)。"""
     per = {}
     for o in bd.get("db_operations") or []:
         if not isinstance(o, dict):
@@ -200,15 +217,20 @@ def _column_facts(bd):
         for c in o.get("columns") or []:
             if isinstance(c, dict) and c.get("alias"):
                 per.setdefault(c["alias"], set()).add(_expr_fact(c.get("expression")))
+    # WHY: 下書きの aliases(SELECT の式の一覧)も事実。画面の集計単位で式が変わる列(NULL::varchar の行)はここにしか無いことがある
+    for c in bd.get("aliases") or []:
+        if isinstance(c, dict) and c.get("alias"):
+            per.setdefault(c["alias"], set()).add(_expr_fact(c.get("expression")))
     ddl = {}
     for f in bd.get("response_fields") or []:
         if isinstance(f, dict) and f.get("index_signature") and f.get("path"):
             ddl[_leaf(f["path"])] = (f.get("db_type"), f.get("db_nullable"))
     out = {}
     for alias, facts in per.items():
-        if len(facts) != 1:
+        m = _merge_facts(list(facts))
+        if m is None:
             continue
-        t, null = facts.pop()
+        t, null = m
         dt, dn = ddl.get(alias, (None, None))
         # fallback-ok: 式から型・null 可が読めない欄だけ、index signature の行の DDL の型で補う(式の事実を優先する)
         t = t or dt
@@ -312,7 +334,10 @@ def _selftest():
             {"alias": "nm", "expression": "COALESCE(s.name, '(不明)')"},
             {"alias": "ds", "expression": "array_remove(array_agg(p.d ORDER BY p.d), NULL)"},
             {"alias": "bare", "expression": "p.bare"},
-            {"alias": "nn", "expression": "NULL::text"}]}],
+            {"alias": "nn", "expression": "NULL::text"}]},
+          # WHY: 同じ別名が店舗別(NULL::varchar)とレジ別(p.rj)で式が違う列は、1つでも NULL なら null 可・型は1通りに決まる
+          {"columns": [{"alias": "rj", "expression": "p.rj"}]}],
+          "aliases": [{"alias": "rj", "expression": "NULL::varchar", "when": "group = shop"}],
           "response_fields": [{"path": "rows[].bare", "index_signature": True, "db_type": "date", "db_nullable": False}]}
     fa = {"action": "a", "response_items": [
         {"key": "rows[].sou", "data_type": "number | string | string[]", "nullable": True},
@@ -322,14 +347,16 @@ def _selftest():
         {"key": "rows[].bare", "data_type": "string", "nullable": True},
         {"key": "rows[].nn", "data_type": "string", "nullable": False},
         {"key": "rows[].miss", "data_type": "number | string", "nullable": True},
+        {"key": "rows[].rj", "data_type": "number | string", "nullable": False},
         {"key": "total", "data_type": "number | string", "nullable": True}]}
     tlog = []
     _fill_types(fa, bd, tlog)
     got = {x["key"]: (x["data_type"], x["nullable"]) for x in fa["response_items"]}
     assert got == {"rows[].sou": ("number", False), "rows[].n": ("number", False), "rows[].nm": ("string", False),
                    "rows[].ds": ("string[]", False), "rows[].bare": ("date(YYYY-MM-DD)", False),
-                   "rows[].nn": ("string", True), "rows[].miss": ("number | string", True), "total": ("number | string", True)}, got
-    assert len(tlog) == 5, tlog
+                   "rows[].nn": ("string", True), "rows[].rj": ("string", True),
+                   "rows[].miss": ("number | string", True), "total": ("number | string", True)}, got
+    assert len(tlog) == 6, tlog
 
     # fill 全体: 一時の下書きを読み、表示名・出典・nth が入る。INTERMEDIATE_DIR は必ず戻す
     import json as _json

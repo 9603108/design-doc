@@ -130,7 +130,18 @@ def _translate_row(row, pt2lt, lt2pt, col):
         row["logical_column"] = col[(pt, lc)]
 
 
-def _translate_condition(cond, aliases, pt2lt, col):
+_EQ_JOIN = re.compile(r"^\s*([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*$")
+
+
+def _side(aliases, pt2lt, col, q, c):
+    """別名.列 の片側を (物理表, 論理列) にする。表か列が決まらないときは (None, None)。"""
+    pt = aliases.get(q)
+    if not pt or pt not in pt2lt:
+        return None, None
+    return pt, col.get((pt, c))
+
+
+def _translate_condition(cond, aliases, pt2lt, col, log=None):
     """joins の「別名.列」を、下書きの table_aliases で表へ解決し「論理表.論理列」に作り直す。
     WHY: 解決できない側は元の字面のまま残す(推測しない)。"""
     def rep(m):
@@ -142,7 +153,23 @@ def _translate_condition(cond, aliases, pt2lt, col):
         if not lc:
             return m.group(0)
         return _sfx(pt2lt[pt]) + "." + lc
-    return _QUAL.sub(rep, cond or "")  # fallback-ok: 条件が無い joins は対象外
+    text = _QUAL.sub(rep, cond or "")  # fallback-ok: 条件が無い joins は対象外
+    # WHY: 等結合 a.x = b.y で片側だけ論理列が決まるときは、同じ鍵を指すので、もう片側の表にも同じ論理名を付ける。
+    #      残すと別名(s.id)が結合条件に残り、検査の[結合]で止まる。両側とも決まらないときは字面のまま残す。
+    m = _EQ_JOIN.match(cond or "")  # fallback-ok: 等結合の形でない条件は片側推定しない
+    if not m:
+        return text
+    p1, l1 = _side(aliases, pt2lt, col, m.group(1), m.group(2))
+    p2, l2 = _side(aliases, pt2lt, col, m.group(3), m.group(4))
+    if l1 is None and l2 and p1 in pt2lt:
+        lc = l2
+    elif l2 is None and l1 and p2 in pt2lt:
+        lc = l1
+    else:
+        return text
+    if log is not None:
+        log.append(f"INFO _compose_db_facts: 結合条件の {m.group(1)}.{m.group(2)} の論理列を等結合の相手の「{lc}」で補う")
+    return f"{_sfx(pt2lt[p1])}.{lc} = {_sfx(pt2lt[p2])}.{lc}"
 
 
 def _fill_agg(op, dop):
@@ -281,7 +308,7 @@ def _compose_db(out, drafts, log):
         for row in op.get("joins") or []:  # fallback-ok: joins は任意
             _translate_row(row, pt2lt, lt2pt, col)
             if row.get("condition"):  # fallback-ok: 条件の無い joins は対象外
-                row["condition"] = _translate_condition(row["condition"], aliases, pt2lt, col)
+                row["condition"] = _translate_condition(row["condition"], aliases, pt2lt, col, log)
     _rename_logical_names(out, drafts, log)         # c0) 論理名を事実の出所の名前へ寄せる(下の(推定)の前)
     for r in lns:                                   # c) 論理表名の「(推定)」
         if r.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
@@ -379,7 +406,13 @@ def selftest():
     assert op["group_by"][0]["logical_column"] == "店舗ID", op["group_by"][0]
     assert op["order_by"][0]["logical_column"] == "会計日", op["order_by"][0]
     assert op["joins"][0]["logical_table"] == "店舗マスタ(推定)", op["joins"][0]
-    assert op["joins"][0]["condition"] == "s.id = POS会計(推定).店舗ID", op["joins"][0]["condition"]
+    # WHY: 店舗マスタ側の列(shops.id)は論理名が無い。等結合の相手(店番号)の論理名を借りる。別名 s. は残さない
+    assert op["joins"][0]["condition"] == "店舗マスタ(推定).店舗ID = POS会計(推定).店舗ID", op["joins"][0]["condition"]
+    # 等結合の片側だけ決まる → 相手の論理名。両側とも決まらない・表が不明 → 字面のまま。等結合でない → 片側推定しない
+    tl, ptl, cl = {"p": "pos", "s": "shops"}, {"pos": "POS会計", "shops": "店舗マスタ"}, {("pos", "mise_no"): "店番号"}
+    assert _translate_condition("s.id = p.mise_no", tl, ptl, cl) == "店舗マスタ(推定).店番号 = POS会計(推定).店番号"
+    assert _translate_condition("s.id = x.mise_no", tl, ptl, cl) == "s.id = x.mise_no"
+    assert _translate_condition("s.id > p.mise_no", tl, ptl, cl) == "s.id > POS会計(推定).店番号"
     assert op["aggregate"][0]["alias"] == "warn_dates" and op["aggregate"][1]["alias"] == "days"
     assert all(r["logical_table"].endswith("(推定)") for r in ln), ln
     # 2回目を流しても結果が変わらない(冪等)
