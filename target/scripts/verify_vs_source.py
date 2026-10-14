@@ -5,7 +5,7 @@ verify_vs_source.py — 中間 JSON の記述を、ソースの実物と機械�
 
 【目的】
 LLM が書いた文言・例示値が、ソース(Python / TSX)の文字列に実在するかを照合し、作り話を止める。
-今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)・B3(応答項目の型と null 可。null 可の違いは ERROR)・F2(境界値と DB 例外。WARN)・F3(初期取得の順。WARN)。F の照合は同じファイルへ足す(改良案 0.2)。
+今あるのは B4(メッセージ文言)・D1 後半(S1 の example)・B1(式)・B2(画面項目)・B5(処理の種別。ERROR で終了コード 1)・B3(応答項目の型と null 可。null 可の違いは ERROR)・F2(境界値と DB 例外。WARN)・F3(初期取得の順。WARN)・B1 の事実(実列と別名・CTE・副問合せ・集計の単位・例外の code。ERROR、集計の単位だけ WARN)。F の照合は同じファイルへ足す(改良案 0.2)。
 
 【意味合い】
 - 戻りは verify_partials と同じ「[種別] 場所: 内容 → 差し戻し先 <単位>」。先頭に [WARN] を付けた行は終了コードに影響しない。
@@ -341,7 +341,215 @@ def check_boundaries(validations, api_spec, apis, common_errors):
     return problems
 
 
+def _sq(s):
+    """SQL の式の字面を比べる形にする(小文字・::型・表の接頭辞・空白を除く)。呼出元: check_backend_facts。"""
+    s = re.sub(r"::\w+", "", str(s or "").lower())
+    return re.sub(r"\s+", "", re.sub(r"\b[a-z_]\w*\.(?=[a-z_*])", "", s))
+
+
+def _sq_head(s):
+    """_sq の形から FILTER (…) 以降を落とす。FILTER の条件は定数名で書かれる(_WARN_COND 等)ことがあり、字面で比べられないため。"""
+    return re.sub(r"filter\(.*", "", _sq(s))
+
+
+def _code_for_status(status, common_errors):
+    """status を返す共通エラー(例外処理)の code の既定値。1つに決まらなければ None。status が式(getattr(…) or 400)のものは式の中の数字で当てる。"""
+    s = str(status)
+    codes = {e["code_default"] for c in common_errors or [] for e in c.get("errors") or []
+             if e.get("code_default") and (str(e.get("status_code")) == s or (not isinstance(e.get("status_code"), int) and re.search(rf"\b{re.escape(s)}\b", str(e.get("status_code")))))}
+    return next(iter(codes)) if len(codes) == 1 else None
+
+
+def check_backend_facts(data, apis, common_errors):
+    """設計書(data)を backend 下書きの事実(apis[action].db_operations の columns・ctes・subqueries・aggregate_units と common_errors)と突き合わせる(ERROR)。
+    [別名]: 物理列として書いた名前が SQL の別名(実列に無い) / 集計の別名が null なのにソースは AS を持つ。差し戻し先 H2
+    [式]: api_spec の response_items[].expression が実 SQL の式と食い違う。差し戻し先 S2
+    [CTE]: ソースに CTE が無いのに CTE と書く / 定義が空の CTE を参照 / 絞り込みのある CTE を空・条件なしと書く / 本体の集計と書いた別名が CTE の集計。差し戻し先 S2・H2
+    [副問合せ]: 別名の無い集計が副問合せの中の集計なのに本体の集計(aggregate)として書いてある。差し戻し先 H2
+    [集計単位]: count の説明の「日数」が、数える単位(GROUP BY)に日付の列が無い・日付以外の列も含むのと合わない(WARN)。差し戻し先 S2
+    [エラーcode]: messages・messages_backend の code が、その文言を返す例外処理の code(code_default)と違う / api_spec の error_patterns の ID 風の code がソースに無い。差し戻し先 H4・S2
+    呼出元: main(下書きがあるとき)。apis が空なら何も言わない。差し戻し先は units.json の owns に合わせた(dataset・aggregate は H2、expression・説明は S2、messages_backend は H4)。"""
+    ops = {act: a.get("db_operations") or [] for act, a in (apis or {}).items()}
+    problems, alias_only, real = [], {}, set()
+    for olist in ops.values():
+        for op in olist:
+            for c in op.get("columns") or []:
+                if c.get("kind") == "alias_only" and c.get("alias_name"):
+                    alias_only.setdefault(c["alias_name"], c.get("alias_expression") or c.get("expression"))
+                real.update(s.rsplit(".", 1)[-1] for s in [c.get("real_column")] + list(c.get("source_columns") or []) if s)
+    # (1) 物理列として書かれた名前が、実列に無く別名だけにある
+    rows = [("logical_names", r) for r in data.get("logical_names") or []] + \
+           [(f"db_operations[{op.get('id')}].dataset", r) for op in data.get("db_operations") or [] for r in op.get("dataset") or []]
+    seen = set()
+    for where, r in rows:
+        n = r.get("physical_column") if isinstance(r, dict) else None
+        if n in alias_only and n not in real and (where, n) not in seen:
+            seen.add((where, n))
+            problems.append(f"[別名] {where}: physical_column「{n}」は SQL の別名(式 {alias_only[n]})で実列ではない → 差し戻し先 H2")
+    texts = {}  # action → [(場所, 文, 差し戻し先)]。CTE・集計単位の記述を見る
+    for op in data.get("db_operations") or []:
+        act = (op.get("api_endpoint") or {}).get("action")
+        texts.setdefault(act, []).extend((f"db_operations[{op.get('id')}].{k}", op.get(k), "S2") for k in ("remarks", "dataset_name") if op.get(k))
+    for a in data.get("api_spec") or []:
+        t = texts.setdefault(a.get("action"), [])
+        t.append((f"api_spec[{a.get('action')}].description", a.get("description"), "S2"))
+        t.extend((f"api_spec[{a.get('action')}].response_items[{r.get('key')}].{k}", r.get(k), "S2") for r in a.get("response_items") or [] for k in ("description", "transform_backend") if r.get(k))
+    # (2) 集計: 別名 null・副問合せの集計・CTE の集計
+    for op in data.get("db_operations") or []:
+        dops = ops.get((op.get("api_endpoint") or {}).get("action")) or []
+        units = [u for d in dops for u in d.get("aggregate_units") or []]
+        subs = [_sq(s.get("definition")) for d in dops for s in d.get("subqueries") or []]
+        doc_alias = {a.get("alias") for a in op.get("aggregate") or [] if a.get("alias")}
+        for a in op.get("aggregate") or []:
+            fn, where = str(a.get("function")).lower(), f"db_operations[{op.get('id')}].aggregate[{a.get('alias') or a.get('function')}]"
+            if not a.get("alias"):
+                if any(_sq(f"{fn}({a.get('target')})") in s for s in subs):
+                    problems.append(f"[副問合せ] {where}: {fn}({a.get('target')}) は副問合せの中の集計で、本体の集計(aggregate)ではない → 差し戻し先 H2")
+                    continue
+                miss = [u for u in units if str(u.get("func")).lower() == fn and u.get("alias") and u["alias"] not in doc_alias]
+                exact = [u for u in miss if _sq(u.get("arg")) == _sq(a.get("target"))]
+                if exact or len(miss) == 1:
+                    problems.append(f"[別名] {where}: alias が null だがソースは {(exact or miss)[0]['alias']} という別名を付けている → 差し戻し先 H2")
+            elif (a.get("scope") or "main") == "main":
+                same = [u for u in units if u.get("alias") == a["alias"] and str(u.get("func")).lower() == fn]
+                if same and all(u.get("scope") != "main" for u in same):
+                    problems.append(f"[CTE] {where}: 別名 {a['alias']} の集計は {same[0].get('scope')} の中にあり、本体の集計ではない → 差し戻し先 H2")
+    # (2) 式: response_items[].expression が実 SQL の式と同じか(FILTER の中の条件は定数名のことがあるので見ない)
+    for a in data.get("api_spec") or []:
+        cols = {c.get("alias"): c for d in ops.get(a.get("action")) or [] for c in d.get("columns") or [] if c.get("is_expression")}
+        for r in a.get("response_items") or []:
+            c = cols.get(str(r.get("key")).rsplit(".", 1)[-1])
+            if c and r.get("expression"):
+                x, y = _sq_head(r["expression"]), _sq_head(c["expression"])
+                fx, fy = set(re.findall(r"[a-z_]+(?=\()", x)), set(re.findall(r"[a-z_]+(?=\()", y))
+                # 関数の名前が全部実 SQL にあれば、引数の細部(CASE の展開・外側の array_remove 等)は字面で比べない
+                if x != y and x not in y and y not in x and not (fx and fx <= fy):
+                    problems.append(f"[式] api_spec[{a.get('action')}].response_items[{r['key']}].expression: 「{r['expression']}」が実 SQL の式「{c['expression']}」と違う → 差し戻し先 S2")
+    # (2) CTE の記述
+    for act, dops in ops.items():
+        ctes = [c for d in dops for c in d.get("ctes") or []]
+        for where, t, unit in texts.get(act, []):
+            t = str(t)
+            if not ctes and re.search(r"CTE|共通表式", t):
+                problems.append(f"[CTE] {where}: CTE と書いてあるがソースの SQL に WITH(CTE)が無い → 差し戻し先 {unit}")
+            for c in ctes:
+                m = re.search(rf"(?:CTE|共通表式)[「『(（\s]*{re.escape(c['name'])}\b|\b{re.escape(c['name'])}\b[」』)）\s]*(?:という|の)?\s*(?:CTE|共通表式)", t)
+                if not m:
+                    continue
+                sent = next((s for s in t.split("。") if m.group(0) in s), t)
+                if not str(c.get("definition")).strip():
+                    problems.append(f"[CTE] {where}: CTE {c['name']} はソースで定義が空なのに参照している → 差し戻し先 {unit}")
+                elif c.get("filtered") and re.search(r"空|絞り込み(?:は)?(?:無|な)し|条件(?:は)?(?:無|な)し|全件", sent):
+                    problems.append(f"[CTE] {where}: CTE {c['name']} はソースで WHERE により絞り込むのに「{sent}」と書いている → 差し戻し先 {unit}")
+    # (3) count の説明と数える単位(同じ別名の単位が複数の DB 操作にあるときは1件にまとめる)
+    unit_seen = set()
+    for a in data.get("api_spec") or []:
+        for r in a.get("response_items") or []:
+            leaf = str(r.get("key")).rsplit(".", 1)[-1]
+            for d in ops.get(a.get("action")) or []:
+                for u in d.get("aggregate_units") or []:
+                    text = " ".join(str(r.get(k) or "") for k in ("display_name", "description", "transform_backend"))
+                    if u.get("alias") == leaf and str(u.get("func")).lower() == "count" and u.get("scope") == "main" and re.search(r"日数|日の数", text) and (a.get("action"), r["key"]) not in unit_seen:
+                        # 行数が日数になるのは、数える単位が日付の列だけのとき。日付が無い・日付以外(店舗・レジなど)も含むときは WARN(両方向を捕まえる)
+                        gb = u.get("group_by") or []
+                        dates = [g for g in gb if re.search(r"date|_dt|day|日", g, re.IGNORECASE)]
+                        others = [g for g in gb if g not in dates]
+                        if dates and not others:
+                            continue
+                        unit_seen.add((a.get("action"), r["key"]))
+                        why = "日付の列が無い" if not dates else f"日付の列以外({'・'.join(others)})も数える単位に含まれ、行数が日数と合わない"
+                        problems.append(f"[WARN] [集計単位] api_spec[{a.get('action')}].response_items[{r['key']}]: 「日数」と書くが count の単位は {u.get('unit')} で{why} → 差し戻し先 S2")
+    # (4) エラー code
+    errs = {e["id"]: e for a in (apis or {}).values() for e in a.get("error_patterns") or [] if e.get("id")}
+    known = {e.get("code_default") for c in common_errors or [] for e in c.get("errors") or [] if e.get("code_default")}
+    # messages・messages_backend のどちらも、code 欄を持つ文言だけを見る(code が無い文言は照合しない。message_id は MSE 番号のままで正しい)
+    for key in ("messages", "messages_backend"):
+        for m in data.get(key) or []:
+            if not isinstance(m, dict) or "code" not in m:
+                continue
+            e = errs.get(m.get("message_id"))
+            want = _code_for_status(e.get("status_code"), common_errors) if e else None
+            if want and m.get("code") != want:
+                problems.append(f"[エラーcode] {key}[{m.get('message_id')}].code: 「{m.get('code')}」だがソースの例外処理は status {e['status_code']} に code={want} を返す → 差し戻し先 H4")
+    for a in data.get("api_spec") or []:
+        for ep in a.get("error_patterns") or []:
+            codes = re.findall(r"code\s*[=＝]\s*([A-Za-z_]\w*)", str(ep.get("condition"))) + ([str(ep["code"])] if ep.get("code") else [])
+            problems += [f"[エラーcode] api_spec[{a.get('action')}].error_patterns: code「{c}」はソースの例外処理の code({'・'.join(sorted(known))})に無い → 差し戻し先 S2"
+                         for c in codes if known and c not in known and re.fullmatch(r"[A-Za-z]{2,4}\d{3,}", c)]
+    return problems
+
+
 def selftest():
+    # 事実(別名・集計・CTE・副問合せ・例外の code)の照合
+    col = lambda al, kind, real_c="", src=(), expr="x": {"alias": al, "alias_name": al, "kind": kind, "real_column": real_c, "source_columns": list(src),
+                                                         "expression": expr, "is_expression": kind == "alias_only"}
+    dop = {"id": "db_op_a", "columns": [col("shop_id", "column", "t.mise_no", ["t.mise_no"]), col("days", "alias_only", expr="count(*)"),
+                                         col("first_date", "alias_only", "", ["t.kai_date"], "min(t.kai_date)"), col("amount", "alias_only", "", ["t.amount"], "SUM(t.amount)")],
+           "ctes": [{"name": "d", "definition": "SELECT * FROM t WHERE x = 1", "from": "t", "filtered": True}, {"name": "e", "definition": "", "from": "", "filtered": False}],
+           "subqueries": [{"location": "WHERE", "definition": "SELECT max(kai_date) FROM t", "filtered": False}],
+           "aggregate_units": [{"func": "count", "arg": "*", "alias": "days", "scope": "main", "group_by": ["t.mise_no"], "unit": "t.mise_no"},
+                               {"func": "min", "arg": "t.kai_date", "alias": "first_date", "scope": "main", "group_by": ["t.mise_no"], "unit": "t.mise_no"},
+                               {"func": "sum", "arg": "t.n", "alias": "tot", "scope": "cte d", "group_by": ["t.kai_date"], "unit": "t.kai_date"}]}
+    bapis = {"act": {"db_operations": [dop], "error_patterns": [{"id": "MSE00001", "status_code": 400}]}}
+    ces = [{"exception": "VE", "errors": [{"code_default": "validation_error", "status_code": "getattr(e, 'status', 400) or 400"}]},
+           {"exception": "Exception", "errors": [{"code_default": "internal_error", "status_code": 500}]}]
+    good = {"logical_names": [{"physical_column": "mise_no"}, {"physical_column": "amount"}],
+            "db_operations": [{"id": "DB1", "api_endpoint": {"action": "act"}, "dataset": [{"no": 1, "physical_column": "kai_date"}],
+                               "aggregate": [{"function": "min", "target": "t.kai_date", "alias": "first_date", "scope": "main"}], "remarks": "期間で絞る"}],
+            "api_spec": [{"action": "act", "description": "d", "response_items": [{"key": "rows[].first_date", "expression": "min(kai_date)", "description": "最初"},
+                                                                                   {"key": "rows[].days", "expression": "count(*)", "description": "店舗の行数"}],
+                          "error_patterns": [{"condition": "不正 (code=validation_error)"}]}],
+            "messages_backend": [{"message_id": "MSE00001", "code": "validation_error"}]}
+    assert check_backend_facts(good, bapis, ces) == [], check_backend_facts(good, bapis, ces)
+    assert check_backend_facts({}, None, None) == []
+    # 別名を物理列にした(days は式の別名で実列に無い。amount は実列でもあるので許す)→ ERROR
+    bad = json.loads(json.dumps(good))
+    bad["logical_names"].append({"physical_column": "days"})
+    bad["db_operations"][0]["dataset"].append({"no": 2, "physical_column": "first_date"})
+    got = check_backend_facts(bad, bapis, ces)
+    assert [g.split(" ")[0] for g in got] == ["[別名]"] * 2 and "days" in got[0] and "first_date" in got[1] and all("差し戻し先 H2" in g for g in got), got
+    # 集計の別名が null / 副問合せの集計を本体として書いた / CTE の集計を本体として書いた
+    bad = json.loads(json.dumps(good))
+    bad["db_operations"][0]["aggregate"] = [{"function": "min", "target": "kai_date", "alias": None, "scope": "main"}, {"function": "max", "target": "kai_date", "alias": None, "scope": "main"},
+                                            {"function": "sum", "target": "t.n", "alias": "tot", "scope": "main"}]
+    got = check_backend_facts(bad, bapis, ces)
+    assert [g.split(" ")[0] for g in got] == ["[別名]", "[副問合せ]", "[CTE]"] and "first_date" in got[0], got
+    # 式の食い違い(FILTER の中の定数名は見ない)
+    bad = json.loads(json.dumps(good))
+    bad["api_spec"][0]["response_items"][0]["expression"] = "max(kai_date)"
+    got = check_backend_facts(bad, bapis, ces)
+    assert len(got) == 1 and got[0].startswith("[式]") and "差し戻し先 S2" in got[0], got
+    # CTE: 定義が空の e を参照 / 絞り込みのある d を条件なしと書く / ソースに CTE が無い API
+    bad = json.loads(json.dumps(good))
+    bad["db_operations"][0]["remarks"] = "CTE e を使う。CTE d は条件なしで全件を取る"
+    got = check_backend_facts(bad, bapis, ces)
+    assert [g.split(" ")[0] for g in got] == ["[CTE]"] * 2 and "e" in got[0] and "d" in got[1], got
+    assert check_backend_facts(bad, {"act": {"db_operations": [{"columns": [], "ctes": []}]}}, ces)[0].startswith("[CTE]")
+    # count の単位に日付が無いのに「日数」→ WARN
+    bad = json.loads(json.dumps(good))
+    bad["api_spec"][0]["response_items"][1]["description"] = "期間内の会計日数"
+    got = check_backend_facts(bad, bapis, ces)
+    assert len(got) == 1 and got[0].startswith("[WARN] [集計単位]"), got
+    # 数える単位に日付以外(店舗)も含むのに「日数」→ WARN。日付だけの単位なら WARN にしない
+    bapis2 = json.loads(json.dumps(bapis))
+    bapis2["act"]["db_operations"][0]["aggregate_units"][0]["group_by"] = ["t.mise_no", "t.kai_date"]
+    got = check_backend_facts(bad, bapis2, ces)
+    assert len(got) == 1 and got[0].startswith("[WARN] [集計単位]") and "t.mise_no" in got[0], got
+    bapis2["act"]["db_operations"][0]["aggregate_units"][0]["group_by"] = ["t.kai_date"]
+    assert check_backend_facts(bad, bapis2, ces) == [], check_backend_facts(bad, bapis2, ces)
+    # エラー code: MSE0000x は ERROR(ソースは validation_error)。api_spec の ID 風 code も ERROR
+    bad = json.loads(json.dumps(good))
+    bad["messages_backend"][0]["code"] = "MSE00001"
+    bad["api_spec"][0]["error_patterns"] = [{"condition": "不正 (code=MSE00001)"}]
+    got = check_backend_facts(bad, bapis, ces)
+    assert [g.split(" ")[0] for g in got] == ["[エラーcode]"] * 2 and "validation_error" in got[0] and "差し戻し先 H4" in got[0] and "差し戻し先 S2" in got[1], got
+    # messages(設計側の文言)の code も同じ照合。code 欄が無い文言は見ない
+    bad = json.loads(json.dumps(good))
+    bad["messages"] = [{"message_id": "MSE00001", "code": "MSE00001"}, {"message_id": "MSE00001", "message": "code 欄なし"}]
+    got = check_backend_facts(bad, bapis, ces)
+    assert len(got) == 1 and got[0].startswith("[エラーcode] messages[MSE00001].code") and "差し戻し先 H4" in got[0], got
+    bad["messages"] = [{"message_id": "MSE00001", "code": "validation_error"}]
+    assert check_backend_facts(bad, bapis, ces) == [], check_backend_facts(bad, bapis, ces)
     # F2: 境界値の語が rule に無い・共通エラーの status が api_spec に無いと WARN
     bs = [{"param": "shop_id", "check": "v <= 0", "compare": ["v <= 0"]},
           {"param": "from", "check": "x", "compare": [], "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "impossible_dates_accepted": ["2026-02-30"]},
@@ -467,13 +675,15 @@ def main(argv=None):
         return 0
     problems = check_messages(data, strings) + check_examples((data.get("screen_layout") or {}).get("items") or [], strings)
     cands, jsx, beh, disp_rows = [], [], [], []
-    type_problems, n_sql, plan, bound_problems, n_bound = [], 0, None, [], 0
+    type_problems, n_sql, plan, bound_problems, n_bound, fact_problems = [], 0, None, [], 0, []
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_backend_draft.json")):
         bd = json.loads(p.read_text(encoding="utf-8"))
         apis = bd.get("apis") or {}
         type_problems = check_types(data.get("api_spec"), apis)
         # F2: 境界値と共通エラー(DB 例外)の照合。validations は最終の validations か、断片の validations_frontend
         bound_problems = check_boundaries(data.get("validations") or data.get("validations_frontend"), data.get("api_spec"), apis, bd.get("common_errors"))
+        # B1 の事実(別名・CTE・副問合せ・集計の単位・例外の code)の照合。[WARN] 付きは終了コードに影響しない
+        fact_problems = check_backend_facts(data, apis, bd.get("common_errors"))
         n_bound = sum(len(a.get("boundaries") or []) for a in apis.values())
         n_sql = sum(1 for a in apis.values() for f in a.get("response_fields") or [] if f.get("db_type"))
     for p in sorted(Path(INTERMEDIATE_DIR).glob(f"{feat}_react_draft.json")):
@@ -493,8 +703,12 @@ def main(argv=None):
     problems += calc_problems
     kind_problems = check_kinds(data.get("validations") or data.get("validations_frontend"), data.get("front_processes"), beh)
     fetch_problems = check_fetch_plan(plan, data.get("front_processes"))
-    for p in problems + kind_problems + type_problems + fetch_problems + bound_problems:
+    for p in problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems:
         print(p)
+    fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
+    print(f"[INFO] 下書きの事実(別名・CTE・副問合せ・集計の単位・エラー code)の照合: ERROR {len(fact_errors)} 件・WARN {len(fact_problems) - len(fact_errors)} 件")
+    n_code = sum(1 for k in ("messages", "messages_backend") for m in data.get(k) or [] if isinstance(m, dict) and "code" in m)
+    print(f"[INFO] エラー code の照合: code 欄のある文言 {n_code} 件(messages・messages_backend。0 件なら code の照合は効いていない)")
     print(f"[INFO] 境界値・DB 例外の照合: 下書きの boundaries {n_bound} 件・WARN {len(bound_problems)} 件")
     null_problems = [p for p in type_problems if not p.startswith("[WARN]")]
     print(f"[INFO] 応答項目の型の照合: ERROR {len(null_problems)} 件・WARN {len(type_problems) - len(null_problems)} 件・SQL の型の手掛かりつきの欄 {n_sql} 件")
@@ -503,7 +717,7 @@ def main(argv=None):
     print(f"[INFO] 計算式の照合: ソースの式 {len(cands)} 件・calculations {n} 件・WARN {len(calc_problems)} 件")
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
     print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件(うち下書きの ui_strings {n_ui} 件)に対し WARN {len(problems)} 件")
-    return 1 if kind_problems or null_problems else 0
+    return 1 if kind_problems or null_problems or fact_errors else 0
 
 
 if __name__ == "__main__":
