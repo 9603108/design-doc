@@ -186,7 +186,7 @@ def check_fragments(spec, frags, only=None):
             if generic in COMPOSED:
                 # WHY: 合成が下書きの事実で置き換える欄なので、単位が書いても範囲外・重複の問題にしない(WARN は verify_partials が出す)
                 continue
-            written.setdefault(concrete, []).append(unit)
+            written.setdefault(concrete, set()).add(unit)  # 同じ単位が同名の行を複数書いたものは数えない(別々の単位の重なりだけ [重複])
             if not any(owns(p, generic) for p in mine):
                 who = owner_of(spec, generic)
                 problems.append(f"[範囲外] {unit}: {concrete} は {who or '分担表のどの単位でもない欄'} の担当 → 差し戻し先 {unit}")
@@ -197,7 +197,7 @@ def check_fragments(spec, frags, only=None):
                 problems.append(f"[参照] {unit}: 行 {row} が作り手 {c} の断片に無い(識別子の食い違いか {c} の書き漏れ) → 差し戻し先 {unit} か {c}")
     for concrete, us in written.items():
         if len(us) > 1:
-            problems.append(f"[重複] {concrete}: {', '.join(us)} が同じ欄を書いた → 差し戻し先 担当外の側")
+            problems.append(f"[重複] {concrete}: {', '.join(sorted(us))} が同じ欄を書いた → 差し戻し先 担当外の側")
     if only:
         problems = [p for p in problems if f" {only}" in p or f"_unit_{only}." in p]
     return problems
@@ -236,7 +236,7 @@ def _draft_common_errors():
     """backend 下書きの最上位 common_errors(入口の except 節)のうち、status が数値で取れたものを共通エラーの行にして返す(F2)。
     呼出元: compose。意味合い: 入口で受ける DB 例外などの 500 系は、API ごとに書かせると抜けるため、ソースで status が決まったものだけ機械で足す。
     status が式(getattr(e, 'status', 400) or 400)のもの・via の補助関数の中で決まるもの・同じ status の2件目以降は足さない(推測しない)。
-    condition は例外名と code だけの事実(業務の言い換えは S2 が書く)。下書きが無ければ []。"""
+    condition は例外名だけの事実(業務の言い換えは S2 が書く)。code_default が1種類に決まるときだけ error_code を入れる。下書きが無ければ []。"""
     from _config_loader import INTERMEDIATE_DIR
     by_status = {}
     for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
@@ -247,14 +247,16 @@ def _draft_common_errors():
         for c in d.get("common_errors") or []:
             for e in c.get("errors") or []:
                 if isinstance(e.get("status_code"), int):
-                    by_status.setdefault(e["status_code"], []).append((c.get("exception"), e.get("code"), c.get("src") or []))
+                    by_status.setdefault(e["status_code"], []).append((c.get("exception"), e.get("code_default"), c.get("src") or []))
     out = []
     for sc, hits in by_status.items():
         excs = "・".join(dict.fromkeys(x for x, _, _ in hits if x))
-        codes = [c for _, c, _ in hits if isinstance(c, str) and re.fullmatch(r"\w+", c)]
+        codes = {c for _, c, _ in hits if isinstance(c, str) and re.fullmatch(r"\w+", c)}
         src = [s for _, _, ss in hits for s in ss]
-        out.append({"status_code": sc, "condition": f"想定外の例外が起きたとき({excs}" + (f"。code={codes[0]}" if codes else "") + ")",
-                    **({"src": src} if src else {})})
+        row = {"status_code": sc, "condition": f"想定外の例外が起きたとき({excs})", **({"src": src} if src else {})}
+        if len(codes) == 1:  # WHY: code は condition に書かず error_code の欄に入れる。候補が2種類以上なら入れない(推測しない)
+            row["error_code"] = codes.pop()
+        out.append(row)
     return out
 
 
@@ -515,21 +517,23 @@ def _normalize_event_refs(out, log=None):
     if not current:
         return
 
-    def fix(code, where):
+    def fix(code, where, keep_names=False):
         if not isinstance(code, str) or not code or code in current:
             return code
+        if keep_names and not re.fullmatch(r"EV\d+", code):
+            return code  # 処理名(EV の形でない文字列)は削らない。B13 が処理名から FR を結ぶ
         new = alias.get(code)
         if log is not None:
             log.append(f"[正規化] {where}: {code} → {new or '削除(events に無い)'}")
         return new
 
-    def fix_list(lst, where):
-        return [x for x in (fix(c, where) for c in lst) if x]
+    def fix_list(lst, where, keep_names=False):
+        return [x for x in (fix(c, where, keep_names) for c in lst) if x]
 
     for cl in _rows(out, "common_logic"):
         for k in ("used_in", "used_by_processes"):
             if isinstance(cl.get(k), list):
-                cl[k] = fix_list(cl[k], f"common_logic[{cl.get('name')}].{k}")
+                cl[k] = fix_list(cl[k], f"common_logic[{cl.get('name')}].{k}", keep_names=True)
     for op in _rows(out, "db_operations"):
         api = op.get("api_endpoint")
         if not isinstance(api, dict):
@@ -573,6 +577,61 @@ def _fill_initial_db_triggers(out, log=None):
                 tev.append(c)
                 if log is not None:
                     log.append(f"[初期表示] db_operations[{op.get('id')}].trigger_events に {c} を足す({api.get('action')})")
+
+
+FILLER_ORDER_DEFAULT = 100
+
+
+def _fill_error_codes(out):
+    """api_spec[].error_patterns[] のうち error_code が無い行に、backend 下書きの common_errors の code_default を入れる(B0)。
+    呼出元: compose(_run_fillers の前)。意味合い: API ごとに code を書かせると食い違うため、入口の except 節でソースが決めた code を機械で入れる。
+    一致: 行の status_code(数値)が、下書きの status_code と等しい、または下書きの status の式にある数値リテラルと等しい(getattr(e, 'status', 400) or 400 → 400)。
+    候補の code_default が2種類以上になる status は、どれも入れない(推測しない)。行に既に error_code があれば触らない。下書きが無ければ何もしない。"""
+    from _config_loader import INTERMEDIATE_DIR
+    codes_by_status = {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for c in d.get("common_errors") or []:
+            for e in c.get("errors") or []:
+                code = e.get("code_default")
+                if not (isinstance(code, str) and code):
+                    continue
+                nums = set()
+                if isinstance(e.get("status_code"), int):
+                    nums.add(e["status_code"])
+                if isinstance(e.get("status"), str):
+                    nums |= {int(n) for n in re.findall(r"(?<![\w.])\d{3}(?![\w.])", e["status"])}
+                for n in nums:
+                    codes_by_status.setdefault(n, set()).add(code)
+    for a in _rows(out, "api_spec"):
+        for x in a.get("error_patterns") or []:
+            if not isinstance(x, dict) or x.get("error_code"):
+                continue
+            sc = x.get("status_code")
+            cands = codes_by_status.get(sc) if isinstance(sc, int) else None
+            if cands and len(cands) == 1:
+                x["error_code"] = next(iter(cands))
+
+
+def _run_fillers(out, log=None, directory=None):
+    """scripts/_compose_*.py の fill(out, log) を、モジュール変数 ORDER(既定 100)・ファイル名の順に呼ぶ(B0)。
+    呼出元: compose(NUMBERED の番号振りの前)。意味合い: 単位の断片だけでは決まらない欄(表の別名・表示名の補完など)を、
+    画面ごとの決め打ち無しに、欄ごとのモジュールが足す。モジュールが無ければ何もしない。失敗は握らず例外のまま上げる。
+    directory は検査用。省略時はこのファイルと同じ scripts/。"""
+    import importlib.util
+    here = Path(directory) if directory else Path(__file__).resolve().parent
+    fillers = []
+    for p in sorted(here.glob("_compose_*.py")):
+        spec = importlib.util.spec_from_file_location(p.stem, p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if callable(getattr(mod, "fill", None)):
+            fillers.append((getattr(mod, "ORDER", FILLER_ORDER_DEFAULT), p.name, mod))
+    for _, _, mod in sorted(fillers, key=lambda t: (t[0], t[1])):
+        mod.fill(out, log if log is not None else [])
 
 
 def compose(spec, frags, project_config=None, log=None):
@@ -647,6 +706,8 @@ def compose(spec, frags, project_config=None, log=None):
     _normalize_event_refs(out, log)
     _fill_initial_db_triggers(out, log)
     _fill_logical_names(out)
+    _fill_error_codes(out)
+    _run_fillers(out, log)  # B0: 欄ごとの _compose_*.py が足す(無ければ何もしない)。番号振りの前に済ませる
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
             row["no"] = i
@@ -853,6 +914,72 @@ def _selftest_compose_facts():
     print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers")
 
 
+def _selftest_b0():
+    """B0 の a)〜e) を一時の下書きと合成の欄で確かめる(フック・error_code・処理名の保持・[重複] の誤検出の除去)。"""
+    import tempfile
+    import _config_loader
+    # a) フック: ORDER の小さい順、同じ ORDER は名前の順に fill を呼ぶ。モジュールが無ければ何もしない
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "_compose_b.py").write_text("ORDER = 100\ndef fill(out, log):\n    out.setdefault('seq', []).append('b')\n", encoding="utf-8")
+        Path(td, "_compose_a.py").write_text("ORDER = 50\ndef fill(out, log):\n    out.setdefault('seq', []).append('a')\n", encoding="utf-8")
+        Path(td, "_compose_c.py").write_text("def fill(out, log):\n    out.setdefault('seq', []).append('c')\n", encoding="utf-8")
+        out = {}
+        _run_fillers(out, [], directory=td)
+        assert out["seq"] == ["a", "b", "c"], out
+    with tempfile.TemporaryDirectory() as td:
+        out = {"k": 1}
+        _run_fillers(out, [], directory=td)
+        assert out == {"k": 1}, out
+    with tempfile.TemporaryDirectory() as td:  # 失敗は握らず例外のまま上げる
+        Path(td, "_compose_r.py").write_text("def fill(out, log):\n    raise RuntimeError('boom')\n", encoding="utf-8")
+        try:
+            _run_fillers({}, [], directory=td)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("fill の例外が握られた")
+    # b) common_errors: condition に code を書かず、code_default から error_code を入れる / c) error_code の機械充填
+    backend = {"common_errors": [
+        {"exception": "queries.ValidationError", "errors": [{"status_code": 400, "code": "getattr(e, 'code', None) or 'validation_error'", "code_default": "validation_error"}]},
+        {"exception": "DatabaseError", "errors": [{"status_code": 500, "code_default": "internal_error"}]},
+        {"exception": "Gate", "errors": [{"status_code": 503, "code_default": "a"}]},
+        {"exception": "Gate2", "errors": [{"status_code": 503, "code_default": "b"}]},
+        {"exception": "Auth", "errors": [{"status": "getattr(e, 'status', 404) or 404", "code_default": "not_found"}]},
+    ]}
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "x_backend_draft.json").write_text(json.dumps(backend, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            ce = {c["status_code"]: c for c in _draft_common_errors()}
+            assert "。code=" not in ce[400]["condition"] and ce[400]["condition"] == "想定外の例外が起きたとき(queries.ValidationError)", ce[400]
+            assert ce[400]["error_code"] == "validation_error" and "error_code" not in ce[503], ce
+            api = {"api_spec": [{"action": "a", "error_patterns": [
+                {"status_code": 400, "condition": "x"}, {"status_code": 404, "condition": "y"},
+                {"status_code": 503, "condition": "z"}, {"status_code": 500, "condition": "w", "error_code": "keep"}]}]}
+            _fill_error_codes(api)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    got = [e.get("error_code") for e in api["api_spec"][0]["error_patterns"]]
+    assert got == ["validation_error", "not_found", None, "keep"], got
+    # d) 処理名(EV の形でない文字列)は削らず、旧 EV は現行の番号へ写す
+    out = {"events": [{"no": "EV1", "event_code": "EV00"}],
+           "common_logic": [{"name": "判定", "used_in": ["EV00", "初期表示", "EV09"], "used_by_processes": ["FR1 名"]}]}
+    _normalize_event_refs(out, [])
+    cl = out["common_logic"][0]
+    assert cl["used_in"] == ["EV1", "初期表示"] and cl["used_by_processes"] == ["FR1 名"], cl
+    # e) [重複]: 同じ単位が同名の行を2つ書いたのは重複にしない / 別々の単位が同じ欄を書いたときだけ出す
+    spec = {"units": {"S1": {"owns": ["screen_layout.items"]}, "S2": {"owns": ["screen_layout.items"]}}, "creators": {}}
+    same = {"S1": {"screen_layout": {"items": [{"item_name": "小計", "area_ref": "A"}, {"item_name": "小計", "area_ref": "B"}]}}}
+    assert check_fragments(spec, same) == [], check_fragments(spec, same)
+    two = {"S1": {"screen_layout": {"items": [{"item_name": "小計", "area_ref": "A"}]}},
+           "S2": {"screen_layout": {"items": [{"item_name": "小計", "area_ref": "B"}]}}}
+    probs = check_fragments(spec, two)
+    assert any(p.startswith("[重複] screen_layout.items[小計].area_ref") and "S1, S2" in p for p in probs), probs
+    print("[selftest OK] _units B0 (_run_fillers / _fill_error_codes / common_errors / 処理名の保持 / [重複])")
+
+
 if __name__ == "__main__":
+    _selftest_b0()
     _selftest_initial_values()
     _selftest_compose_facts()
