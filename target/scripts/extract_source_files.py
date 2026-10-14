@@ -307,44 +307,124 @@ def upgrade_backend_files(old_backend: list) -> list:
     return result
 
 
-def _imported_shared_modules(backend: list, root) -> list:
-    """入口・共通モジュールの .py が import する、同じディレクトリの .py を shared_module として返す（1段のみ）。
+def _top_level_names(tree) -> set:
+    """モジュールの先頭で定義される名前（def・class・代入）。import は含めない。
 
-    2026-10-14 T11 対応:
-    目的: backend_files に載るのは入口ファイル(handler.py)と設定の共通モジュールだけで、入口が import する
-          同じディレクトリの queries.py 等が一覧から漏れていた。import を読んで足す。
-    意味合い: import 先を辿るのは1段だけ（渡された一覧に載るファイルの import のみ）。
-              ドットを含む import（a.b）・相対 import・標準ライブラリ・同じディレクトリに無い名前は足さない。
-              既に一覧にあるパスは重複させない。
-    接続情報: main が upgrade_backend_files と共通モジュールの追加の後に呼ぶ。project_root が無い・
-              存在しないときは何も返さない（従来どおり）。説明は file_descriptions → ファイル先頭の順で埋める。
+    2026-10-14 T11 再修正:
+    目的: import 先のモジュールが、画面の API の本体が使う名前を本当に定義しているかを判定する材料。
+    接続情報: _imported_shared_modules が import 先ごとに呼ぶ。
     """
-    if root is None or not root.is_dir():
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _parse_py(path: Path):
+    """.py を AST にする。無い・読めない・構文エラーなら None（呼出側で飛ばす）。"""
+    if not path.is_file():
+        return None
+    try:
+        return ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return None
+
+
+def _api_action_functions(backend: list, root: Path, actions: set) -> list:
+    """画面の API の action が、入口ファイルの dispatch 表でどの関数を引くかを (相対パス, 関数名) で返す。
+
+    2026-10-14 T11 再修正:
+    目的: 画面の API が実際に通る関数だけを起点にするため。入口が import する全モジュールは起点にしない。
+    意味合い: 入口の辞書リテラル {"action名": モジュール.関数名} のうち、actions（画面の backend_processes の
+              endpoint.action）に載るものだけを採る。POS 固有の名前は決め打ちしない。
+    接続情報: 入口は kind=backend の .py。辞書の値のモジュールは入口が import しているローカルの .py に限る。
+    """
+    found = []
+    seen = set()
+    for b in backend:
+        if b.get("kind") != "backend" or not b["path"].endswith(".py"):
+            continue
+        tree = _parse_py(root / b["path"])
+        if tree is None:
+            continue
+        mod_path = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if "." not in a.name:
+                        mod_path[a.asname or a.name] = (Path(b["path"]).parent / f"{a.name}.py").as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and k.value in actions and k.value not in seen
+                        and isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name)
+                        and v.value.id in mod_path):
+                    seen.add(k.value)
+                    found.append((mod_path[v.value.id], v.attr))
+    return found
+
+
+def _imported_shared_modules(backend: list, root, actions: set) -> list:
+    """画面の API の関数の本体が使う名前を、その関数が置かれたモジュールの import 先から探し、定義するモジュールを shared_module として返す（1段のみ）。
+
+    2026-10-14 T11 再修正:
+    目的: 一覧から queries.py（_require_date・_opt_int・ValidationError の定義元）等が漏れないこと。
+          入口の import を全部足すと画面と無関係なモジュールが大量に入る（run9 で 2 件が 105 件に増えた）。
+    意味合い: 起点は _api_action_functions が返す、画面の API の関数だけ。関数の本体で使う名前（素の名前・a.b の b）を
+              AST で集め、そのモジュールの import 先で同じ名前が定義されていれば、その import 先を足す。
+              import 先の先（2段目）は辿らない。標準ライブラリ・ドットを含む import・同じディレクトリに無いものは足さない。
+              既に一覧にあるパスは重複させない。actions が空なら何も足さない（画面の API が分からない）。
+    接続情報: main が upgrade_backend_files と共通モジュールの追加の後に呼ぶ。root と actions は main が渡す。
+              説明は file_descriptions → ファイル先頭の順で埋める。
+    """
+    if root is None or not root.is_dir() or not actions:
         return []
     file_descs = get_file_descriptions(FEATURE_NAME)
     known = {b["path"] for b in backend}
     found = []
-    for b in list(backend):
-        if b.get("kind") not in ("backend", "shared_module") or not b["path"].endswith(".py"):
+    for rel_fn, func_name in _api_action_functions(backend, root, actions):
+        tree = _parse_py(root / rel_fn)
+        if tree is None:
             continue
-        src = root / b["path"]
-        if not src.is_file():
+        func = next((n for n in tree.body
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == func_name), None)
+        if func is None:
             continue
-        try:
-            tree = ast.parse(src.read_text(encoding="utf-8", errors="ignore"))
-        except SyntaxError:
-            continue
-        modules = []
-        for node in ast.walk(tree):
+        bare = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
+        dotted = {(n.value.id, n.attr) for n in ast.walk(func)
+                  if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+        parent = Path(rel_fn).parent
+        # (import 元のモジュール名, 種類, 名前の情報)。import 文の形ごとに「使われているか」を判定する
+        jobs = []
+        for node in tree.body:
             if isinstance(node, ast.Import):
-                modules += [a.name for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules.append(node.module)
-        for mod in modules:
-            if "." in mod:
+                for a in node.names:
+                    if "." not in a.name:
+                        jobs.append((a.name, "attr", a.asname or a.name))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and "." not in node.module:
+                for a in node.names:
+                    jobs.append((node.module, "from", (a.asname or a.name, a.name)))
+        for mod, kind, info in jobs:
+            rel = (parent / f"{mod}.py").as_posix()
+            if rel in known:
                 continue
-            rel = (Path(b["path"]).parent / f"{mod}.py").as_posix()
-            if rel in known or not (root / rel).is_file():
+            src_tree = _parse_py(root / rel)
+            if src_tree is None:
+                continue
+            defined = _top_level_names(src_tree)
+            if kind == "attr":
+                used = any(x == info and t in defined for x, t in dotted)
+            else:
+                local, orig = info
+                used = local in bare and orig in defined
+            if not used:
                 continue
             known.add(rel)
             name = f"{mod}.py"
@@ -352,6 +432,15 @@ def _imported_shared_modules(backend: list, root) -> list:
             found.append({"path": rel, "kind": "shared_module", "description": desc or _head_description(root / rel)})
     return found
 
+
+def _screen_actions(data: dict) -> set:
+    """画面の API の action 名（中間JSON の backend_processes[].endpoint.action）。
+
+    2026-10-14 T11 再修正: _imported_shared_modules の起点（画面の API）を決める材料。
+    接続情報: main が読む。無ければ空集合（何も足さない）。
+    """
+    return {(bp.get("endpoint") or {}).get("action")
+            for bp in (data.get("backend_processes") or []) if (bp.get("endpoint") or {}).get("action")}
 
 def main():
     if not INTERMEDIATE_JSON.exists():
@@ -398,9 +487,9 @@ def main():
                 "description": m.get("description", "共通モジュール")
             })
 
-    # 2b. 2026-10-14 T11: 入口・共通モジュールが import する同じディレクトリの .py を追加（1段のみ。
-    #     目的は一覧から queries.py 等が漏れないこと。詳細は _imported_shared_modules）
-    new_backend += _imported_shared_modules(new_backend, _project_root())
+    # 2b. 2026-10-14 T11 再修正: 画面の API の関数の本体が使う名前を定義する同じディレクトリの .py を追加（1段のみ。
+    #     起点は画面の backend_processes の action。入口の import を全部は足さない。詳細は _imported_shared_modules）
+    new_backend += _imported_shared_modules(new_backend, _project_root(), _screen_actions(data))
 
     # 3. meta から source_html_path を削除（個人パスのため設計書として不要）
     if "source_html_path" in meta:
@@ -426,5 +515,65 @@ def main():
     print(f"[OK] 保存先: {INTERMEDIATE_JSON}")
 
 
+def selftest() -> int:
+    """画面の API の関数が使う名前の定義元だけが backend_files に足されることを確かめる自己検査。
+
+    2026-10-14 T11 再修正:
+    意味合い: 一時フォルダに入口・API の関数・無関係なモジュールを合成し、足されるものと足されないものを見る。
+              画面設定（file_descriptions）は読まない（get_file_descriptions を空に差し替える）。
+    接続情報: `python3 extract_source_files.py --selftest` から呼ぶ。
+    """
+    import tempfile
+    global get_file_descriptions
+    saved = get_file_descriptions
+    get_file_descriptions = lambda feature: {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "backend").mkdir()
+            files = {
+                # 入口: dispatch 表で画面の action を queries_pos の関数へ引く。別の action（画面に無い）も持つ
+                "backend/handler.py": (
+                    "import queries_pos\nimport queries\nimport unused_mod\n"
+                    "ACTIONS = {\"list_pos_account_report\": queries_pos.list_pos_account_report,\n"
+                    "           \"other_action\": queries.list_other}\n"),
+                # 画面の API の関数。queries の名前と queries_helpers の名前を使い、db は import するが使わない
+                "backend/queries_pos.py": (
+                    "import db\nimport queries\nfrom queries_helpers import fmt_money\n"
+                    "def list_pos_account_report(params):\n"
+                    "    d = queries._require_date(params[\"d\"])\n"
+                    "    n = queries._opt_int(params)\n"
+                    "    if n is None:\n"
+                    "        raise queries.ValidationError(\"n\")\n"
+                    "    return fmt_money(n), d\n"),
+                "backend/queries.py": (
+                    "class ValidationError(Exception):\n    pass\n"
+                    "def _require_date(v):\n    return v\n"
+                    "def _opt_int(v):\n    return v\n"
+                    "def list_other():\n    return 1\n"),
+                "backend/queries_helpers.py": "def fmt_money(v):\n    return v\n",
+                "backend/db.py": "def connect():\n    return None\n",
+                "backend/unused_mod.py": "def _require_date(v):\n    return v\n",
+            }
+            for rel, text in files.items():
+                (root / rel).write_text(text, encoding="utf-8")
+            backend = [{"path": "backend/handler.py", "kind": "backend", "description": ""},
+                       {"path": "backend/queries_pos.py", "kind": "shared_module", "description": ""}]
+            got = {b["path"] for b in _imported_shared_modules(backend, root, {"list_pos_account_report"})}
+            want = {"backend/queries.py", "backend/queries_helpers.py"}
+            if got != want:
+                print(f"[NG] selftest: 足された {sorted(got)} / 期待 {sorted(want)}", file=sys.stderr)
+                return 1
+            if _imported_shared_modules(backend, root, set()) != []:
+                print("[NG] selftest: actions が空なのに足された", file=sys.stderr)
+                return 1
+            print("[OK] selftest: 画面の API の関数が使う名前の定義元だけ足す（db.py・unused_mod.py は足さない）")
+            return 0
+    finally:
+        get_file_descriptions = saved
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     main()
