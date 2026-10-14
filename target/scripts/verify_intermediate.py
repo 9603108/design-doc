@@ -1266,6 +1266,10 @@ BRACE_HOLE_RE = re.compile(r"\{[^{}\s]+\}")  # 空白を含まない {名前} �
 # 2026-10-13: 画面項目の例示値は、実行時に決まる値(金額・件数・日付など)を {金額} 円 のように書式の例として書く(S1 手順書)。
 # 具体的な値はソースに無く verify_vs_source が止めるため。この道筋の {名前} は未展開の穴とみなさない
 EXAMPLE_PATH_RE = re.compile(r"^screen_layout\.items\[\d+\]\.example$")
+# 例示値に残った {名前} は、書式の例として書かれるべき値が穴のまま残った状態。ERROR にせず WARN で S1 へ差し戻す。
+# 理由: verify_partials.py の _EX_HOLE(0402803)と同じ判定にそろえ、2つの検査で同じ穴を別の重さで扱わないため。
+# 空白を含む {…} も穴として拾う(BRACE_HOLE_RE は例示値には使わない)
+EXAMPLE_HOLE_RE = re.compile(r"\{[^{}]+\}")
 # DB 操作の日本語キーと、それに対応する英語キー（英語キーが空なら ERROR）
 DB_OP_JP_TO_EN = (
     ("結合", "joins"),
@@ -1296,6 +1300,7 @@ def check_intermediate_strict(merged: dict) -> list:
       (1) common_logic の要素で processing_steps も expression も空 → ERROR
       (2) 全文字列に 'db_op_' が残る → ERROR
       (3) 全文字列に '〈' または波括弧の穴 '{名前}' が残る → ERROR
+          （例外: screen_layout.items[].example の {…} の穴だけは WARN で S1 へ差し戻す）
       (4) messages の ID が ^MS[EWI]\\d{5}$ に合わない → ERROR / 同じ ID に別の文面が付く → ERROR
       (5) db_operations の要素に日本語キー（結合・抽出条件・条件・集計・並び順）の値があり、
           対応する英語キー（joins / where / group_by / order_by）が空 → ERROR
@@ -1311,9 +1316,13 @@ def check_intermediate_strict(merged: dict) -> list:
     for path, s in _iter_strings(merged):
         if "db_op_" in s and not path.endswith("legacy_id"):  # legacy_id は旧 ID の控え(docx に出ない)
             issues.append(("ERROR", f"{path}: 物理名 'db_op_' が文字列に残存: '{s[:80]}'"))
-        # 画面項目の例示値(screen_layout.items[].example)の {名前} は、実行時に決まる値の書式の例として書く正式な書き方(S1 手順書)。穴とみなさない。〈 は従来どおり ERROR
+        # 画面項目の例示値(screen_layout.items[].example)の {名前} は下の elif で WARN にする(〈 は従来どおり ERROR)。
+        # 理由: 例示値は書式の例として実値で書くのが正(S1 手順書)。穴は S1 へ戻して実値に直させる
         if "〈" in s or (BRACE_HOLE_RE.search(s) and not EXAMPLE_PATH_RE.match(path)):
             issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
+        # 例示値の {名前} は WARN に留める(最終段で残れば S1 へ差し戻す)。ERROR にすると docx 生成前に止まり、S1 の手戻りを機械的に強制しすぎるため
+        elif EXAMPLE_PATH_RE.match(path) and EXAMPLE_HOLE_RE.search(s):
+            issues.append(("WARN", f"{path}: 例示値に {{…}} の穴が残る（書式の例を実値で書き直す。差し戻し先 S1）: '{s[:80]}'"))
     # (4) メッセージ ID の形式と、同じ ID の文面の一致
     seen_msg = {}
     for m in merged.get("messages", []) or []:
