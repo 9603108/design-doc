@@ -226,7 +226,8 @@ def _spec_transform(drafts, leaf):
     設計書に出なかった。これらは W7 が react 下書きに出した display_rows[].cell_format(セルの書式の事実)と spec.unit から機械で作る。
     cell_format が null(書式が決まらない画面)・spec が無い・同じ葉の spec が2つ以上のときは None で、モデルの行を触らない。
     単位 = 書式の suffix、無ければ suffix_from_unit が true のとき spec.unit(無ければ unit_default)。単位が決まらなければ「と「…」」は書かない。
-    3桁区切り・0表示は grouping・null_as_zero が true のときだけ書く(true でなければ書かない。推測しない)。"""
+    3桁区切り・0表示は grouping・null_as_zero が true のときだけ書く(true でなければ書かない。推測しない)。
+    0表示の null_as_zero は spec.null_as_zero[cnt|kin|single](spec ごと)を先に読み、無ければ cell_format の値(R1)。"""
     hit = _spec_of(drafts, leaf)
     if not hit:
         return None
@@ -234,11 +235,12 @@ def _spec_transform(drafts, leaf):
     if not isinstance(cf, dict) or not spec.get("label"):
         return None
     if leaf == spec.get("cnt"):
-        fmt, where = cf.get("cnt"), "点数欄"
+        role, where = "cnt", "点数欄"
     elif spec.get("cnt"):
-        fmt, where = cf.get("kin"), "金額欄"
+        role, where = "kin", "金額欄"
     else:
-        fmt, where = cf.get("single"), None
+        role, where = "single", None
+    fmt = cf.get(role)
     if not isinstance(fmt, dict):
         return None
     suffix = fmt.get("suffix")
@@ -247,7 +249,12 @@ def _spec_transform(drafts, leaf):
     text = (f"「{spec['label']}」行の{where}に、" if where else f"「{spec['label']}」行に、")
     text += ("3桁区切りの" if fmt.get("grouping") is True else "") + "数値"
     text += (f"と「{suffix}」" if suffix else "") + "で出す"
-    if fmt.get("null_as_zero") is True:
+    # WHY(R1): 値が無いときの0は spec ごとの事実(spec.null_as_zero[役割])を先に見る。欄(cell_format)の値は三項 `s.calc ? … : num(…)` の
+    #   枝が決まらず null になり、calc を持たない金額欄・単独セルの行にも文が付かなかった。spec の値が無い(古い下書き)ときだけ欄の値を使う。
+    #   spec の値が null(calc の式が 0 にするか決まらない行)は欄が true でも書かない(推測しない)
+    per = spec.get("null_as_zero")
+    zero = per[role] if isinstance(per, dict) and role in per else fmt.get("null_as_zero")
+    if zero is True:
         text += "。値が無いときは0として出す"
     return text, spec["label"], spec.get("nth")
 
@@ -489,6 +496,23 @@ def _selftest_w6():
     # grouping・null_as_zero が true でなければ、その語を書かない(推測しない)
     cf["kin"] = F("円", grouping=None, zero=None)
     assert _spec_transform(drafts, "k1")[0] == "「売上訂正」行の金額欄に、数値と「円」で出す"
+    # R1: 欄の値が null(三項で決まらない)でも、spec ごとの null_as_zero が true の行には文が付き、calc を持つ行(null)には付かない。
+    #   点数欄は cnt、金額欄は kin、cnt の無い spec は single の値を読む。spec の値が無ければ欄の値(上の従来の形)
+    cf2 = {"cnt": F("点", zero=True), "kin": F("円", zero=None), "single": F(None, True, "円", zero=None)}
+    d2 = [{"display_rows": [{"cell_format": cf2, "specs": [
+        {"label": "売上訂正", "kin": "k1", "cnt": "c1", "unit": None, "nth": 1, "null_as_zero": {"cnt": True, "kin": True}},
+        {"label": "総売上", "kin": "k2", "cnt": None, "unit": None, "nth": 1, "null_as_zero": {"single": True}},
+        {"label": "客数", "kin": "k3", "cnt": None, "unit": "人", "nth": 1, "null_as_zero": {"single": True}},
+        {"label": "平均単価", "kin": None, "cnt": None, "unit": None, "nth": 1, "null_as_zero": {"single": None}},
+        {"label": "旧下書き", "kin": "k4", "cnt": None, "unit": None, "nth": 1}]}]}]
+    assert _spec_transform(d2, "c1")[0].endswith("点数欄に、3桁区切りの数値と「点」で出す。値が無いときは0として出す")
+    assert _spec_transform(d2, "k1")[0] == "「売上訂正」行の金額欄に、3桁区切りの数値と「円」で出す。値が無いときは0として出す"
+    assert _spec_transform(d2, "k2")[0] == "「総売上」行に、3桁区切りの数値と「円」で出す。値が無いときは0として出す"
+    assert _spec_transform(d2, "k3")[0] == "「客数」行に、3桁区切りの数値と「人」で出す。値が無いときは0として出す"
+    assert _spec_transform(d2, "k4")[0] == "「旧下書き」行に、3桁区切りの数値と「円」で出す", "spec の値が無く欄が null なら書かない"
+    cf2["single"]["null_as_zero"] = True
+    d2[0]["display_rows"][0]["specs"][3]["kin"] = "k5"
+    assert _spec_transform(d2, "k5")[0] == "「平均単価」行に、3桁区切りの数値と「円」で出す", "spec が null(calc 行)は欄が true でも書かない"
     # 適用: 画面項目が label と同じ行だけ上書きし、2回目は変えない。cell_format null の行は従来のまま
     api = {"action": "a", "response_to_screen_mapping": [
         {"api_field_path": "rows[].k2", "screen_item_name": "総売上", "transform": "そのまま表示"},

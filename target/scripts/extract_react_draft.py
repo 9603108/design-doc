@@ -1018,8 +1018,13 @@ def _row_specs(body, count, path=None, text=None, base=0):
         note = "".join(re.findall(r"['\"]([^'\"]*)['\"]", nm.group(1))) if nm else None
         # WHY(W7): unit は spec の単位(「点」「人」)。画面は単位なしの spec に既定の「円」を足す(`s.unit ?? "円"`)ので、
         #   合成(_compose_mapping)が表示行の transform の単位を spec ごとに決められるよう、リテラルをそのまま出す(無ければ null)
+        # WHY(R1): spec が calc(関数プロパティ)を持つかで、金額欄の値の作り方が変わる(`s.calc ? s.calc(agg) : num(…)`)。
+        #   calc の式の文字列を "_calc" に一時的に持たせ(無ければ None)、_display_rows が spec ごとの null_as_zero を決めた後に外す
+        #   (下書きには出さない。出すのは判定の結果 null_as_zero だけ)
+        cm = re.search(r"\bcalc\s*:\s*", ob)
+        calc = ob[cm.end():next((j for j, c, d in _walk(ob, cm.end()) if d < 0 or (c == "," and d == 0)), len(ob))] if cm else None
         specs.append({"label": label, "csv": attr("csv"), "kin": attr("kin"), "cnt": attr("cnt"),
-                      "unit": attr("unit"),
+                      "unit": attr("unit"), "_calc": calc,
                       "nth": count[label], "dead": ("dead: true" in ob) or ("dead:true" in ob),
                       "note": note,
                       "src": [_span(path, text, base + om.start(), base + om.end())] if path is not None else []})
@@ -1050,9 +1055,15 @@ def _display_rows(sources):
             # WHY(W7): セルの書式は「その配列の行を描く所」の事実で、配列ごとではなくファイルの描画コードで決まる。
             #   同じファイルの配列には同じ値を付ける(合成 _compose_mapping が transform の書式を作るときに読む)
             import copy
-            cf = _cell_format(p, t, sources)
+            evals = {}
+            cf = _cell_format(p, t, sources, evals)
             for r in rows[first_row:]:
                 r["cell_format"] = copy.deepcopy(cf)
+                # WHY(R1): 金額欄・単独セルの値は `s.calc ? s.calc(agg) : num(…)` のように spec ごとに通る枝が違う。
+                #   欄(cell_format)全体では枝が決まらず null_as_zero が null になるので、spec ごとに決めて spec に付ける
+                for s in r["specs"]:
+                    s["null_as_zero"] = _spec_null_as_zero(s, evals, sources) if cf else None
+                    s.pop("_calc", None)
     return rows
 
 
@@ -1083,7 +1094,7 @@ def _call_wrap(expr):
     return m.group(1), expr[po + 1:-1].strip()
 
 
-def _td_cell(inner, before, sources, fmt_names):
+def _td_cell(inner, before, sources, fmt_names, out_arg=None):
     """1つの <td> の中身から、書式 F の事実を作る。`{F(引数)} 末尾` の形でなければ None。
 
     before は <tr> より前のファイルの文字(`const unit = …`・`const kin = …` の定義を、直近のものから引く先)。
@@ -1099,6 +1110,9 @@ def _td_cell(inner, before, sources, fmt_names):
     if not wrap:
         return None
     fn, arg = wrap
+    # WHY(R1): spec ごとの null_as_zero(_spec_null_as_zero)が、F の引数の式を spec ごとに評価し直せるよう、呼出元の out_arg へ渡す
+    if out_arg is not None:
+        out_arg.append(arg)
     rest = s[e + 1:].strip()
     # 末尾: リテラルの文字 / {識別子}(単位の変数) / 無し。それ以外(別の式が混ざる)は決められない
     suffix, from_unit, unit_default = None, False, None
@@ -1129,20 +1143,30 @@ def _td_cell(inner, before, sources, fmt_names):
             "grouping": grouping, "null_as_zero": null_as_zero}
 
 
-def _null_as_zero(arg, ctx_text, sources, depth=0):
-    """F の引数の式が、値が null のとき 0 にするか。True・False、決まらないとき None。呼出元: _td_cell()。"""
+_ANY_SPEC = object()  # _null_as_zero の spec_calc の既定: spec を限らない(どの枝も通りうるものとして全枝で判定する)
+
+
+def _null_as_zero(arg, ctx_text, sources, depth=0, spec_calc=_ANY_SPEC):
+    """F の引数の式が、値が null のとき 0 にするか。True・False、決まらないとき None。呼出元: _td_cell()・_spec_null_as_zero()。
+
+    spec_calc(R1): 既定(_ANY_SPEC)は spec を限らず全枝で判定する(欄全体の値)。str はその spec の `calc: …` の式、None は calc を持たない spec。
+    spec を限ると、条件が `X.calc` の三項は通る枝が決まる(calc 無し→偽の枝、calc あり→真の枝で、calc の定義はその spec の式だけを見る)。"""
     arg = arg.strip()
     if re.fullmatch(r"[A-Za-z_$][\w$]*", arg) and depth < 2:
         ms = list(re.finditer(rf"\bconst\s+{re.escape(arg)}\b[^=\n]*=", ctx_text))
         if not ms:
             return None
         expr = ctx_text[ms[-1].end():_expr_end(ctx_text, ms[-1].end())]
-        return _null_as_zero(expr, ctx_text, sources, depth + 1)
+        return _null_as_zero(expr, ctx_text, sources, depth + 1, spec_calc)
     # WHY(W6 の指摘): `c ? A : B` は枝ごとに判定する。全部の枝が null を 0 にするときだけ True、1つでも決まらなければ None、
     #   決まった枝が全部 False なら False(混在は None)。画面の `const kin = s.calc ? s.calc(agg) : num(…)` を決められるようにする
     tern = _split_ternary(arg)
     if tern and depth < 4:
-        res = [_null_as_zero(b, ctx_text, sources, depth + 1) for b in tern[1:]]
+        # WHY(R1): 条件が `X.calc` の三項で spec が決まっているなら、通る枝は1つ(calc を持たない spec は偽の枝 num(…) だけ)。
+        #   全枝で判定すると calc の枝が決まらず、calc を持たない行まで null になっていた
+        if spec_calc is not _ANY_SPEC and re.fullmatch(r"[\w$.!?]+\.calc", tern[0]):
+            return _null_as_zero(tern[2] if spec_calc is None else tern[1], ctx_text, sources, depth + 1, spec_calc)
+        res = [_null_as_zero(b, ctx_text, sources, depth + 1, spec_calc) for b in tern[1:]]
         if any(r is None for r in res):
             return None
         return True if all(res) else (False if not any(res) else None)
@@ -1151,13 +1175,17 @@ def _null_as_zero(arg, ctx_text, sources, depth=0):
     mc = re.fullmatch(r"[\w$.!?]+\.([A-Za-z_$][\w$]*)\s*\(.*\)", arg, re.S)
     if mc:
         defs = []
-        for sp in sources:
-            if Path(sp).suffix not in (".tsx", ".jsx"):
-                continue
-            st = Path(sp).read_text(encoding="utf-8")
-            for pm in re.finditer(rf"\b{re.escape(mc.group(1))}\s*:\s*(?=\(|[A-Za-z_$])", st):
-                end = next((j for j, c, d in _walk(st, pm.end()) if d < 0 or (c == "," and d == 0)), len(st))
-                defs.append(st[pm.end():end])
+        if spec_calc is not _ANY_SPEC and mc.group(1) == "calc":
+            # WHY(R1): spec が決まっているなら calc の定義はその spec の式だけ(他の spec の calc を混ぜない)。calc が無ければ定義なし=決まらない
+            defs = [spec_calc] if spec_calc is not None else []
+        else:
+            for sp in sources:
+                if Path(sp).suffix not in (".tsx", ".jsx"):
+                    continue
+                st = Path(sp).read_text(encoding="utf-8")
+                for pm in re.finditer(rf"\b{re.escape(mc.group(1))}\s*:\s*(?=\(|[A-Za-z_$])", st):
+                    end = next((j for j, c, d in _walk(st, pm.end()) if d < 0 or (c == "," and d == 0)), len(st))
+                    defs.append(st[pm.end():end])
         if defs and all(re.search(r"\?\?\s*0\b", x) for x in defs):
             return True
         return None
@@ -1170,13 +1198,30 @@ def _null_as_zero(arg, ctx_text, sources, depth=0):
     return bool(re.search(r"\?\?\s*0\b", arg))
 
 
-def _cell_format(path, text, sources):
+def _spec_null_as_zero(spec, evals, sources):
+    """spec 1つの、セルごとの null_as_zero。点数欄・金額欄を持つ spec は {"cnt", "kin"}、cnt の無い spec は {"single"}(値は True・False・None)。
+
+    呼出元: _display_rows()。意味合い(R1): 欄(cell_format)全体では `s.calc ? s.calc(agg) : num(…)` の枝が決まらず kin・single の null_as_zero が null だが、
+    spec ごとなら通る枝が決まる。calc を持たない spec は num の枝だけを通るので num の判定で決まる。calc を持つ spec はその spec の calc の式が
+    `?? 0` を通すときだけ True、そうでなければ None(推測しない)。役割ごとの式が複数あって判定が割れるときも None。
+    spec に "_calc" が無いとき(_row_specs を通っていない)は spec を限らず、全枝で判定する。"""
+    roles = ("cnt", "kin") if spec.get("cnt") else ("single",)
+    calc = spec.get("_calc", _ANY_SPEC)
+    out = {}
+    for role in roles:
+        vals = [_null_as_zero(a, b, sources, 0, calc) for a, b in evals.get(role, [])]
+        out[role] = vals[0] if vals and all(v == vals[0] for v in vals) else None
+    return out
+
+
+def _cell_format(path, text, sources, evals=None):
     """spec の配列を描く <tr>(cnt の td を持つ行)から、セルの書式 {cnt, kin, single} を作る。決まらなければ None。
 
     呼出元: _display_rows()(同じファイルの配列に同じ値を付ける)。意味合い: 画面は点数・金額・単独セルを同じ関数で整形し末尾に単位を付ける。
     その事実(末尾・単位の出どころ・桁区切り・null→0)を機械で出し、合成(_compose_mapping)が表示行の transform を作る根拠にする。
     役割の決め方: cnt = `.cnt` を参照する td、kin = その次の値の td、single = それ以外の値の td。描く <tr> が複数あって形が違う、
     役割のどれかが決まらない、single が複数で形が違うときは None(誤った書式を断定しない)。画面ごとの決め打ちの名前は持たない。
+    evals が dict なら、役割(cnt・kin・single)ごとに F の引数の式と、その td より前の文字 [(arg, before), …] を足す(R1: spec ごとの null_as_zero 用)。
     """
     fmt_names = _formatter_names(sources)
     results = []
@@ -1188,19 +1233,24 @@ def _cell_format(path, text, sources):
             continue
         roles, singles = {}, []
         kin_i = None
+        args = {"cnt": [], "kin": [], "single": []}  # WHY(R1): 役割ごとの F の引数の式(spec ごとの null_as_zero の評価に使う)
         for i, (inner, s0, e0) in enumerate(tds):
-            cell = _td_cell(inner, before, sources, fmt_names)
+            arg_l = []
+            cell = _td_cell(inner, before, sources, fmt_names, arg_l)
             if cell is not None:
                 cell["src"] = [_span(path, text, s0, e0)]
             if i == ci:
                 roles["cnt"] = cell
+                args["cnt"] += arg_l[:1] if cell is not None else []
             elif cell is None:
                 continue
             elif i > ci and kin_i is None:
                 kin_i = i
                 roles["kin"] = cell
+                args["kin"] += arg_l[:1]
             else:
                 singles.append(cell)
+                args["single"] += arg_l[:1]
         if roles.get("cnt") is None or roles.get("kin") is None or not singles:
             return None
         key = lambda c: {k: v for k, v in c.items() if k != "src"}
@@ -1209,6 +1259,9 @@ def _cell_format(path, text, sources):
         roles["single"] = dict(singles[0])
         roles["single"]["src"] = [sp for c in singles for sp in c["src"]]
         results.append(roles)
+        if evals is not None:
+            for role, lst in args.items():
+                evals.setdefault(role, []).extend((a, before) for a in lst)
     if not results:
         return None
     for r in results[1:]:
@@ -1792,6 +1845,31 @@ def _selftest_w7():
             assert cf["cnt"]["src"][0]["file"] == str(tsx) and cf["cnt"]["src"][0]["line_start"] == 15, cf["cnt"]["src"]
             units = {s["label"]: s["unit"] for s in rows[1]["specs"]}
             assert units == {"点数": "点", "金額": None}, units
+            # R1: spec ごとの null_as_zero。calc を持たない spec は num の枝だけを通るので True(欄全体 cf["kin"] は null のまま)、
+            #   cnt のある spec は cnt・kin の2つ、無い spec は single。内部の "_calc" は下書きに残らない
+            nz = {s["label"]: s["null_as_zero"] for r in rows for s in r["specs"]}
+            assert nz == {"売上": {"cnt": True, "kin": True}, "点数": {"single": True}, "金額": {"single": True}}, nz
+            assert not any("_calc" in s for r in rows for s in r["specs"]), "内部の _calc が下書きに残った"
+            # calc を持つ spec: calc の式が ?? 0 を通さなければ None(推測しない)、通せば True。他の spec は変わらない
+            # fallback-ok: 次の replace は calc を持つ spec(`calc: (r) => (r.a ?? 0) - …`)を試験の入力に足す(null を 0 にする式の判定の確認)
+            head_c = head.replace('{ label: "金額", kin: "k" }]', '{ label: "金額", kin: "k" }, { label: "差", calc: (r) => r.a - r.b }, '
+                                  '{ label: "安全", calc: (r) => (r.a ?? 0) - (r.b ?? 0) }]')
+            assert head_c != head
+            tsx.write_text(head_c + row_a + '  });\n  return null;\n}\n', encoding="utf-8")
+            rows_c = _display_rows(srcs)
+            nz = {s["label"]: s["null_as_zero"] for r in rows_c for s in r["specs"]}
+            assert nz == {"売上": {"cnt": True, "kin": True}, "点数": {"single": True}, "金額": {"single": True},
+                          "差": {"single": None}, "安全": {"single": True}}, nz
+            assert rows_c[0]["cell_format"]["kin"]["null_as_zero"] is None, "欄全体は calc の枝が決まらないので null のまま"
+            # 条件が X.calc の三項: spec を限ると通る枝が決まる(calc 無し→num の枝=True、calc あり→その spec の式)。限らなければ従来どおり
+            ctx = "const kin = s.calc ? s.calc(agg) : num(agg[s.kin!]);\n"
+            tsx2.write_text(num_def, encoding="utf-8")
+            assert _null_as_zero("kin", ctx, [tsx2], 0, None) is True, "calc の無い spec は num の枝"
+            assert _null_as_zero("kin", ctx, [tsx2], 0, "(r) => r.a - r.b") is None, "calc が ?? 0 を通さない"
+            # fallback-ok: 次の行は calc の式(`?? 0` を通す)を試験の入力として渡す
+            assert _null_as_zero("kin", ctx, [tsx2], 0, "(r) => (r.a ?? 0) - 1") is True, "calc が ?? 0 を通す"
+            assert _null_as_zero("kin", ctx, [tsx2]) is None, "spec を限らなければ calc の定義が無く決まらない"
+            assert _null_as_zero("kin", "const kin = c ? raw(a) : num(b);\n", [tsx2], 0, None) is None, "条件が .calc でなければ全枝で判定(混在)"
             # 描く <tr> が2か所で形が違えば null
             row_b = row_a.replace("点</td>", "件</td>")
             tsx.write_text(head + row_a + '  });\n  const r2 = (specs: Spec[]) => specs.map((s, i) => {\n' + row_b
