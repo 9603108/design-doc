@@ -384,7 +384,194 @@ def _fill_src(out):
                 put(x, err.get(x.get("message_id")))
 
 
-def compose(spec, frags, project_config=None):
+def _initial_text(si):
+    """state_initials の1件(kind・initial・readable)を、画面項目の「初期値」欄の文にする。
+    リテラルは原文のまま(空文字と空配列だけ言葉にする)、日付関数を含む式は readable、それ以外の式は原文を「式:」付きで書く。"""
+    kind, raw = si.get("kind"), si.get("initial") or ""
+    if kind == "none":
+        return "未設定(undefined)"
+    if kind == "literal":
+        return {'""': "空文字", "''": "空文字", "[]": "空の一覧"}.get(raw, raw)
+    return si.get("readable") or f"式: {raw}"
+
+
+def _fill_initial_values(out):
+    """画面項目(screen_layout.items)の initial_value 欄を、react 下書きの state_initials(useState の初期値の事実)から埋める。
+    呼出元: compose(_fill_src の後)。意味合い: 初期表示の表を「全項目 Blank」と書く誤りを止めるため、モデルに書かせず事実で入れる。
+    照合: state_initials[].bound[].label と item_name の一致。結ぶ state が無い項目(ボタン・固定の文言など)は欄を作らない。
+    initial_value が既にある項目は触らない。下書きに state_initials が無ければ何もしない。
+    接続: 欄を読んで初期処理の表へ写す側は merge_partials.build_initialization(少なくとも、そこが初期値を Blank 一律にしている)。"""
+    from _config_loader import INTERMEDIATE_DIR
+    by_label = {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+        try:
+            r = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for si in r.get("state_initials") or []:
+            for b in si.get("bound") or []:
+                if b.get("label"):
+                    by_label.setdefault(str(b["label"]).strip(), si)
+    for it in _rows(out, "screen_layout.items"):
+        si = by_label.get(str(it.get("item_name") or "").strip())
+        if si and not it.get("initial_value"):
+            it["initial_value"] = _initial_text(si)
+
+
+def _react_draft_facts():
+    """react 下書きから (初期表示のイベントの code の集合, 初期表示で呼ぶ API の action の集合) を取る。
+    呼出元: _fill_initial_db_triggers。意味合い: 初期表示の行は events の action が「初期表示」のもの(画面名は使わない)。
+    API は、その行の event_processes の calls と、db_operations の trigger_events にその行の code を持つものの action。
+    initial_fetches の関数名(fetchXxx)は API の action と綴りが違うため、照合には使わない(推測で結ばない)。
+    下書きが無ければ (set(), set())。"""
+    from _config_loader import INTERMEDIATE_DIR
+    drafts = []
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+        try:
+            drafts.append(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    init = {e["event_code"] for d in drafts for e in d.get("events") or []
+            if isinstance(e, dict) and e.get("action") == "初期表示" and e.get("event_code")}
+    actions = set()
+    for d in drafts:
+        for ep in d.get("event_processes") or []:
+            if isinstance(ep, dict) and ep.get("event_code") in init:
+                actions |= {c["action"] for c in ep.get("calls") or [] if isinstance(c, dict) and c.get("action")}
+        for op in d.get("db_operations") or []:
+            if not isinstance(op, dict):
+                continue
+            api = op.get("api_endpoint")
+            if isinstance(api, dict) and api.get("action") and init & set(api.get("trigger_events") or []):
+                actions.add(api["action"])
+    return init, actions
+
+
+def _origin_error_codes():
+    """backend 下書きの common_errors(_error_origins の出どころ)から、式の code → 既定の code(code_default)の対応を取る。
+    呼出元: _fix_message_codes。意味合い: 例外の code は、ソースの式 getattr(e, 'code', None) or 'validation_error' のまま
+    メッセージに書かれやすい。式の中の既定の文字列(validation_error)が実際の code なので、そこへ寄せる。下書きが無ければ {}。"""
+    from _config_loader import INTERMEDIATE_DIR
+    out = {}
+    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for c in d.get("common_errors") or []:
+            for e in c.get("errors") or []:
+                if isinstance(e, dict) and e.get("code") and e.get("code_default"):
+                    out.setdefault(str(e["code"]), e["code_default"])
+    return out
+
+
+def _event_code_map(events):
+    """events の行から (旧コード → 現行の番号の対応, 現行の番号の集合) を取る。
+    呼出元: _normalize_event_refs・_fill_initial_db_triggers。意味合い: 現行の番号は、行の no が「EV<数字>」の形ならその no
+    (migrate_v49_event_unify の後の形)、無ければ event_code(Phase 1 の形)。旧コードは行の legacy_event_code と event_code。
+    両方とも現行の番号へ写す。これで、移行の前後どちらの形の events にも同じ写像が当たる。"""
+    alias, current = {}, set()
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        no = ev.get("no")
+        cur = no if isinstance(no, str) and re.fullmatch(r"EV\d+", no) else ev.get("event_code")
+        if not cur:
+            continue
+        current.add(cur)
+        for old in (ev.get("legacy_event_code"), ev.get("event_code")):
+            if old and old != cur:
+                alias.setdefault(old, cur)
+    return alias, current
+
+
+def _normalize_event_refs(out, log=None):
+    """共通ロジックと DB 操作・画面項目の参照に残る旧イベントコード(EV00 等)を、events の現行の番号へ写す。
+    呼出元: compose(_fill_initial_values の後)。意味合い: 旧コードのまま残ると、存在しない発火イベントとして後段で出る。
+    events を正として参照の側を合わせる。写せない(events に無い)コードは残さず削り、log に書く(事実を優先し、置き換えを記録する)。
+    events が無いときは何もしない(events を持たない断片の合成で、参照を全部消さないため)。"""
+    alias, current = _event_code_map(_rows(out, "events"))
+    if not current:
+        return
+
+    def fix(code, where):
+        if not isinstance(code, str) or not code or code in current:
+            return code
+        new = alias.get(code)
+        if log is not None:
+            log.append(f"[正規化] {where}: {code} → {new or '削除(events に無い)'}")
+        return new
+
+    def fix_list(lst, where):
+        return [x for x in (fix(c, where) for c in lst) if x]
+
+    for cl in _rows(out, "common_logic"):
+        for k in ("used_in", "used_by_processes"):
+            if isinstance(cl.get(k), list):
+                cl[k] = fix_list(cl[k], f"common_logic[{cl.get('name')}].{k}")
+    for op in _rows(out, "db_operations"):
+        api = op.get("api_endpoint")
+        if not isinstance(api, dict):
+            continue
+        if isinstance(api.get("trigger_events"), list):
+            api["trigger_events"] = fix_list(api["trigger_events"], f"db_operations[{op.get('id')}].trigger_events")
+        if api.get("trigger_event"):
+            new = fix(api["trigger_event"], f"db_operations[{op.get('id')}].trigger_event")
+            if new:
+                api["trigger_event"] = new
+            else:
+                api.pop("trigger_event")
+    for it in _rows(out, "screen_layout.items"):
+        if it.get("event_code"):
+            new = fix(it["event_code"], f"screen_layout.items[{it.get('item_name')}].event_code")
+            if new:
+                it["event_code"] = new
+            else:
+                it.pop("event_code")
+
+
+def _fill_initial_db_triggers(out, log=None):
+    """初期表示が呼ぶ API の DB 操作に、初期表示のイベントを発火イベントとして足す。発火イベント欄が無い DB 操作には欄を作る。
+    呼出元: compose(_normalize_event_refs の後)。意味合い: 初期表示のときに引く DB の参照が発火イベントの欄に現れないと、
+    機能別処理の表で紐づかない。初期表示の API は _react_draft_facts で決める(画面の名前や番号は決め打ちしない)。
+    下書きが無い・初期表示の行が events に無いときは何もしない。"""
+    init_codes, actions = _react_draft_facts()
+    alias, current = _event_code_map(_rows(out, "events"))
+    targets = sorted({alias.get(c, c) for c in init_codes} & current)
+    if not targets or not actions:
+        return
+    for op in _rows(out, "db_operations"):
+        api = op.get("api_endpoint")
+        if not isinstance(api, dict) or api.get("action") not in actions:
+            continue
+        tev = api.get("trigger_events")
+        if not isinstance(tev, list):
+            tev = api["trigger_events"] = []
+        for c in targets:
+            if c not in tev:
+                tev.append(c)
+                if log is not None:
+                    log.append(f"[初期表示] db_operations[{op.get('id')}].trigger_events に {c} を足す({api.get('action')})")
+
+
+def _fix_message_codes(out, log=None):
+    """messages_backend の code が式のまま(getattr(e, 'code', None) or 'validation_error' など)のとき、
+    下書きの _error_origins(common_errors の code_default)の実際の code へ置き換える。
+    呼出元: compose(_fill_initial_db_triggers の後)。意味合い: 単位が式を code に写すと、検査は通っても実際の code と食い違う。
+    事実(下書きの code_default)を正とし、置き換えた旨を log に残す。対応が無い code は触らない(推測しない)。"""
+    origins = _origin_error_codes()
+    if not origins:
+        return
+    for m in _rows(out, "messages_backend"):
+        c = m.get("code")
+        if not isinstance(c, str) or re.fullmatch(r"\w+", c) or c not in origins:
+            continue
+        m["code"] = origins[c]
+        if log is not None:
+            log.append(f"[正規化] messages_backend[{m.get('message_id')}].code: {c} → {origins[c]}")
+
+
+def compose(spec, frags, project_config=None, log=None):
     """断片を識別子で突き合わせて重ねる。戻り: 最上位キーの dict。行の並びは作り手の断片を先に取る"""
     creators = spec.get("creators") or {}
     out = {}
@@ -450,6 +637,11 @@ def compose(spec, frags, project_config=None):
                     msgs.append({**{k: ce[k] for k in ("code", "severity", "message") if k in ce}, "message_id": mid})
                     have.add(mid)
     _fill_src(out)
+    _fill_initial_values(out)
+    # 参照の正規化は events を正として行う。順序: 旧コードを現行へ写す → 初期表示の発火を足す → code を下書きの実際の値へ寄せる
+    _normalize_event_refs(out, log)
+    _fill_initial_db_triggers(out, log)
+    _fix_message_codes(out, log)
     _fill_logical_names(out)
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
@@ -588,3 +780,75 @@ def check_all(spec, frags, only=None):
     if only:
         refs = [p for p in refs if p.endswith(f" {only}")]
     return problems + refs
+
+
+def _selftest_initial_values():
+    """_fill_initial_values を一時の下書きで確かめる(リテラル・日付式・式・未設定・結ぶ state が無い項目・既存値の維持)。"""
+    import tempfile
+    import _config_loader
+    si = [
+        {"state": "a", "kind": "literal", "initial": "true", "readable": None, "bound": [{"label": "空欄項目も表示"}]},
+        {"state": "b", "kind": "expression", "initial": "monthStart()", "readable": "当月1日(JST基準)", "bound": [{"label": "集計開始日"}]},
+        {"state": "c", "kind": "expression", "initial": "f(x)", "readable": None, "bound": [{"label": "式項目"}]},
+        {"state": "d", "kind": "none", "initial": "", "readable": None, "bound": [{"label": "未設定項目"}]},
+        {"state": "e", "kind": "literal", "initial": "\"\"", "readable": None, "bound": [{"label": "空項目"}]},
+    ]
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_react_draft.json").write_text(json.dumps({"state_initials": si}, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            out = {"screen_layout": {"items": [{"item_name": n} for n in ("空欄項目も表示", "集計開始日", "式項目", "未設定項目", "空項目", "ボタン")]
+                                     + [{"item_name": "集計開始日2", "initial_value": "手書き"}]}}
+            _fill_initial_values(out)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    got = {i["item_name"]: i.get("initial_value") for i in out["screen_layout"]["items"]}
+    assert got == {"空欄項目も表示": "true", "集計開始日": "当月1日(JST基準)", "式項目": "式: f(x)", "未設定項目": "未設定(undefined)",
+                   "空項目": "空文字", "ボタン": None, "集計開始日2": "手書き"}, got
+    print("[selftest OK] _units._fill_initial_values")
+
+
+def _selftest_compose_facts():
+    """参照の正規化(旧イベントコード・初期表示の発火・code の式)を一時の下書きと合成の欄で確かめる。
+    移行の前(event_code だけ)と後(no と legacy_event_code を持つ)の両方の形の events に当てる。"""
+    import tempfile
+    import _config_loader
+    react = {"events": [{"event_code": "EV00", "action": "初期表示"}, {"event_code": "EV01", "action": "クリック"}],
+             "event_processes": [{"event_code": "EV00", "calls": [{"action": "list_a"}]}],
+             "db_operations": [{"api_endpoint": {"action": "list_a", "trigger_events": ["EV00"]}}]}
+    backend = {"common_errors": [{"exception": "queries.ValidationError", "errors": [
+        {"code": "getattr(e, 'code', None) or 'validation_error'", "code_default": "validation_error", "message": "str(e)"}]}]}
+    out = {"events": [{"no": "EV1", "legacy_event_code": "EV00", "action": "初期表示"},
+                      {"no": "EV2", "legacy_event_code": "EV01", "action": "クリック"}],
+           "common_logic": [{"name": "判定", "used_in": ["EV00", "EV01", "EV09"]}],
+           "db_operations": [{"id": "DB1", "api_endpoint": {"action": "list_a", "trigger_events": ["EV2"]}},
+                             {"id": "DB2", "api_endpoint": {"action": "list_a"}},
+                             {"id": "DB3", "api_endpoint": {"action": "list_b"}}],
+           "screen_layout": {"items": [{"item_name": "店舗", "event_code": "EV01"}]},
+           "messages_backend": [{"message_id": "MSE1", "code": "getattr(e, 'code', None) or 'validation_error'", "message": "str(e)"}]}
+    log = []
+    old = _config_loader.INTERMEDIATE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_react_draft.json").write_text(json.dumps(react, ensure_ascii=False), encoding="utf-8")
+        (Path(td) / "x_backend_draft.json").write_text(json.dumps(backend, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            _normalize_event_refs(out, log)
+            _fill_initial_db_triggers(out, log)
+            _fix_message_codes(out, log)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    assert out["common_logic"][0]["used_in"] == ["EV1", "EV2"], out["common_logic"]
+    assert out["screen_layout"]["items"][0]["event_code"] == "EV2", out["screen_layout"]
+    got = [op["api_endpoint"].get("trigger_events") for op in out["db_operations"]]
+    assert got == [["EV2", "EV1"], ["EV1"], None], got
+    assert out["messages_backend"][0]["code"] == "validation_error", out["messages_backend"]
+    assert any("EV09" in x and "削除" in x for x in log), log
+    assert any("EV00 → EV1" in x or "EV00" in x for x in log), log
+    print("[selftest OK] _units._normalize_event_refs / _fill_initial_db_triggers / _fix_message_codes")
+
+
+if __name__ == "__main__":
+    _selftest_initial_values()
+    _selftest_compose_facts()
