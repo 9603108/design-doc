@@ -29,7 +29,10 @@ from pathlib import Path
 # TSX の文字列: 引用符の文字列 / テンプレート(${…} は定数部だけ残す) / JSX の文言(タグの間の字面)
 _QUOTED = re.compile(r'"((?:[^"\\\n]|\\.)*)"|\'((?:[^\'\\\n]|\\.)*)\'')
 _TEMPLATE = re.compile(r"`([^`]*)`")
-_JSX_TEXT = re.compile(r">([^<>{}]+)<")
+# WHY: JSX の文の途中の式({shops.length} など)は実行時の値なので、文の中の {…} は取った文言の中に残す(穴として照合する)
+_JSX_TEXT = re.compile(r">((?:[^<>{}]|\{[^{}]*\})+)<")
+# WHY: 強調・コードなどのインライン要素は文の途中に入るが、文は1つなので、照合用にはタグを外す
+_INLINE_TAG = re.compile(r"</?(?:strong|em|b|i|code|span|small|a|kbd)\b[^>]*>")
 _HOLE = re.compile(r"\{[^{}\s]+\}")
 
 
@@ -63,6 +66,8 @@ def collect_source_strings(files):
             for m in _TEMPLATE.finditer(text):
                 out.update(norm(p) for p in re.split(r"\$\{[^}]*\}", m.group(1)))
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(text))
+            # WHY: <strong>や<code>の境界で文が切れている(「<strong>取込欠損の疑い</strong>：…」)ので、インライン要素のタグを外した版からも文を取る
+            out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(_INLINE_TAG.sub("", text)))
     out.discard("")
     return out
 
@@ -120,10 +125,22 @@ def check_messages(data, strings):
     return problems
 
 
+_EX_NUMBER = re.compile(r"[0-9０-９][0-9０-９,.，．]*")
+
+
+def _example_in_source(text, strings):
+    """S1 の例示値が、ソースの文字列に実在するか。数字の並び(金額・件数・日付)は実行時の値なので穴 {_} にしてから _in_source で見る。
+    単位・記号・固有の語は字面のまま照合する。
+    WHY: 例示値は実データの一例で、書式に合う数字まで字面で照合すると、正しい書式の例示が WARN になる(POS 会計レポートの S1 で発生)。
+    呼出元: check_examples(verify_partials.check_examples も同じ関数を呼ぶので、両検査の基準は揃う)。"""
+    # WHY: 「3 点 / 4,500 円」のように区切った例示は、区切りごとに別々に照合する。画面では点と円が別のセルに出るので、ソースも別々の文字列を持つ
+    return all(_in_source(_EX_NUMBER.sub("{_}", part), strings) for part in norm(text).split(" / "))
+
+
 def check_examples(items, strings):
     """S1 の screen_layout.items[].example が、ソースの文字列に実在するか(D1 後半)。"""
     return [f"[WARN] [例示値] screen_layout.items[{i.get('item_name')}]: example「{i['example']}」がソースの文字列に無い → 差し戻し先 S1"
-            for i in items if isinstance(i, dict) and i.get("example") and not _in_source(norm(str(i["example"])), strings)]
+            for i in items if isinstance(i, dict) and i.get("example") and not _example_in_source(norm(str(i["example"])), strings)]
 
 
 def _name_variants(names):
@@ -157,7 +174,12 @@ def check_calcs(calcs, candidates):
         for w in ("四捨五入", "切り上げ", "切上"):
             if w in words and not {"Math.round", "Math.ceil"} & set(cand.get("funcs", [])):
                 problems.append(f"[WARN] [式] {where}: 「{w}」はソースの式に無い → 差し戻し先 H4")
-        for n in re.findall(r"\d+(?:\.\d+)?", re.sub(r"[（(][^）)]*[）)]", "", c.get("formula") or "")):
+        # WHY: 入力の名前(例 合計2(支払科目計))の数字は列の名前で、式の定数ではない。名前を外してから数字を見る
+        body = c.get("formula") or ""
+        for i in c.get("inputs") or []:
+            if i.get("name"):
+                body = body.replace(i["name"], "")
+        for n in re.findall(r"\d+(?:\.\d+)?", re.sub(r"[（(][^）)]*[）)]", "", body)):
             if n not in (cand.get("literals") or []):
                 problems.append(f"[WARN] [式] {where}: 式の数字 {n} がソースの定数 {cand.get('literals')} に無い → 差し戻し先 H4")
     problems += [f"[WARN] [式の漏れ] calc_candidates[{k['id']}]「{k.get('label')}」: ソースの式 {k['expr']} に対の calculations が無い → 差し戻し先 H4"
@@ -222,7 +244,9 @@ def check_kinds(validations, front_processes, behaviors):
         if want is None:
             continue
         text = " ".join(str(v.get(k) or "") for k in ("field", "rule", "applied_when"))
-        got = {b["kind"] for b in behaviors if (len(b.get("target") or "") >= 2 and b["target"] in text) or (b.get("cond") and b["cond"] in text)}
+        # WHY: 同じ行範囲で対になる behavior(src が重なる)を先に使う。字面(cond の一部の語)で拾うと、同じ語を含む別の表示用の行を誤って対にする(POS の VL5 は「s.dead」で表示用の行に当たった)
+        by_src = {b["kind"] for b in behaviors if _overlap(v.get("src"), b["src"] + b.get("control_src", []))}
+        got = by_src or {b["kind"] for b in behaviors if (len(b.get("target") or "") >= 2 and b["target"] in text) or (b.get("cond") and b["cond"] in text)}
         where = f"validations[{v.get('no') or v.get('field')}]"
         if want == "input_check" and not has_input:
             problems.append(f"[種別] {where}: kind=入力検査 だが画面のソースに入力検査(setError・throw・required 等)が無い → 差し戻し先 H4")
@@ -341,6 +365,10 @@ def check_boundaries(validations, api_spec, apis, common_errors):
     return problems
 
 
+# WHY: SQL の関数の形(name( ))。日本語の説明の式と、SQL の式を区別するために使う
+_SQL_CALL = re.compile(r"\b[A-Za-z_]+\s*\(")
+
+
 def _sq(s):
     """SQL の式の字面を比べる形にする(小文字・::型・表の接頭辞・空白を除く)。呼出元: check_backend_facts。"""
     s = re.sub(r"::\w+", "", str(s or "").lower())
@@ -363,7 +391,7 @@ def _code_for_status(status, common_errors):
 def check_backend_facts(data, apis, common_errors):
     """設計書(data)を backend 下書きの事実(apis[action].db_operations の columns・ctes・subqueries・aggregate_units と common_errors)と突き合わせる(ERROR)。
     [別名]: 物理列として書いた名前が SQL の別名(実列に無い) / 集計の別名が null なのにソースは AS を持つ。差し戻し先 H2
-    [式]: api_spec の response_items[].expression が実 SQL の式と食い違う。差し戻し先 S2
+    [式]: api_spec の response_items[].expression が実 SQL の式と食い違う(SQL の関数の形を持つ式だけ比べる。日本語の説明は言い換えを許すので見ない)。差し戻し先 S2
     [CTE]: ソースに CTE が無いのに CTE と書く / 定義が空の CTE を参照 / 絞り込みのある CTE を空・条件なしと書く / 本体の集計と書いた別名が CTE の集計。差し戻し先 S2・H2
     [副問合せ]: 別名の無い集計が副問合せの中の集計なのに本体の集計(aggregate)として書いてある。差し戻し先 H2
     [集計単位]: count の説明の「日数」が、数える単位(GROUP BY)に日付の列が無い・日付以外の列も含むのと合わない(WARN)。差し戻し先 S2
@@ -419,7 +447,8 @@ def check_backend_facts(data, apis, common_errors):
         cols = {c.get("alias"): c for d in ops.get(a.get("action")) or [] for c in d.get("columns") or [] if c.get("is_expression")}
         for r in a.get("response_items") or []:
             c = cols.get(str(r.get("key")).rsplit(".", 1)[-1])
-            if c and r.get("expression"):
+            # WHY: 日本語の説明(例 期間内の総売上を合計して整数にする)は言い換えを許すので字面では比べない。SQL の関数の形を持つ式だけ比べる
+            if c and r.get("expression") and _SQL_CALL.search(str(r["expression"])):
                 x, y = _sq_head(r["expression"]), _sq_head(c["expression"])
                 fx, fy = set(re.findall(r"[a-z_]+(?=\()", x)), set(re.findall(r"[a-z_]+(?=\()", y))
                 # 関数の名前が全部実 SQL にあれば、引数の細部(CASE の展開・外側の array_remove 等)は字面で比べない
@@ -642,8 +671,43 @@ def selftest():
         assert len(check_messages(bad, s)) == 1 and check_messages(bad, s)[0].startswith("[WARN] [文言]")
         det = {"event_processes": [{"event_code": "EV1", "details": ["画面に「- 全店 -」と出す", "「作り話」と出す"]}]}
         assert len(check_messages(det, s)) == 1
-        assert check_examples([{"item_name": "店舗", "example": "- 全店 -"}, {"item_name": "日付", "example": "2026-10-01"}], s) == [
-            "[WARN] [例示値] screen_layout.items[日付]: example「2026-10-01」がソースの文字列に無い → 差し戻し先 S1"]
+        assert check_examples([{"item_name": "店舗", "example": "- 全店 -"}, {"item_name": "日付", "example": "2026-10-01"}], s) == [], "日付の書式の実値は通す"
+        assert check_examples([{"item_name": "店名", "example": "作り話の店 3 件"}], s) == [
+            "[WARN] [例示値] screen_layout.items[店名]: example「作り話の店 3 件」がソースの文字列に無い → 差し戻し先 S1"]
+    # S1 の例示値: 数字の並び(日付・金額)は実行時の値として穴扱い。字面の語(店名など)がソースに無ければ WARN
+    assert check_examples([{"item_name": "日付", "example": "2026-10-14"}], s) == []
+    assert check_examples([{"item_name": "店舗", "example": "- 全店 - 2 件"}], s) == []
+    got = check_examples([{"item_name": "店舗", "example": "作り話の店 2 件"}], s)
+    assert len(got) == 1 and got[0].startswith("[WARN] [例示値]"), got
+    # S2 の式: 日本語の説明は字面で比べない(SQL の関数の形の式は従来どおり比べる)
+    prose = {"api_spec": [{"action": "act", "response_items": [{"key": "rows[].first_date", "expression": "期間内の最小の会計日"}]}]}
+    assert check_backend_facts(prose, bapis, ces) == [], check_backend_facts(prose, bapis, ces)
+    # H4 の式: 列の名前(合計2(支払科目計))の数字は定数ではない。式の中の定数 3 は WARN
+    cc = [{"id": "CC09", "label": "支払科目に無い額", "expr": "r.s - r.t", "operands": ["s", "t"], "funcs": [], "literals": [],
+           "operand_labels": {"s": ["小計（税込売上金額）"], "t": ["合計2(支払科目計)"]}}]
+    dd = [{"name": "支払科目に無い額", "formula": "支払科目に無い額 = 小計（税込売上金額） − 合計2(支払科目計)",
+           "inputs": [{"name": "小計（税込売上金額）"}, {"name": "合計2(支払科目計)"}]}]
+    assert check_calcs(dd, cc) == [], check_calcs(dd, cc)
+    cc2 = [{"id": "CC09", "label": "支払科目に無い額", "expr": "r.s * 3", "operands": ["s"], "funcs": [], "literals": [],
+            "operand_labels": {"s": ["小計（税込売上金額）"]}}]
+    got = check_calcs([{"name": "支払科目に無い額", "formula": "支払科目に無い額 = 小計（税込売上金額） × 3", "inputs": [{"name": "小計（税込売上金額）"}]}], cc2)
+    assert len(got) == 1 and "式の数字 3" in got[0], got
+    # VL5: 同じ行範囲の対(124 の data_filter)を先に使う。src が無いときは字面で対を探す(従来どおり表示用の行に当たる)
+    bh = [{"id": "BH01", "kind": "display_toggle", "cond": "s.dead", "target": "空", "src": sp(132), "control_src": []},
+          {"id": "BH10", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)}]
+    vl = {"no": "VL9", "field": "空欄項目も表示", "rule": "表示の絞り込み: 空欄項目(s.dead)を表示対象から外す", "kind": "絞り込み"}
+    assert check_kinds([dict(vl, src=sp(123, 124) + sp(276))], [], bh) == []
+    assert len(check_kinds([vl], [], bh)) == 1
+    # S1 の例示: 区切り(" / ")ごとに照合する。インライン要素(strong)と JSX の式({…})で切れた文も、タグを外せば照合できる
+    assert _example_in_source("3 点 / 4,500 円", s)
+    with tempfile.TemporaryDirectory() as d:
+        tsx = Path(d, "N.tsx")
+        tsx.write_text("<p>\n  <strong>取込欠損の疑い</strong>：この期間に、上書きされた疑いのある日があります。\n</p>\n"
+                       "<p>\n  POSがあるのは\n  {shops.length}店だけなので\n</p>\n", encoding="utf-8")
+        ss = collect_source_strings([tsx])
+        assert _example_in_source("取込欠損の疑い：この期間に、上書きされた疑いのある日があります。", ss), ss
+        assert _example_in_source("POSがあるのは10店だけなので", ss), ss
+        assert not _example_in_source("作り話の文は10店だけなので", ss)
     print("selftest OK")
     return 0
 
