@@ -512,6 +512,58 @@ def _expand(errs, fn, clo):
     return out
 
 
+def _order_errors(errs, fn, clo):
+    """API の error_patterns を、API の関数の中の実行順に並べ直す(MSE の採番より前に呼ぶ)。
+    キー: 出典が fn の中の行ならその行。補助関数の中の行なら、fn の中でその補助関数へ届く呼出の行(間接の呼出も辿る)。
+    同じ補助関数を引数だけ変えて何度も呼ぶときは、実引数の定数が e["param"] に一致する呼出を使う(from と to を取り違えない)。
+    取れないものは末尾に元の順で置く(sorted は安定)。
+    なぜ要るか: 下書きの error_patterns は関数の走査順で並ぶので、実行順(検査の順・画面の並び)と合わない。
+    呼出元: extract()(apis に入れる直前)。ponytail: 呼出は関数名の一致で拾う(_expand と同じ前提)。"""
+
+    def func_at(file, line):
+        hit = [f for m, f in clo if str(m.path) == file and f.lineno <= line <= f.end_lineno]
+        return min(hit, key=lambda f: f.end_lineno - f.lineno) if hit else None
+
+    def reaches(src, target):
+        seen, todo = set(), [src]
+        while todo:
+            g = todo.pop()
+            if g is target:
+                return True
+            if id(g) in seen:
+                continue
+            seen.add(id(g))
+            names = {_call_name(c) for c in ast.walk(g) if isinstance(c, ast.Call)}
+            todo.extend(f for _, f in clo if f.name in names)
+        return False
+
+    def call_line(target, prm):
+        hits = []  # (実引数に prm の定数があるか, 呼出の行)
+        for c in ast.walk(fn):
+            if not isinstance(c, ast.Call):
+                continue
+            if not any(reaches(f, target) for _, f in clo if f is not fn and f.name == _call_name(c)):
+                continue
+            args = list(c.args) + [k.value for k in c.keywords]
+            hits.append((bool(prm) and any(isinstance(a, ast.Constant) and a.value == prm for a in args), c.lineno))
+        if not hits:
+            return None
+        same = [ln for ok, ln in hits if ok]
+        return min(same or [ln for _, ln in hits])
+
+    def key(e):
+        ks = []
+        for s in e.get("src") or []:
+            f = func_at(s["file"], s["line_start"])
+            if f is not None:
+                ks.append(s["line_start"] if f is fn else call_line(f, e.get("param") or ""))
+        ks = [k for k in ks if k is not None]
+        return min(ks) if ks else None
+
+    keyed = [(key(e), i, e) for i, e in enumerate(errs)]
+    return [e for _, _, e in sorted(keyed, key=lambda t: (t[0] is None, t[0] or 0, t[1]))]
+
+
 def _auth(mods, tables):
     """入口の関数(ディスパッチ表の名前を参照する関数)が、表を引く前に呼ぶ認証の関数を拾い、その応答の文面を返す(status は静的に取れなければ空)。
     ponytail: 入口は表の名前の参照で、認証は _AUTH_CALL の名前一致で近似する。外れたら推測で埋めず空のままにする。"""
@@ -1248,6 +1300,7 @@ def extract(files, hints=None):
                     op["id"] = f"db_op_{action}" + (f"_{i}" if len(ops) > 1 else "")
                     for no, c in enumerate(op["columns"], 1):
                         c["no"] = no
+                errors = _order_errors(errors, fn, clo)  # 実行順に並べてから MSE を採番する(新4)。並びは下の ids の採番より前
                 apis[action] = {"dataset": dataset, "src": [_src(tm, fn)],
                                 "response_items": [{"key": key, "src": s} for key, s in keys.items()],
                                 "error_patterns": errors, "boundaries": _boundaries(errors, clo, fn), **clauses,
@@ -1457,6 +1510,28 @@ def selftest():
                                       {"code": "internal_error", "message": "f'{type(e).__name__}: {e}'"}]}])[0]["errors"]
     assert [(x["code_from"], x["code_default"], x["message_from"]) for x in ce] == [
         ("exception_attr:code", "validation_error", "exception_message"), ("literal", "internal_error", "exception_type_and_message")], ce
+    # 新4: error_patterns は API の関数の中の実行順。補助関数の文面は、その補助を呼ぶ行で並べ、同じ補助を引数だけ変えて呼ぶときは実引数で選ぶ
+    oc = ('class ValidationError(Exception):\n    pass\n'
+          'def _req(p, k):\n    if not p.get(k):\n        raise ValidationError(f"{k} は必須")\n    return p[k]\n'
+          'def _shop(p):\n    if not p.get("shop_id"):\n        raise ValidationError("店舗が違う")\n    return p["shop_id"]\n'
+          'def act(p):\n    _shop(p)\n    _req(p, "to")\n    _req(p, "from")\n    if p.get("x") == 0:\n        raise ValidationError("直接")\n    return {"x": 1}\n'
+          'T = {"act": act}\n')
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "o.py").write_text(oc, encoding="utf-8")
+        om = Module(Path(d) / "o.py")
+        ofn = om.funcs["act"]
+        olines = oc.split("\n")
+        oline = lambda s: next(i for i, t in enumerate(olines, 1) if s in t)
+        osrc = lambda s: [{"file": str(om.path), "line_start": oline(s), "line_end": oline(s)}]
+        rev = [{"message": "直接", "src": osrc('raise ValidationError("直接")'), "param": ""},
+               {"message": "from は必須", "src": osrc("{k} は必須"), "param": "from"},
+               {"message": "to は必須", "src": osrc("{k} は必須"), "param": "to"},
+               {"message": "店舗が違う", "src": osrc('raise ValidationError("店舗が違う")'), "param": ""}]
+        got = [e["message"] for e in _order_errors(rev, ofn, _closure(om, ofn, {}))]
+        assert got == ["店舗が違う", "to は必須", "from は必須", "直接"], got
+        eps = extract([Path(d) / "o.py"])["apis"]["act"]["error_patterns"]
+        assert [e["text_expanded"] for e in eps] == ["店舗が違う", "to は必須", "from は必須", "直接"], eps
+        assert [e["id"] for e in eps] == ["MSE00001", "MSE00002", "MSE00003", "MSE00004"], eps
     print("[selftest OK] extract_backend_draft")
     return 0
 
