@@ -243,7 +243,7 @@ def build_front_processes(event_processes: list, events: list, initialization: d
                     {"group_kind": "auto", "group_category": "画面表示時", "trigger_no": 1}
                 ],
                 # B9 c: 取得の開始時・失敗時の事実(EV00 の failure_effects)を backend_call の前後に入れてから番号を振る
-                "steps": _renumber_init_steps(_with_init_fact_steps(_with_fetch_order(ip.get("steps", []) or []), _ev00_failure_effects())),
+                "steps": _renumber_init_steps(_with_init_fact_steps(_with_fetch_order(ip.get("steps", []) or []), _ev00_failure_effects(), _fetch_mode())),
                 "validation_refs": [],
                 "calculation_refs": [],
                 "common_logic_refs": [],
@@ -343,6 +343,19 @@ def _build_initial_process_overview(ip: dict) -> str:
     return name
 
 
+def _fetch_mode():
+    """react 下書き events[0].fetch_plan.mode(parallel・serial・single)を返す。下書きが無い・読めないときは None。
+    WHY: 並行の並び替え(_with_init_fact_steps)が読む。読み元は _with_fetch_order と同じ下書き1本。"""
+    draft = INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"
+    if not draft.exists():
+        return None
+    try:
+        plan = ((json.loads(draft.read_text(encoding="utf-8")).get("events") or [{}])[0]).get("fetch_plan")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (plan or {}).get("mode")
+
+
 def _with_fetch_order(steps: list) -> list:
     """初期処理の steps に、取得の順(react 下書き events[0].fetch_plan.mode)の1行が無ければ足した写しを返す。
 
@@ -387,13 +400,17 @@ def _ev00_failure_effects() -> list:
     return [f for f in (data.get("failure_effects") or []) if isinstance(f, dict) and f.get("event") == "EV00"]
 
 
-def _with_init_fact_steps(steps: list, ev00_failures: list) -> list:
-    """初期処理の steps の各 backend_call の前後に、EV00 の事実の行(開始時・失敗時)を state_update の step として足した写しを返す。
+def _with_init_fact_steps(steps: list, ev00_failures: list, mode=None) -> list:
+    """初期処理の steps の各 backend_call の前後に、EV00 の事実の行を state_update の step として足した写しを返す。
 
     WHY: EV00 は apply_react_draft(B6)が強制しない(EV00 以外が対象)ため、初期処理の取得の事実はここで入れる。
     対応: EV00 の failure_effects(1件 = 1回の取得、ソース順)と、steps の backend_call(出現順)を1対1で取る。
           件数が合わなければ何もしない(推測で対応させない)。
-    位置: 開始時は呼出の前、失敗時は呼出の後。同じ趣旨の step が既にあれば足さない(extract_react_draft._FACT_MATCH の語で判定)。
+    位置: 開始時は呼出の前、成功時と失敗時は呼出の後(成功、失敗の順)。同じ趣旨の step が既にあれば足さない(extract_react_draft._FACT_MATCH の語で判定)。
+          成功時の行は、後で migrate_v48_to_v49 が呼出の直後に入れる response_mapping の後ろに来る。
+    並行(mode == "parallel")のとき: 並びを「前置き・開始時1・呼出1・開始時2・呼出2・…・応答側1・応答側2」に直す。
+          WHY: 並行の取得は先の応答を待たずに次の呼出を出す。応答側を呼出の間に挟むと、後の呼出が応答の処理の後に見えてしまうため。
+          応答側 = 呼出の後から次の呼出の開始時の直前まで(最後の呼出は末尾まで)。serial・mode なしは従来どおり。
     文面: extract_react_draft._event_facts と同じ文を使う(下書き側と文が割れないように)。state 名は下書きのまま(画面項目名への言い換えは無い)。
     """
     idx = [i for i, s in enumerate(steps) if s.get("kind") == "backend_call" or s.get("backend_call")]
@@ -404,21 +421,35 @@ def _with_init_fact_steps(steps: list, ev00_failures: list) -> list:
     texts = {}  # (取得の番号, key) → 文
     for k, fe in enumerate(ev00_failures):
         for f in _event_facts({"empty": []}, [fe], {}):
-            if f["key"] in ("start", "failure"):
+            if f["key"] in ("start", "success", "failure"):
                 texts[(k, f["key"])] = f["text"]
 
     def _present(key: str) -> bool:
         return any(m in str(s.get("description") or "") for s in steps for m in _FACT_MATCH[key])
 
+    def _fact(k: int, key: str):
+        t = texts.get((k, key))
+        return {"kind": "state_update", "description": t} if t and not _present(key) else None
+
     pos = {i: k for k, i in enumerate(idx)}
-    out = []
+    pre = []     # 最初の呼出より前の step
+    blocks = []  # [開始時の行(0か1件), 呼出の step, 応答側(成功・失敗の行と、後続の step)]
     for i, s in enumerate(steps):
         k = pos.get(i)
-        if k is not None and texts.get((k, "start")) and not _present("start"):
-            out.append({"kind": "state_update", "description": texts[(k, "start")]})
-        out.append(dict(s))
-        if k is not None and texts.get((k, "failure")) and not _present("failure"):
-            out.append({"kind": "state_update", "description": texts[(k, "failure")]})
+        if k is None:
+            (blocks[-1][2] if blocks else pre).append(dict(s))
+            continue
+        head = [x for x in [_fact(k, "start")] if x]
+        tail = [x for x in [_fact(k, "success"), _fact(k, "failure")] if x]
+        blocks.append([head, dict(s), tail])
+
+    out = list(pre)
+    if mode == "parallel":
+        out += [x for head, call, _tail in blocks for x in head + [call]]
+        out += [x for _head, _call, tail in blocks for x in tail]
+    else:
+        for head, call, tail in blocks:
+            out += head + [call] + tail
     return out
 
 
@@ -1099,13 +1130,31 @@ def selftest() -> int:
           "failure_text": "String(e)", "failure_state": "error", "src": [{"file": "x", "line_start": 1, "line_end": 1}]}
     base = [{"kind": "backend_call", "description": "店舗一覧を取得する", "backend_call": {"backend_id": "B001"}}]
     out = _with_init_fact_steps(base, [fe])
-    assert [s["kind"] for s in out] == ["state_update", "backend_call", "state_update"], out
-    assert "取得の開始時に" in out[0]["description"] and "取得に失敗したときは" in out[2]["description"], out
+    assert [s["kind"] for s in out] == ["state_update", "backend_call", "state_update", "state_update"], out
+    assert "取得の開始時に" in out[0]["description"] and "取得に成功したときは" in out[2]["description"] \
+        and "取得に失敗したときは" in out[3]["description"], out
     assert _with_init_fact_steps(base, []) == base
     assert _with_init_fact_steps(base, [fe, fe]) == base
     # 既に同じ趣旨の文があれば足さない
     pre = [{"kind": "state_update", "description": "取得の開始時に、loading を true にする"}] + base
-    assert len(_with_init_fact_steps(pre, [fe])) == 3
+    assert len(_with_init_fact_steps(pre, [fe])) == 4
+    # N7: 並行は「開始時・呼出」を先に全部出し、応答側(成功・失敗・後続の step)を後ろにまとめる。順(serial)は従来どおり
+    fe2 = dict(fe, call="load2", on_success=["shops"], on_failure=["error2"])
+    two = [{"kind": "backend_call", "description": "店舗一覧を取得する", "backend_call": {"backend_id": "B001"}},
+           {"kind": "state_update", "description": "店舗の応答を画面に反映する"},
+           {"kind": "backend_call", "description": "会計レポートを取得する", "backend_call": {"backend_id": "B002"}},
+           {"kind": "state_update", "description": "会計レポートの応答を表示する"}]
+    par = _with_init_fact_steps(two, [fe, fe2], "parallel")
+    assert len(par) == 10 and [i for i, s in enumerate(par) if s["kind"] == "backend_call"] == [1, 3], par
+    assert "取得の開始時" in par[0]["description"] and "取得の開始時" in par[2]["description"], par
+    assert "取得に成功" in par[4]["description"] and "取得に失敗" in par[5]["description"], par
+    assert par[6]["description"] == "店舗の応答を画面に反映する" and "取得に成功" in par[7]["description"], par
+    assert par[9]["description"] == "会計レポートの応答を表示する", par
+    ser = _with_init_fact_steps(two, [fe, fe2], "serial")
+    assert [i for i, s in enumerate(ser) if s["kind"] == "backend_call"] == [1, 6], ser
+    assert ser[2]["description"].startswith("取得に成功") and ser[3]["description"].startswith("取得に失敗") \
+        and ser[4]["description"] == "店舗の応答を画面に反映する", ser
+    assert _with_init_fact_steps(two, [fe], "parallel") == two
     print("[selftest OK] migrate_v17_to_v18.step_kind")
     print("[selftest OK] migrate_v17_to_v18.db_op_detail_ctes")
     print("[selftest OK] migrate_v17_to_v18.init_fact_steps")
