@@ -200,8 +200,15 @@ def check_h2_columns(h2, draft):
     同じ元列に別名が複数つく列(first_date・last_date がどちらも kai_date)は、別名の数だけ dataset の行が要る。
     1行にまとめれば、足りない別名を挙げて ERROR にする(run4 で first_date・last_date が欠けた)。
     logical_names は「同じ表・同じ列は1行にまとめてよい」ので、物理名が1つあれば足りる。
+    別名の行(alias_only)の書き方は physical_column 空・alias_name つき(dataset・logical_names とも)。
+    別名を physical_column に書いた・logical_names が alias_name を落とした行は、合成と同じ機械の直し(_compose_db_facts.restore_alias_rows)を
+    写しに当ててから数える(verify_vs_source の [別名] とは、直した形で食い違わない)。
     呼出元: check_unit_extras。"""
+    import copy
     from collections import Counter
+    import _compose_db_facts
+    h2 = copy.deepcopy(h2)  # 検査は断片を書き換えない
+    _compose_db_facts.restore_alias_rows(h2, [draft])
 
     def accepted(c):  # この列の照合名として H2 に書いてよい名前
         # WHY: alias_only の列は物理列が無く、手順書どおり H2 は別名を alias_name に書いて physical_column を空にする。
@@ -743,6 +750,22 @@ def selftest_units():
     h2a["logical_names"] = []
     out = check_h2_columns(h2a, draft_alias)
     assert len(out) == 2 and all("H2 に無い: shop_name" in p for p in out), out
+    # R14: 別名の行の書き方は physical_column 空・alias_name つき。書き方の揺れは合成と同じ機械の直しで受ける。
+    # (1) logical_names が alias_name を落とした(run13)→ dataset の同じ(物理表, 論理列)から補って通す
+    row_a = {"physical_table": "shops", "logical_column": "店舗名称(推定)"}
+    h2a["db_operations"][0]["dataset"] = [dict(row_a, physical_column="", alias_name="shop_name")]
+    h2a["logical_names"] = [dict(row_a, physical_column="")]
+    assert check_h2_columns(h2a, draft_alias) == [], check_h2_columns(h2a, draft_alias)
+    assert "alias_name" not in h2a["logical_names"][0], "検査が断片を書き換えた"
+    # (2) 別名を physical_column に書いた(古い書き方)→ 別名として数えて通す(verify_vs_source の [別名] に残らない形へ合成が直す)
+    h2a["db_operations"][0]["dataset"] = [dict(row_a, physical_column="shop_name")]
+    h2a["logical_names"] = [dict(row_a, physical_column="shop_name")]
+    assert check_h2_columns(h2a, draft_alias) == [], check_h2_columns(h2a, draft_alias)
+    # (3) logical_names の行が alias_name を落とし、dataset にも対応する行が無ければ、欠けとして出す(推測で補わない)
+    h2a["db_operations"][0]["dataset"] = [dict(row_a, physical_column="", alias_name="shop_name")]
+    h2a["logical_names"] = [{"physical_table": "shops", "logical_column": "別の名前", "physical_column": ""}]
+    out = check_h2_columns(h2a, draft_alias)
+    assert len(out) == 1 and out[0].startswith("[列の省略] logical_names") and "H2 に無い: shop_name" in out[0], out
     # 下書きの集計・ウィンドウの別名が H2 の aggregate に無ければ ERROR(C4)
     draft3 = {"apis": {"save": {"features": {"aggregates": [{"alias": "total"}], "windows": [{"alias": "nz"}]}}}}
     h2f = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"}, "aggregate": [{"alias": "total"}]}]}

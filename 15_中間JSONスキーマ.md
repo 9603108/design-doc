@@ -184,6 +184,7 @@
 ```
 
 - `physical_table` ごとに列を網羅。
+- `alias_name`（任意）: SQL の式の別名（下書きで `kind` が `alias_only` の列）の行に付ける。その行は `physical_column` を空にし、別名を `alias_name` で示す（`days`・`first_date` 等を `physical_column` に書かない）。`db_operations[].dataset[]` の同じ別名の行も同じ書き方。実列の行は省いてよい。物理列が1つに決まる別名は、合成（`_compose_db_facts.py`）が `physical_column` を補い `derived` を付ける。
 - `derived`（任意、true）: 合成（`_compose_db_facts.py`）が補った行を示す。`apply_logical_name_substitution.py` は `derived: true` の行を置換の表に使わない（first_date・last_date が kai_date を指すだけの行で、本文の kai_date が誤って置換されるのを防ぐ）。
 - project_config の `logical_name_sources` に定義した資料に名称があればそれを優先（rank A の資料が最優先。詳細は 10_論理名変換.md）。
 - 上のサンプルの「顧客マスタ」「顧客コード」は、project_config の `naming.legacy_system` が既定（null）のときの値の例。`naming.legacy_system` を設定した案件では、その `master_suffix`・`code_suffix` に従った論理名になる（規則は 10_論理名変換.md。以降のサンプルも同じ）。
@@ -739,6 +740,7 @@ INSERT/UPDATE/DELETE の場合:
 - `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
 - `where[].when`（任意、文字列）: その条件が分岐で付く・外れるときの条件（例: `shop_id が指定されたとき`）。`where[].text`（任意）は条件の字面で、合成が `when` を付けるときの照合に使う。
 - `ctes[].conditional_parts[{sql, when}]`（任意）: CTE の中の条件付きの断片。`definition` には無条件の部分だけを残す。`db_operations[].table_aliases{別名: 実表}`（任意）は、`joins[].condition` の「別名.列」を実表・論理表へ解決するための対応表。
+- `dataset[].alias_name`（任意）: SQL の別名。式の別名（`kind` が `alias_only`）の行は `physical_column` を空にして `alias_name` に別名を書く（`logical_names[]` の同じ別名の行と同じ書き方）。
 - `dataset[].alias_expression`（任意）: 物理列が1つに決まらない式（`count(*)` 等）の表示用の式。`physical_column` が空のとき、docx は「論理名[式 …]」と出す。
 - `transaction`: INSERT/UPDATE/DELETE は必ず `true`
 - `operation_type` ごとに必要なフィールドが変わる（上記の通り）

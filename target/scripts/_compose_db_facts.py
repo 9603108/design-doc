@@ -56,6 +56,55 @@ def _column_of(table, sources):
     return next(iter(cols)) if len(cols) == 1 else None
 
 
+def _alias_facts(drafts):
+    """下書き(複数可)の columns から ({式の別名: 式}, 実列の名前の集合) を返す。verify_vs_source.check_backend_facts の [別名] と同じ定義。"""
+    alias_only, real = {}, set()
+    for d in drafts:
+        for api in (d.get("apis") or {}).values():  # fallback-ok: 下書きの欄は任意
+            for dop in api.get("db_operations") or []:  # fallback-ok: 同上
+                for c in dop.get("columns") or []:  # fallback-ok: 同上
+                    if c.get("kind") == "alias_only" and c.get("alias_name"):
+                        alias_only.setdefault(c["alias_name"], c.get("alias_expression") or c.get("expression"))  # fallback-ok: 式は表示用
+                    real.update(s.rsplit(".", 1)[-1] for s in [c.get("real_column")] + list(c.get("source_columns") or []) if s)  # fallback-ok: 式の列は実列が無い
+    return alias_only, real
+
+
+def restore_alias_rows(h2, drafts, log=None):
+    """H2 の別名の行(下書きで kind=alias_only の列)を、決まった書き方(physical_column 空・alias_name に別名)へ機械で直す。件数を返す。
+    (1) dataset・logical_names の physical_column が SQL の別名(実列に無い)なら、alias_name にして physical_column を空にする。
+    (2) logical_names の行で physical_column が空・alias_name が無いものは、dataset の同じ(物理表, 論理列)の行の alias_name を写す(1つに決まるときだけ)。
+    WHY: 手順書は alias_only の行を physical_column 空・alias_name つきと定める。モデルが logical_names で alias_name を落とす・別名を物理列に書く
+         揺れがあり、verify_partials の [列の省略] と verify_vs_source の [別名] が逆向きに止めた(run13)。同じ事実から機械で直せるので、直した形を検査と合成の両方が見る。
+    呼出元: _compose_db(合成の先頭)・verify_partials.check_h2_columns(写しに対して)。drafts は下書きの全体(apis を持つ辞書)の並び。"""
+    alias_only, real = _alias_facts(drafts)
+    ds = [r for o in h2.get("db_operations") or [] if isinstance(o, dict) for r in o.get("dataset") or [] if isinstance(r, dict)]  # fallback-ok: 任意の欄
+    lns = [r for r in h2.get("logical_names") or [] if isinstance(r, dict)]  # fallback-ok: 任意の欄
+    n = 0
+    for r in ds + lns:
+        pc = r.get("physical_column")
+        if pc in alias_only and pc not in real:  # 実列でもある名前(amount 等)は別名と見なさない
+            if not r.get("alias_name"):
+                r["alias_name"] = pc
+            r["physical_column"] = ""
+            n += 1
+            if log is not None:
+                log.append(f"INFO _compose_db_facts: physical_column「{pc}」は SQL の別名なので alias_name へ移す")
+    by_key = {}
+    for r in ds:
+        if r.get("alias_name") and not r.get("physical_column"):
+            by_key.setdefault((r.get("physical_table"), r.get("logical_column")), set()).add(r["alias_name"])
+    for r in lns:
+        if r.get("alias_name") or r.get("physical_column"):
+            continue
+        al = by_key.get((r.get("physical_table"), r.get("logical_column")), set())  # fallback-ok: 対応する dataset の行が無ければ触らない
+        if len(al) == 1:
+            r["alias_name"] = next(iter(al))
+            n += 1
+            if log is not None:
+                log.append(f"INFO _compose_db_facts: logical_names {r.get('physical_table')}「{r.get('logical_column')}」に alias_name {r['alias_name']} を補う")
+    return n
+
+
 def _fill_physical(out, pairs, log):
     """物理列の空欄を、下書きの列(別名の一致)の source_columns から補う。決まらない行は alias_expression を入れる。
     WHY: 式(min(p.kai_date) 等)でも、元の表の列が1つに決まるなら物理列は分かる。count(*) のように決まらないものは式で示す。"""
@@ -397,6 +446,7 @@ def _compose_db(out, drafts, log):
         drafts_of[id(op)] = (dop, a)
         if dop:
             pairs.append((op, dop, a))
+    restore_alias_rows(out, drafts, log)            # a0) 別名の行の形(physical_column 空・alias_name つき)。a) が alias_name で補うので先に直す
     _fill_physical(out, pairs, log)                 # a) 物理列の空欄
     for op, dop, a in pairs:                        # e) where の when
         _fill_when(op, a)
@@ -674,6 +724,38 @@ def selftest():
     print("[selftest OK] _compose_db_facts V4 (別名の表が違う行は下書き列の表へ付け替える・論理表が無い・候補が割れるときは触らない)")
     print("[selftest OK] _compose_db_facts 番号振りの後の id でも同じ事実(legacy_id・action で結ぶ)")
     print("[selftest OK] _compose_db_facts F2 (副問い合わせの集計を外す・主の集計は残す)")
+    # R14: 別名の行の形を機械で直す。(1) physical_column に別名を書いた行 → alias_name へ移す(実列でもある名前は別名と見なさない)
+    #      (2) logical_names が alias_name を落とした行 → dataset の同じ(物理表, 論理列)の alias_name を写す(1つに決まるときだけ)
+    r14_dr = [{"apis": {"a": {"db_operations": [{"id": "x", "columns": [
+        {"alias_name": "days", "kind": "alias_only", "real_column": "", "source_columns": [], "alias_expression": "count(*)"},
+        {"alias_name": "first_date", "kind": "alias_only", "real_column": "", "source_columns": ["pos.kai_date"], "alias_expression": "min(p.kai_date)"},
+        {"alias_name": "amount", "kind": "alias_only", "real_column": "", "source_columns": ["pos.amount"], "alias_expression": "SUM(p.amount)"},
+        {"alias_name": "shop_id", "kind": "column", "real_column": "pos.mise_no", "source_columns": ["pos.mise_no"]}]}]}}}]
+    r14_h2 = lambda: {"logical_names": [
+        {"physical_table": "pos", "logical_table": "T", "physical_column": "days", "logical_column": "日数"},      # (1) 別名を物理列に書いた
+        {"physical_table": "pos", "logical_table": "T", "physical_column": "", "logical_column": "最初の日"},      # (2) alias_name を落とした
+        {"physical_table": "pos", "logical_table": "T", "physical_column": "amount", "logical_column": "金額"},    # 実列でもあるので触らない
+        {"physical_table": "pos", "logical_table": "T", "physical_column": "mise_no", "logical_column": "店番号"}],
+        "db_operations": [{"id": "x", "api_endpoint": {"action": "a"}, "dataset": [
+            {"no": 1, "physical_table": "pos", "logical_column": "日数", "physical_column": "days"},
+            {"no": 2, "physical_table": "pos", "logical_column": "最初の日", "physical_column": "", "alias_name": "first_date"},
+            {"no": 3, "physical_table": "pos", "logical_column": "金額", "physical_column": "amount", "alias_name": "amount"}]}]}
+    r14 = r14_h2()
+    assert restore_alias_rows(r14, r14_dr) == 3, r14
+    assert [(r["physical_column"], r.get("alias_name")) for r in r14["logical_names"]] == [("", "days"), ("", "first_date"), ("amount", None), ("mise_no", None)], r14["logical_names"]
+    assert [(r["physical_column"], r.get("alias_name")) for r in r14["db_operations"][0]["dataset"]] == [("", "days"), ("", "first_date"), ("amount", "amount")], r14["db_operations"][0]["dataset"]
+    snap14 = json.loads(json.dumps(r14))
+    assert restore_alias_rows(r14, r14_dr) == 0 and r14 == snap14, "not idempotent"
+    # 同じ(物理表, 論理列)に別名が2つ割れるときは補わない
+    r14b = {"logical_names": [{"physical_table": "pos", "physical_column": "", "logical_column": "日付"}],
+            "db_operations": [{"dataset": [{"physical_table": "pos", "logical_column": "日付", "physical_column": "", "alias_name": "first_date"},
+                                           {"physical_table": "pos", "logical_column": "日付", "physical_column": "", "alias_name": "last_date"}]}]}
+    assert restore_alias_rows(r14b, r14_dr) == 0 and "alias_name" not in r14b["logical_names"][0], r14b
+    # 合成を通すと、直した行の物理列を下書きの実列で補う(first_date → kai_date、days は式のまま空)
+    r14c = r14_h2()
+    _compose_db(r14c, r14_dr, [])
+    assert [(r["physical_column"], r.get("alias_name")) for r in r14c["logical_names"][:2]] == [("", "days"), ("kai_date", "first_date")], r14c["logical_names"]
+    print("[selftest OK] _compose_db_facts R14 (別名の行の形: physical_column の別名を alias_name へ・落ちた alias_name を dataset から補う・実列でもある名前は触らない)")
     print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
     print("[selftest OK] _compose_db_facts (B2: 物理列・when・句の論理名・(推定)・集計の別名・derived の除外)")
 

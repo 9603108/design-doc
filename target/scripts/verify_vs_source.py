@@ -1169,6 +1169,15 @@ def selftest():
     bad["db_operations"][0]["dataset"].append({"no": 2, "physical_column": "first_date"})
     got = check_backend_facts(bad, bapis, ces)
     assert [g.split(" ")[0] for g in got] == ["[別名]"] * 2 and "days" in got[0] and "first_date" in got[1] and all("差し戻し先 H2" in g for g in got), got
+    # R14: 別名の行の決まった書き方(physical_column 空・alias_name つき)は通す。別名を物理列に書いた形も、合成の機械の直し(restore_alias_rows)を通せば通る
+    #      (verify_partials の [列の省略] は同じ書き方を alias_name で数える。2本が逆向きに止めない)
+    ok = json.loads(json.dumps(good))
+    ok["logical_names"].append({"physical_table": "t", "physical_column": "", "alias_name": "days", "logical_column": "日数"})
+    ok["db_operations"][0]["dataset"].append({"no": 2, "physical_table": "t", "physical_column": "", "alias_name": "first_date", "logical_column": "最初の日"})
+    assert check_backend_facts(ok, bapis, ces) == [], check_backend_facts(ok, bapis, ces)
+    import _compose_db_facts
+    fixed = json.loads(json.dumps(bad))
+    assert _compose_db_facts.restore_alias_rows(fixed, [{"apis": bapis}]) == 2 and check_backend_facts(fixed, bapis, ces) == [], check_backend_facts(fixed, bapis, ces)
     # 集計の別名が null / 副問合せの集計を本体として書いた / CTE の集計を本体として書いた
     bad = json.loads(json.dumps(good))
     bad["db_operations"][0]["aggregate"] = [{"function": "min", "target": "kai_date", "alias": None, "scope": "main"}, {"function": "max", "target": "kai_date", "alias": None, "scope": "main"},

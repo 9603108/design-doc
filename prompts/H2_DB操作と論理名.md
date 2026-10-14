@@ -8,7 +8,7 @@
 ## 列の骨組みは1列も省かない
 - 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない
 - logical_names にも columns の列を全部書く(同じ表・同じ列は1行にまとめてよい)
-- dataset の physical_column は columns[].real_column の列の部分(表.列 の列)を写す。kind が alias_only の列は real_column が空で、下書きの physical_column に入っている値は別名なので、physical_column に書かない(空にし、別名は logical_column と alias_name で示す)。physical_table は columns[].real_column の表の部分(空なら table)。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
+- dataset の physical_column は columns[].real_column の列の部分(表.列 の列)を写す。kind が alias_only の列は real_column が空で、下書きの physical_column に入っている値は別名なので、physical_column に書かない(空にし、別名は logical_column と alias_name で示す)。**logical_names にも同じ別名の行を書き、physical_column は空・alias_name に別名を入れる(dataset の行と同じ書き方。logical_names でも alias_name を落とさない)**。physical_table は columns[].real_column の表の部分(空なら table)。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
 - 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)・ui_label_guess(画面の語からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く
 - logical_name_source が docstring・comment・csv_header・ui_label の候補は、下書きの語をそのまま使う(合成が事実の名前へ寄せるので、書き換えない)
   (例: 店舗ID(推定))。ソースや DDL でより確かな名前が分かれば、それに置き換えて「(推定)」を外してよい
@@ -19,7 +19,8 @@
 - 論理表名の末尾の「(推定)」と、where・order_by の when は合成が付け直す。書き分けなくてよい
 
 ## 書く欄(`_unit_H2.json`。db_operations の行を作る)
-- `logical_names[]`: {physical_table, logical_table, physical_column, logical_column}。dataset に出る列を全部
+- `logical_names[]`: {physical_table, logical_table, physical_column, logical_column}。dataset に出る列を全部。kind が alias_only の列の行は alias_name(別名)も持ち、physical_column は空にする(実列の行は alias_name を省いてよい)
+  - 別名を physical_column に書いた・logical_names で alias_name を落とした行は、検査(verify_partials)と合成が下書きの事実から機械で直す(推測では直さない)。それでも別名の行が1行も無い列は [列の省略] で差し戻す
 - `db_operations[]`: {id, api_endpoint, operation_type, dataset[], joins[], where[], group_by[], aggregate, order_by[], insert_values[], update_values[], transaction, error_message_id}
   - id は `db_op_<action>`(1つの action に SQL が複数なら `db_op_<action>_<n>`、実行順)
   - api_endpoint は {action}。trigger_events は書かない(apply_react_draft.py が下書きから写す。HTML の画面だけ event_code を書く)
