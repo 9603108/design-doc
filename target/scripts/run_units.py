@@ -91,6 +91,9 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 共通の決まり: {COMMON}(最初に読む)",
         f"- あなたの手順書: {SKILL / spec['prompt']}(読んで従う)",
         f"- 分担表: {UNITS_JSON}",
+        # WHY: H2 の手順書は 05_DB操作.md と 10_論理名変換.md を裸の名前で挙げ、依頼文に場所が無かったため H2 が見つけられなかった。
+        #      スキル直下の実在パスを絶対パスで渡す(実在は selftest で確かめる)
+        f"- スキル直下の文書(手順書が名前で挙げるもの): {SKILL / '05_DB操作.md'} と {SKILL / '10_論理名変換.md'}",
         f"- 中間データの置き場: {inter}/",
         f"- 下書き: {inter}/{feat}_react_draft.json と {inter}/{feat}_backend_draft.json",
         f"- 設定: {inter}/{feat}_screen_config.json と {inter}/{feat}_project_config.json",
@@ -302,6 +305,10 @@ def selftest():
     a, b, c = {"file": "a", "line_start": 1, "line_end": 2}, {"file": "b", "line_start": 3, "line_end": 4}, {"file": "a", "line_start": 1, "line_end": 2}
     assert _merge({"src": [a]}, {"src": [b, c], "t": [1]}, "x") == {"src": [a, b], "t": [1]}
     assert _merge({"t": [1]}, {"t": [2]}, "x") == {"t": [2]}
+    # 手順書が名前で挙げる文書(05・10)は、依頼文に絶対パスで出る・実在する(パスのずれの再発を止める)
+    for doc in ("05_DB操作.md", "10_論理名変換.md"):
+        assert (SKILL / doc).exists(), f"スキル直下に無い: {doc}"
+        assert str(SKILL / doc) in build_prompt(units, "テスト機能", "H2"), f"依頼文に {doc} の絶対パスが無い"
     check_step_args("テスト機能")
 
 

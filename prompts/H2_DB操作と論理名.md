@@ -3,7 +3,7 @@
 ## 入力
 - `{機能名}_backend_draft.json` の `apis.<action>.db_operations[]`(id・from・columns・ctes・subqueries・aggregate_units)。columns は SELECT 句の全列の骨組みで、
   1列ごとに alias(別名)・expression(元の式)・table / column(元の表と列)・logical_name(論理名の候補)・logical_name_source(候補の出所)・kind(column か alias_only)・real_column・alias_name・source_columns を持つ
-- バックエンドのソースの SQL、DDL(あれば)、`05_DB操作.md` の構造化表の節、`10_論理名変換.md`
+- バックエンドのソースの SQL、DDL(あれば)、スキル直下の `05_DB操作.md` の構造化表の節、スキル直下の `10_論理名変換.md`(絶対パスは依頼文の【パス】に書いてある)
 
 ## 列の骨組みは1列も省かない
 - 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない

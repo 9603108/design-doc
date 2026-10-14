@@ -203,11 +203,19 @@ def check_h2_columns(h2, draft):
     呼出元: check_unit_extras。"""
     from collections import Counter
 
-    def accepted(c):  # この列の物理名として書いてよい名前。下書きに physical_column があればそれだけ(別名の取り違えを ERROR にする)
-        if c.get("physical_column"):
+    def accepted(c):  # この列の照合名として H2 に書いてよい名前
+        # WHY: alias_only の列は物理列が無く、手順書どおり H2 は別名を alias_name に書いて physical_column を空にする。
+        #      下書き側の physical_column には別名が入っているので、alias_only は alias_name で照合する(physical_column で照合すると空の行と合わず [列の省略] になる)
+        if c.get("kind") == "alias_only":
+            return [c.get("alias_name") or c.get("alias")]
+        if c.get("physical_column"):  # 物理列があればそれだけ(別名の取り違えを ERROR にする)
             return [c["physical_column"]]
         names = [n for n in (c.get("column"), c.get("alias")) if n]
         return names or [c.get("expression")]
+
+    def h2_name(r):  # H2 の1行の照合名。物理列が空の行(別名だけの行)は alias_name で数える
+        # WHY: 手順書は alias_only の行の physical_column を空にする。空のまま数えると、別名の列がすべて欠けたように見えてしまう
+        return r.get("physical_column") or r.get("alias_name")
 
     def label(c):
         return c.get("alias") or c.get("column") or c.get("expression")
@@ -222,7 +230,7 @@ def check_h2_columns(h2, draft):
             keys.setdefault((c.get("table"), label(c)), c)
         # api_endpoint が辞書でない行は _units.check_refs が [形] で報告する。ここでは数えない
         mine = [o for o in ops if isinstance(o.get("api_endpoint"), dict) and o["api_endpoint"].get("action") == action]
-        pool = Counter(r.get("physical_column") for o in mine for r in o.get("dataset") or [] if isinstance(r, dict))
+        pool = Counter(h2_name(r) for o in mine for r in o.get("dataset") or [] if isinstance(r, dict))
         lack = []
         for c in cols:
             hit = next((n for n in accepted(c) if pool[n] > 0), None)
@@ -236,7 +244,7 @@ def check_h2_columns(h2, draft):
                             f"{', '.join(lack)} → 差し戻し先 H2")
     names = [n for n in h2.get("logical_names") or [] if isinstance(n, dict)]
     if keys:
-        have = {n.get("physical_column") for n in names}
+        have = {h2_name(n) for n in names}  # 別名だけの行(alias_only)も alias_name で数える(dataset と同じ照合名)
         lack = [name for (_table, name), c in keys.items() if not any(n in have for n in accepted(c))]
         if lack:
             problems.append(f"[列の省略] logical_names: 下書きの列 {len(keys)} 種のうち H2 に無い: "
@@ -577,6 +585,18 @@ def selftest_units():
     assert len(out) == 1 and "H2 に無い: last_date " in out[0], f"まとめた別名を拾わない: {out}"
     h2b["db_operations"][0]["dataset"].append({"physical_column": "kai_date"})
     assert check_h2_columns(h2b, draft2) == [], check_h2_columns(h2b, draft2)
+    # alias_only の列(物理列が無い別名)は、下書きの physical_column に別名が入っていても H2 の alias_name で照合する。
+    # H2 は手順書どおり physical_column を空にする。alias_name に無ければ dataset と logical_names の両方で欠けとして出す
+    draft_alias = {"apis": {"save": {"db_operations": [{"id": "db_op_save", "columns": [
+        {"alias": "shop_name", "kind": "alias_only", "physical_column": "shop_name", "real_column": "", "alias_name": "shop_name", "table": "shops", "column": ""}]}]}}}
+    h2a = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"},
+                              "dataset": [{"physical_column": "", "alias_name": "shop_name"}]}],
+           "logical_names": [{"physical_column": "", "alias_name": "shop_name"}]}
+    assert check_h2_columns(h2a, draft_alias) == [], check_h2_columns(h2a, draft_alias)
+    h2a["db_operations"][0]["dataset"] = []
+    h2a["logical_names"] = []
+    out = check_h2_columns(h2a, draft_alias)
+    assert len(out) == 2 and all("H2 に無い: shop_name" in p for p in out), out
     # 下書きの集計・ウィンドウの別名が H2 の aggregate に無ければ ERROR(C4)
     draft3 = {"apis": {"save": {"features": {"aggregates": [{"alias": "total"}], "windows": [{"alias": "nz"}]}}}}
     h2f = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"}, "aggregate": [{"alias": "total"}]}]}
