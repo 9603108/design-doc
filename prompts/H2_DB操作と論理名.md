@@ -2,13 +2,13 @@
 
 ## 入力
 - `{機能名}_backend_draft.json` の `apis.<action>.db_operations[]`(id・from・columns)。columns は SELECT 句の全列の骨組みで、
-  1列ごとに alias(別名)・expression(元の式)・table / column(元の表と列)・logical_name(論理名の候補)・logical_name_source(候補の出所)を持つ
+  1列ごとに alias(別名)・expression(元の式)・table / column(元の表と列)・logical_name(論理名の候補)・logical_name_source(候補の出所)・kind(column か alias_only)・real_column・alias_name・source_columns を持つ
 - バックエンドのソースの SQL、DDL(あれば)、`05_DB操作.md` の構造化表の節、`10_論理名変換.md`
 
 ## 列の骨組みは1列も省かない
 - 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない
 - logical_names にも columns の列を全部書く(同じ表・同じ列は1行にまとめてよい)
-- dataset の physical_column は columns[].physical_column をそのまま書く、physical_table は table。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
+- dataset の physical_column は columns[].real_column の列の部分(表.列 の列)を写す。kind が alias_only の列は real_column が空で、下書きの physical_column に入っている値は別名なので、physical_column に書かない(空にし、別名は logical_column と alias_name で示す)。physical_table は columns[].real_column の表の部分(空なら table)。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
 - 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く
   (例: 店舗ID(推定))。ソースや DDL でより確かな名前が分かれば、それに置き換えて「(推定)」を外してよい
 - 候補が空の列も省かない。式(expression)と別名から論理名を付け、「(推定)」を付ける
@@ -30,7 +30,7 @@
 - joins・where・group_by・order_by は英語のキー名で書く(日本語の見出しに置き換えない)
 - aliases の別名は、式と組で論理名を付ける。論理名を元の列名のもの(会計日 等)に戻さない
 - 別名(AS の後ろの名前)ごとに dataset の行を分ける。同じ元列に別名が複数ある(first_date・last_date がどちらも kai_date)ときも、別名の数だけ行を書き、1行にまとめない。
-  論理名は別名ごとに別の字面にする(物理列は columns[].physical_column のとおり)
+  論理名は別名ごとに別の字面にする(物理列は columns[].real_column のとおり)
 
 ## 書かない欄
 - dataset_name・remarks(S2)
