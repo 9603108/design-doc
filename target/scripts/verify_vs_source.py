@@ -512,6 +512,22 @@ def check_fetch_plan(plan, front_processes):
     return out
 
 
+_SCREEN_RULE_RX = re.compile(r"押せ|押下でき|活性|無効|disabled")
+
+
+def check_front_rules(merged):
+    """FR の手順(front_processes[].steps[].description)に画面規則(ボタンの活性・押せる条件)が書かれていないかを見る(ERROR)。
+    画面規則は VL(画面ルール)と項目の備考に書く。呼出元: main。
+    WHY: 押せる条件を処理の手順に書くと、呼出・成功・失敗の手順と画面規則が1つの欄に混ざり、S1 の画面ルールと食い違う(POS の FR8 の step1・2 がこれに当たった)。"""
+    out = []
+    for p in (merged or {}).get("front_processes") or []:
+        for i, s in enumerate(p.get("steps") or [], 1):
+            d = str(s.get("description") or "")
+            if _SCREEN_RULE_RX.search(d):
+                out.append(f"[ERROR] [画面規則] {p.get('process_id')} の step{i} に画面規則が書かれている({d[:40]})。ボタンの活性・押せる条件は処理本体の手順ではなく、画面ルール(validations)と項目の備考に書く → 差し戻し先 S3")
+    return out
+
+
 def _boundary_words(b):
     """boundaries の1件から、H4 の rule に要る語の候補(どれか1つ)を返す。候補が決められない検査(集合に無い値など)は None。"""
     if b.get("present") is False:
@@ -1061,6 +1077,12 @@ def selftest():
     got = check_fetch_plan(par, fr("店舗の一覧を取得する", "会計レポートを取得する"))
     assert len(got) == 1 and got[0].startswith("[WARN] [取得順]") and "差し戻し先" not in got[0] and "スクリプトの不具合" in got[0], got
     assert check_fetch_plan(ser, fr("取得は並行して進める")) and not check_fetch_plan({"mode": "single"}, fr("x")) and not check_fetch_plan(None, fr("x"))
+    # U12: FR の手順に画面規則(押せ・活性など)を書いたら ERROR。表示の文は通す
+    fr_rule = lambda *d: [{"process_id": "FR8", "name": "CSV出力", "steps": [{"description": x} for x in d]}]
+    assert check_front_rules({"front_processes": fr_rule("CSV出力ボタンを表示する")}) == []
+    got = check_front_rules({"front_processes": fr_rule("集計結果が0件のときは CSV 出力ボタンを押せないようにする", "出力ボタンは活性にする")})
+    assert len(got) == 2 and all(g.startswith("[ERROR] [画面規則]") and "差し戻し先 S3" in g for g in got), got
+    assert check_front_rules({}) == [] and check_front_rules({"front_processes": [{"process_id": "FR1", "steps": []}]}) == []
     sp = lambda a, b=None: [{"file": "P.tsx", "line_start": a, "line_end": b or a}]
     beh = [{"id": "BH01", "kind": "data_filter", "cond": "showDead || !s.dead", "target": "", "src": sp(124), "control_src": sp(276)},
            {"id": "BH02", "kind": "display_toggle", "cond": "rows.length > 1", "target": "合計", "src": sp(305), "control_src": []}]
@@ -1353,7 +1375,8 @@ def main(argv=None):
     literal_problems = check_literal_transform(data, bapis)
     forbidden_problems = check_forbidden_words(data)
     new_problems = db_problems + remark_problems + enum_problems + literal_problems + forbidden_problems
-    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems
+    front_problems = check_front_rules(data)
+    all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems
     for p in all_lines:
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
@@ -1369,6 +1392,8 @@ def main(argv=None):
     print(f"[INFO] 処理の種別の照合: ソースの behaviors {len(beh)} 件・ERROR {len(kind_problems)} 件")
     print(f"[INFO] 文言の照合: ソースの文字列 {len(strings)} 件(うち下書きの ui_strings {n_ui} 件)に対し WARN {len(problems)} 件")
     print(f"[INFO] DB 名・数え方・選択肢・SQL の文字列・禁止語の照合: {len(new_problems)} 件(すべて ERROR。差し戻し先は各行の末尾)")
+    # U12: FR の手順に画面規則を書いていないか(ERROR。差し戻し先 S3)
+    print(f"[INFO] 画面規則の照合(FR の手順に押せ・活性などを書いた行): ERROR {len(front_problems)} 件")
     # WHY: 終了コードは、WARN の接頭辞が無い行(ERROR)が1件でもあれば 1。WARN だけでは止めない
     return 1 if any(not p.startswith("[WARN]") for p in all_lines) else 0
 
