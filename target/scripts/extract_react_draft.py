@@ -477,7 +477,137 @@ def _detail_lines(link, called, failures=()):
     return lines
 
 
-def build_draft(links, unresolved, screen_name, failure_effects=()):
+# ---- 事実の行(案 B5)----------------------------------------------------------
+# 目的: 取得の開始時・成功時・失敗時・0件・CSV・連続操作の事実を、details とは別の fact_lines として出す。
+# WHY: 並びと内容は TSX の書き込みから機械で決まる事実なので、モデルに書かせず下書きが持つ。
+#      B6(apply_react_draft)が position(before_calls・after_calls・end)どおりに強制し、match の語で
+#      モデルが書いた同趣旨の行を落とす。
+_FACT_MATCH = {
+    "start": ["取得の開始時"], "success": ["取得に成功"], "failure": ["取得に失敗"], "empty": ["0件のとき"],
+    "csv.escape": ["値の中の二重引用符"], "csv.total_blank": ["合計行では"],
+    "continuous.stale": ["後から届く"], "continuous.loading": ["最初に返った応答"],
+}
+# WHY: 空に戻す書き込み(null・空配列・空文字)は「空にする」と書く。値の表記の違いを文に持ち込まない
+_EMPTY_VALUES = ("null", "[]", '""', "''", "undefined")
+
+
+def _event_codes(links):
+    """links と同じ順の event_code(attr=mount は EV00、それ以外は EV01 から連番)。build_draft と同じ振り方。"""
+    out, n = [], 0
+    for link in links:
+        if link["attr"] == "mount":
+            out.append("EV00")
+        else:
+            n += 1
+            out.append(f"EV{n:02d}")
+    return out
+
+
+def _state_names(sources):
+    """state 名 → 画面項目の名前(bind された入力要素の label が1種類に決まるときだけ)。呼出元: main()。
+
+    意味合い: 「shop を…」を画面で見える項目の名前(「店舗」等)に言い換える対。決まらない state は名前のまま使う。
+    """
+    labels = {}
+    for g in _react_facts.jsx_elements(sources)["jsx_elements"]:
+        if g.get("bind") and g.get("label"):
+            labels.setdefault(g["bind"], set()).add(g["label"])
+    return {k: next(iter(v)) for k, v in labels.items() if len(v) == 1}
+
+
+def _state_name(st, names):
+    """state 名を画面項目の名前に置き換える。対が無ければ state 名のまま。"""
+    return names.get(st) or st
+
+
+def _set_phrase(pair, names):
+    """before_call の `state=値` を「state を値にする」「state を空にする」の文にする。"""
+    st, _, val = pair.partition("=")
+    name = _state_name(st, names)
+    return f"{name} を空にする" if val in _EMPTY_VALUES else f"{name} を {val} にする"
+
+
+def _event_facts(link, failures, names):
+    """1イベントの事実の行 [{key, text, position, match, src}]。failures はそのイベントの failure_effects の要素。
+
+    呼出元: build_draft()。意味合い: 開始時(before_calls)・成功時(after_calls)・失敗時(after_calls)・0件(end)の行。
+    同じ text は1回だけ出す。拾えない欄は出さない(推測で足さない)。
+    """
+    facts = []
+
+    def add(key, text, position, src):
+        if not any(f["text"] == text for f in facts):
+            facts.append({"key": key, "text": text, "position": position, "match": _FACT_MATCH[key], "src": src})
+
+    for fe in failures:
+        if fe["before_call"]:
+            add("start", "取得の開始時に、" + "・".join(_set_phrase(x, names) for x in fe["before_call"]),
+                "before_calls", fe["src"])
+        if fe["on_success"]:
+            add("success", "取得に成功したときは、" + "・".join(_state_name(s, names) for s in fe["on_success"])
+                + " を応答の内容に置き換える", "after_calls", fe["src"])
+        fl = _failure_line(fe)
+        if fl:
+            add("failure", fl, "after_calls", fe["src"])
+    for _st, txt in link.get("empty") or []:
+        add("empty", f"0件のときは該当なしの旨を表示する(画面の文言: 「{txt}」)", "end", [])
+    return facts
+
+
+def _csv_fact_map(csv_exports):
+    """CSV 出力の事実を、trigger_events の event_code ごとの fact_lines の形で返す。呼出元: main()。
+
+    csv.escape: 値の中の二重引用符の重ね方(quote.escape がある時だけ)。
+    csv.total_blank: 合計行(total_row がある時)で値が空の列。名前は見出しの同じ位置の固定見出し。
+    WHY: 見出しと行の列が1対1に並ぶのは、その前に展開(spread)が無い列だけ。展開の後の列は位置で言い、名前は推測しない。
+    """
+    out = {}
+    for c in csv_exports:
+        facts = []
+        if (c.get("quote") or {}).get("escape"):
+            facts.append({"key": "csv.escape", "text": "値の中の二重引用符は2つ重ねる", "position": "end",
+                          "match": _FACT_MATCH["csv.escape"], "src": c.get("src", [])})
+        cols = (c.get("row_builder") or {}).get("columns") or []
+        fixed = (c.get("header") or {}).get("fixed") or []
+        blank = []
+        for i, col in enumerate(cols):
+            if c.get("total_row") is None or col.get("kind") != "ternary":
+                continue
+            if col.get("total_value", "") not in _EMPTY_VALUES + ("",):
+                continue
+            if i < len(fixed) and not any(x.get("kind") == "spread" for x in cols[:i]):
+                blank.append(fixed[i])
+            else:
+                blank.append(f"{i + 1}列目")
+        if blank:
+            facts.append({"key": "csv.total_blank", "text": f"合計行では {'・'.join(blank)} は空欄にする",
+                          "position": "end", "match": _FACT_MATCH["csv.total_blank"], "src": c.get("src", [])})
+        for code in c.get("trigger_events", []):
+            out.setdefault(code, []).extend(facts)
+    return out
+
+
+def _continuous_fact_map(ops):
+    """連続操作の後から届く応答・読込中表示の事実(outcomes)を、その操作のイベントの fact_lines の形で返す。呼出元: main()。"""
+    out = {}
+    for i, op in enumerate(ops, 1):
+        for o in op.get("outcomes", []):
+            key = "continuous.stale" if o["kind"] == "stale_overwrite" else "continuous.loading"
+            out.setdefault(op["event"], []).append({"key": f"continuous.{i}", "text": o["fact"], "position": "end",
+                                                    "match": _FACT_MATCH[key], "src": o.get("src", [])})
+    return out
+
+
+def _attach_facts(draft, extra):
+    """extra(event_code → 事実の行)を event_processes[].fact_lines に足す。同じ text は1回だけ。呼出元: main()。"""
+    for ep in draft["event_processes"]:
+        cur = ep.setdefault("fact_lines", [])
+        for f in extra.get(ep["event_code"], []):
+            if not any(x["text"] == f["text"] for x in cur):
+                cur.append(f)
+
+
+def build_draft(links, unresolved, screen_name, failure_effects=(), state_names=None):
     """解析結果を Phase 1 の下書き JSON(dict)に組む。
 
     failure_effects は _react_facts.extract の戻りの一覧。イベントごとの details の失敗時の行に使う(省略時は一般文)。
@@ -539,6 +669,9 @@ def build_draft(links, unresolved, screen_name, failure_effects=()):
             "calls": link["calls"],
             "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
             + _detail_lines(link, called, [f for f in failure_effects if f["event"] == ev["event_code"]]),
+            # 目的: 開始時・成功時・失敗時・0件の事実の行(案 B5)。接続: B6 が position どおりに強制する
+            "fact_lines": _event_facts(link, [f for f in failure_effects if f["event"] == ev["event_code"]],
+                                       state_names or {}),
         })
     return {
         "events": events,
@@ -548,6 +681,33 @@ def build_draft(links, unresolved, screen_name, failure_effects=()):
     }
 
 
+_OBJ_LIT = re.compile(r"\{([^{}]*)\}")
+
+
+def _row_specs(body, count):
+    """定数配列の中の {label, csv, kin, cnt} の並びを specs にする。count は全配列を通した label の出現数。
+
+    呼出元: _display_rows()。意味合い: 同じ label(「小計」等)の行が複数あるため、名前だけでは結ぶ先が決まらない。
+    nth(同じ label の何番目か)を持たせ、合成が画面の項目を番号で結べるようにする(案 B5 d)。
+    """
+    specs = []
+    for om in _OBJ_LIT.finditer(body):
+        ob = om.group(1)
+        lm = re.search(r"\b(?:label|header|title)\s*:\s*['\"]([^'\"]+)['\"]", ob)
+        if not lm:
+            continue
+        label = lm.group(1)
+        count[label] = count.get(label, 0) + 1
+
+        def attr(name):
+            am = re.search(rf"\b{name}\s*:\s*['\"]([^'\"]*)['\"]", ob)
+            return am.group(1) if am else None
+
+        specs.append({"label": label, "csv": attr("csv"), "kin": attr("kin"), "cnt": attr("cnt"),
+                      "nth": count[label]})
+    return specs
+
+
 def _display_rows(sources):
     """TSX の モジュール直下の定数配列(const X = [ {label: '...'}, ... ])から、表示行の名前を集める。
 
@@ -555,6 +715,7 @@ def _display_rows(sources):
     接続: 出力は draft["display_rows"]。配列の中身は文字列リテラルの label/header/title だけを拾う(推測で足さない)。
     """
     rows = []
+    count = {}  # 目的: 同じ label の出現数(全配列を通す)。nth の元
     for p in sources:
         if p.suffix not in (".tsx", ".jsx"):
             continue
@@ -564,7 +725,8 @@ def _display_rows(sources):
             labels = [x.group(1) for x in re.finditer(r"\b(?:label|header|title)\s*:\s*['\"]([^'\"]+)['\"]", t[m.end():end])]
             if labels:
                 # 目的: 表示行の出典(配列の宣言の範囲)。接続: build_draft ではなく main() の display_rows に出る
-                rows.append({"array": m.group(1), "labels": labels, "src": [_span(p, t, m.start(), end)]})
+                rows.append({"array": m.group(1), "labels": labels, "src": [_span(p, t, m.start(), end)],
+                             "specs": _row_specs(t[m.end():end], count)})
     return rows
 
 
@@ -577,7 +739,8 @@ def _continuous_ops(links, sources=()):
     防止の仕組みが1つも無いときは prevention を「防止なし」にし、fact にもその旨を書く。
     """
     ops = []
-    for link in links:
+    codes = _event_codes(links)
+    for link, code in zip(links, codes):
         # 目的: mount(初期表示)は利用者の操作ではないので外す。接続: actions が空の属性は取得を起こさない
         if link["attr"] == "mount" or not (link["actions"] or link.get("fetch")):
             continue
@@ -591,8 +754,9 @@ def _continuous_ops(links, sources=()):
         fact = (f"操作「{label}」({link['element']} の {link['attr']})は読込中に"
                 f"{'無効化される' if disabled else '無効化されない'}。取消処理は{'ある' if cancel else '無い'}。")
         if not prevented:
-            fact += "読込中の再操作の防止は防止なし(無効化・loading の判定・中断が無い)。"
-        ops.append({"button": label, "disabled_while_loading": disabled, "guard": guard, "cancel": cancel,
+            # WHY: 「防止なし」は仕組みが無いことの事実。S3 の文と同じ言い方に揃える(案 B5 c)
+            fact += "読込中の再操作を防ぐ仕組みは無い(無効化・loading の判定・中断が無い)。"
+        ops.append({"event": code, "button": label, "disabled_while_loading": disabled, "guard": guard, "cancel": cancel,
                     "prevention": "あり" if prevented else "防止なし", "fact": fact,
                     # 目的: 後から届く応答・読込中表示の事実(C6)。接続: S3 の details に1行ずつ写す
                     "outcomes": _react_facts.outcomes(link, sources)})
@@ -646,7 +810,9 @@ def main(argv=None):
     links, unresolved, excerpt = analyze_sources(sources, pcfg.get("api_call_functions", []))
     # 目的: 取得失敗時に変える state・残る state を下書きに足し(既存キーは変えない)、details の失敗時の行にも使う。接続: _react_facts.extract
     facts = _react_facts.extract(links, sources)
-    draft = build_draft(links, unresolved, cfg.get("screen_name", ""), facts["failure_effects"])
+    # 目的: 画面部品の名前(bind された state の画面項目名)を、開始時・成功時の文の言い換えに使う。接続: _state_names
+    names = _state_names(sources)
+    draft = build_draft(links, unresolved, cfg.get("screen_name", ""), facts["failure_effects"], names)
     draft.update(facts)
     # 目的: CSV 出力の書式(BOM・区切り・改行・見出し・合計行)を下書きに足す(C1)。接続: _react_facts.csv_exports
     draft.update(_react_facts.csv_exports(links, sources))
@@ -671,9 +837,14 @@ def main(argv=None):
     # 目的: 初期表示で呼ぶ API の一覧(initial_fetches)と、useState の初期値・結ぶ画面項目(state_initials)を下書きに足す。接続: _react_facts.initial_fetches / state_initials
     draft.update(_react_facts.initial_fetches(sources, api_names))
     draft.update(_react_facts.state_initials(sources))
+    # 目的: 派生配列(useMemo・素の filter 等で作る配列)を下書きに足す。接続: _react_facts.derived_arrays。B4 の配線(B5 が担当)
+    draft.update(_react_facts.derived_arrays(sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
     draft["display_rows"] = _display_rows(sources)
     draft["continuous_operation"] = _continuous_ops(links, sources)
+    # 目的: CSV と連続操作の事実の行を、trigger の event_processes[].fact_lines に入れる(案 B5 b・c)
+    _attach_facts(draft, _csv_fact_map(draft["csv_exports"]))
+    _attach_facts(draft, _continuous_fact_map(draft["continuous_operation"]))
     write_draft(draft, Path(args.out))
     # api.ts から抜いた断片は下書きと同じフォルダへ、<機能名>_api_excerpt.ts として書く(機能名は config の名前から)
     if excerpt:
@@ -682,6 +853,87 @@ def main(argv=None):
     print(f"[OK] events={len(draft['events'])} db_operations={len(draft['db_operations'])} "
           f"unresolved={len(unresolved)} -> {args.out}")
     return 1 if unresolved else 0
+
+
+def _selftest_b5():
+    """事実の行(開始時・成功時・失敗時・CSV・連続操作)・表示行の specs・派生配列を、CLI の main() を通して assert する。
+
+    呼出元: selftest()。意味合い: B5 の出力が下書きの欄に入り、B6 が読む形で出ることを確かめる。終了コード 0=OK / 1=NG。
+    """
+    import json
+    import tempfile
+    tsx = r'''import { useState, useEffect, useMemo } from "react";
+import { call } from "./api";
+const COLS = [
+  { label: "小計", csv: "小計(税込)", kin: "s3" },
+  { label: "小計", kin: "s4" },
+];
+export default function Screen() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [shop, setShop] = useState("");
+  const visible = useMemo(() => rows.filter((r) => r.days > 0), [rows]);
+  const load = () => {
+    setLoading(true);
+    setError(null);
+    call("list").then((d) => setRows(d.rows)).catch((e) => setError(String(e))).finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, []);
+  const exportCsv = () => {
+    const q = (v) => `"${String(v).replaceAll('"', '""')}"`;
+    const header = ["店舗", "日付"];
+    const line = (r, agg) => [q(r ? r.shop : "合計"), r ? r.days : ""].join(",");
+    const lines = rows.map((r, i) => line(r, i));
+    if (rows.length > 1) lines.push(line(null, 0));
+    const blob = new Blob([[header.join(","), ...lines].join("\r\n")], { type: "text/csv" });
+  };
+  return (
+    <div>
+      <label>店舗</label>
+      <input type="text" value={shop} onChange={(e) => { setShop(e.target.value); load(); }} />
+      <button onClick={exportCsv}>CSV出力</button>
+    </div>
+  );
+}
+'''
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d)
+            (dp / "S.tsx").write_text(tsx, encoding="utf-8")
+            (dp / "S_screen_config.json").write_text(json.dumps(
+                {"screen_name": "テスト画面", "source_files": [str(dp / "S.tsx")]}, ensure_ascii=False), encoding="utf-8")
+            (dp / "S_project_config.json").write_text(json.dumps(
+                {"api_call_functions": ["call"]}, ensure_ascii=False), encoding="utf-8")
+            out = dp / "draft.json"
+            main(["--config", str(dp / "S_screen_config.json"), "--project-config", str(dp / "S_project_config.json"),
+                  "--out", str(out)])
+            draft = json.loads(out.read_text(encoding="utf-8"))
+        ep = {e["event_code"]: e for e in draft["event_processes"]}
+        facts = {k: [(f["text"], f["position"], f["key"]) for f in v["fact_lines"]] for k, v in ep.items()}
+        start = "取得の開始時に、loading を true にする・error を空にする"
+        assert (start, "before_calls", "start") in facts["EV01"], f"EV01 の開始時: {facts['EV01']}"
+        assert (start, "before_calls", "start") in facts["EV00"], f"EV00 の開始時: {facts['EV00']}"
+        assert ("取得に成功したときは、rows を応答の内容に置き換える", "after_calls", "success") in facts["EV01"], facts["EV01"]
+        assert any(t.startswith("取得に失敗したときは、error") and p == "after_calls" for t, p, _ in facts["EV01"]), facts["EV01"]
+        assert any(k.startswith("continuous.") and p == "end" and "上書きする" in t for t, p, k in facts["EV01"]), facts["EV01"]
+        assert ("値の中の二重引用符は2つ重ねる", "end", "csv.escape") in facts["EV02"], facts["EV02"]
+        assert ("合計行では 日付 は空欄にする", "end", "csv.total_blank") in facts["EV02"], facts["EV02"]
+        assert draft["continuous_operation"][0]["event"] == "EV01", draft["continuous_operation"]
+        assert "読込中の再操作を防ぐ仕組みは無い" in draft["continuous_operation"][0]["fact"], draft["continuous_operation"][0]
+        assert draft["display_rows"][0]["specs"] == [
+            {"label": "小計", "csv": "小計(税込)", "kin": "s3", "cnt": None, "nth": 1},
+            {"label": "小計", "csv": None, "kin": "s4", "cnt": None, "nth": 2},
+        ], draft["display_rows"]
+        assert any(a.get("name") == "visible" and a.get("source") == "rows" for a in draft.get("derived_arrays", [])), \
+            f"derived_arrays: {draft.get('derived_arrays')}"
+    except AssertionError as e:
+        print(f"[selftest NG] B5 {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] B5 例外: {e!r}")
+        return 1
+    return 0
 
 
 def selftest():
@@ -749,6 +1001,8 @@ def selftest():
         assert draft["event_processes"][2]["details"] == [DETAIL_TODO, "・wrapped をリクエストする"], "EV02 の details"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
+        return 1
+    if _selftest_b5():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0
