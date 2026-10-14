@@ -325,6 +325,8 @@ def check_unit_extras(frags, directory):
     for unit, frag in frags.items():
         if any(HOLE_RE.search(s) for s in _strings(frag)):
             problems.append(f"[穴あき] _unit_{unit}.json: 〈 または {{…}} の穴が残っている → 差し戻し先 {unit}")
+    # B14 a)(c): 例示値の括弧のプレースホルダと、「DB 例外」の断定は ERROR(差し戻し先は各行に書く)
+    problems += check_example_placeholder(frags) + check_db_exception_wording(frags)
     return problems
 
 
@@ -386,6 +388,15 @@ def check_composed_gaps(composed, frags):
                 if mid and str(e.get("status_code")) == "400" and mid not in have:
                     problems.append(f"[検査の漏れ] api_spec[{a.get('action')}].error_patterns: 400 のエラー {mid} が validations_frontend に無い。"
                                     "バック側の入力検査も1件書き message_id で結ぶ(画面に検査が無ければ kind は「API検査」) → 差し戻し先 H4")
+    # (c) [表示名] 合成が補えなかった response_items の display_name の空。display_name は H3 の欄で、合成が先に補う(B3)。
+    #     補えない行だけが残るので、業務の名前を H3 が書く。H3 の断片が未着(並行の途中)のときは見ない
+    if frags.get("H3") is not None:
+        for a in composed.get("api_spec") or []:
+            empty = [str(r.get("key")) for r in a.get("response_items") or [] if isinstance(r, dict) and not r.get("display_name")]
+            if empty:
+                sample = ", ".join(empty[:5]) + (f" ほか {len(empty) - 5} 件" if len(empty) > 5 else "")
+                problems.append(f"[表示名] api_spec[{a.get('action')}].response_items: display_name が空の行 {len(empty)} 件({sample})。"
+                                "補えない行は業務の名前を書く → 差し戻し先 H3")
     return problems
 
 
@@ -471,6 +482,62 @@ def check_composed_warn(frags):
             for u, n in sorted(counts.items())]
 
 
+# B14 a): S1 の例示値の括弧の中が、実値でなく説明の穴になる語(DB・データベース・実行時・入力値・任意)を含むものを拾う
+PLACEHOLDER_WORDS = ("DB", "データベース", "実行時", "入力値", "任意")
+PAREN_RE = re.compile(r"[（(]([^（）()]*)[）)]")
+# B14 c): 「DB 例外」等の断定。ソースに根拠の無い暗黙の挙動を断定させないための語。「(推測)」を付けた文は通す
+DB_EXC_RE = re.compile(r"DB 例外|データベースの例外|DB のエラー")
+# 検査の対象の欄: validations(rule・applied_when)と error_patterns(condition)
+_EXC_KEYS = ("validations", "validations_frontend", "error_patterns")
+
+
+def check_example_placeholder(frags):
+    """S1 の例示値の括弧の中が DB・データベース・実行時・入力値・任意 等の語なら ERROR(B14 a)。差し戻し先 S1。
+    WHY: 「（DB の店舗名）」は例として読めず、画面に出る実値が業務担当者に分からないため。
+    差し戻し文に「具体的な実値(例 横浜店)で書く」を添える。呼出元: check_unit_extras。"""
+    problems = []
+    for it in ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        ex = str(it.get("example") or "")
+        for inner in PAREN_RE.findall(ex):
+            if any(w in inner for w in PLACEHOLDER_WORDS):
+                problems.append(f"[例示値] screen_layout.items[{it.get('item_name')}]: 例示値「{ex}」の括弧({inner})が実値でない。"
+                                "具体的な実値(例 横浜店)で書く → 差し戻し先 S1")
+                break
+    return problems
+
+
+def _keyed_rows(node, keys, key=None):
+    """断片の中で keys の欄に入っている行(dict)を (欄名, 行) で順に返す。_src_rows と同じ歩き方。呼出元: check_db_exception_wording。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _keyed_rows(v, keys, k)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, dict) and key in keys:
+                yield key, v
+            yield from _keyed_rows(v, keys, key)
+
+
+def check_db_exception_wording(frags):
+    """H4 の validations_frontend(rule・applied_when)と S2 の error_patterns(condition)に「DB 例外」等の断定があれば ERROR(B14 c)。
+    WHY: DB 例外(500)は下書きの事実として合成が足すので、説明文で断定させない。「(推測)」を付けた文は通す。
+    差し戻し先は書いた断片(H4 か S2)。呼出元: check_unit_extras。"""
+    problems = []
+    for unit, frag in frags.items():
+        if unit not in ("H4", "S2"):
+            continue
+        for key, row in _keyed_rows(frag, _EXC_KEYS):
+            for f in (("rule", "applied_when") if key.startswith("validations") else ("condition",)):
+                txt = str(row.get(f) or "")
+                m = DB_EXC_RE.search(txt)
+                if m and "(推測)" not in txt and "（推測）" not in txt:
+                    problems.append(f"[文言] {unit} {key}[{f}]: 「{m.group(0)}」と断定している(ソースの根拠が無い)。"
+                                    "ソースの処理の事実だけを書く → 差し戻し先 " + unit)
+    return problems
+
+
 def main_units(directory, only=None):
     """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
     import _units
@@ -521,7 +588,7 @@ def selftest_units():
         "H2": {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save", "trigger_events": ["EV01"]},
                                   "operation_type": "INSERT"}]},
         "H3": {"api_spec": [{"action": "save", "method": "POST", "path": "/api/order",
-                             "response_items": [{"key": "result", "no": 1, "data_type": "string"}]}]},
+                             "response_items": [{"key": "result", "no": 1, "data_type": "string", "display_name": "結果"}]}]},
         "H4": {"messages_backend": [{"message_id": "MSE00001", "code": "MSE00001", "severity": "error", "message": "保存に失敗しました"}]},
         "S1": {"screen_layout": {"items": [{"item_name": "確定", "area_ref": "A1", "item_type": "Button", "event_code": "EV01"}]}},
         "S2": {"api_spec": [{"action": "save", "description": "受注を保存する", "related_db_operations": ["db_op_save"],
@@ -546,7 +613,7 @@ def selftest_units():
     assert _units.check_all(spec, gap) == [], "none_reason・kind=API検査 が分担表・検査で通らない: " + str(_units.check_all(spec, gap))
     comp = _units.compose(spec, good)
     assert comp["api_spec"][0]["description"] == "受注を保存する" and comp["api_spec"][0]["method"] == "POST", "合成で欄が落ちた"
-    assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "source": {"type": "const"}}, "行の合成が違う"
+    assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "display_name": "結果", "source": {"type": "const"}}, "行の合成が違う"
     parts, unknown = _units.split_partials(comp)
     assert "event_processes" in parts["screen_events"] and not unknown, "partial への振り分けが違う"
     assert comp["screen_layout"]["items"][0]["no"] == 1, "合成で items の no を振っていない"
@@ -628,8 +695,8 @@ def selftest_units():
     with tempfile.TemporaryDirectory() as td:
         Path(td, "x_backend_draft.json").write_text(json.dumps({"common_errors": [
             {"exception": "ValidationError", "errors": [{"code": "getattr(e) or 'v'", "status_code": "getattr(e, 'status', 400) or 400"}]},
-            {"exception": "psycopg2.Error", "errors": [{"code": "internal_error", "status_code": 500}], "src": [{"file": "h.py", "line_start": 5, "line_end": 6}]},
-            {"exception": "Exception", "errors": [{"code": "internal_error", "status_code": 500}]}]}), encoding="utf-8")
+            {"exception": "psycopg2.Error", "errors": [{"code_default": "internal_error", "status_code": 500}], "src": [{"file": "h.py", "line_start": 5, "line_end": 6}]},
+            {"exception": "Exception", "errors": [{"code_default": "internal_error", "status_code": 500}]}]}), encoding="utf-8")
         old, _config_loader.INTERMEDIATE_DIR = _config_loader.INTERMEDIATE_DIR, Path(td)
         try:
             ce = _units._draft_common_errors()
@@ -638,9 +705,11 @@ def selftest_units():
         finally:
             _config_loader.INTERMEDIATE_DIR = old
     sr = [{"file": "h.py", "line_start": 5, "line_end": 6}]
-    assert ce == [{"status_code": 500, "condition": "想定外の例外が起きたとき(psycopg2.Error・Exception。code=internal_error)", "src": sr}], ce
+    # WHY: code は condition に書かず error_code の欄に入れる(B0)。期待値の condition の「。code=」は B0 で消した形
+    assert ce == [{"status_code": 500, "condition": "想定外の例外が起きたとき(psycopg2.Error・Exception)", "src": sr, "error_code": "internal_error"}], ce
     pa, pb = (a["error_patterns"] for a in comp3["api_spec"])
     assert [e["status_code"] for e in pa] == [400, 500] and pa[1]["src"] == sr and pb[0]["src"] == sr and len(pb) == 1, (pa, pb)
+    assert pa[1]["error_code"] == "internal_error" and "code=" not in pa[1]["condition"], pa[1]
     # 作り手の断片がまだ無い(並行の途中)ときは、識別子の照合をしない
     partial_run = {"S2": good["S2"]}
     assert not [p for p in _units.check_fragments(spec, partial_run) if p.startswith("[参照]")], "作り手が未着でも [参照] を出した"
@@ -722,6 +791,23 @@ def selftest_warn():
     _units._set_db_op_facts(rows, facts)
     assert rows[0]["subqueries"] == facts["db_op_x"]["subqueries"] and rows[0]["ctes"] == facts["db_op_x"]["ctes"], rows[0]
     assert "subqueries" not in rows[1] and "ctes" not in rows[1], rows[1]
+    # B14 a): 括弧の中が DB・実行時 等のプレースホルダの例示値は ERROR。実値(横浜店・1,234 円)は通す
+    ph = {"S1": {"screen_layout": {"items": [{"item_name": "店舗", "example": "（DB の店舗名）（レジ2台）"},
+                                            {"item_name": "店", "example": "横浜店（レジ2台）"}]}}}
+    out = check_example_placeholder(ph)
+    assert len(out) == 1 and "items[店舗]" in out[0] and out[0].endswith("差し戻し先 S1") and "items[店]" not in out[0], out
+    assert check_example_placeholder({"S1": {"screen_layout": {"items": [{"item_name": "合計", "example": "1,234 円（税込）"}]}}}) == [], "実値の例で ERROR"
+    # B14 b): 合成後も display_name が空なら H3 へ戻す。H3 の断片が未着(並行の途中)なら見ない
+    empty_dn = {"api_spec": [{"action": "save", "response_items": [{"key": "result"}, {"key": "rows[].x", "display_name": "店"}]}]}
+    out = check_composed_gaps(empty_dn, {"H3": {"api_spec": []}})
+    assert len(out) == 1 and out[0].startswith("[表示名]") and out[0].endswith("差し戻し先 H3") and "result" in out[0], out
+    assert check_composed_gaps(empty_dn, {"S2": {"api_spec": []}}) == [], "H3 が未着でも [表示名] を出した"
+    # B14 c): 「DB 例外」の断定は H4 の validations と S2 の error_patterns で ERROR。「(推測)」を付けた文は通す
+    dbx = {"H4": {"validations_frontend": [{"rule": "DB 例外で止まる", "applied_when": "保存時"}]},
+           "S2": {"api_spec": [{"action": "a", "error_patterns": [{"condition": "データベースの例外が起きたとき"},
+                                                              {"condition": "DB 例外が起きたとき(推測)"}]}]}}
+    out = check_db_exception_wording(dbx)
+    assert len(out) == 2 and out[0].endswith("差し戻し先 H4") and out[1].endswith("差し戻し先 S2"), out
     print("[selftest OK] verify_partials.warn")
 
 
