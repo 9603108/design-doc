@@ -324,6 +324,33 @@ def selftest():
     for doc in ("05_DB操作.md", "10_論理名変換.md"):
         assert (SKILL / doc).exists(), f"スキル直下に無い: {doc}"
         assert str(SKILL / doc) in build_prompt(units, "テスト機能", "H2"), f"依頼文に {doc} の絶対パスが無い"
+    # audit: 各依頼の先頭行に part 番号(1 始まり)・書き先・判定項目の範囲。照合は、欠け・他の part の項目・重複・壊れた JSON を part の番号で返す
+    cl = [{"id": f"AC{i:03d}", "kind": "remarks", "owner": "S1", "subject": f"主語{i}", "text": f"文{i}", "src_excerpt": "x", "src_ref": None}
+          for i in range(1, 31)]
+    with tempfile.TemporaryDirectory() as td:
+        old, INTER = INTER, Path(td)
+        try:
+            ps = build_audit_prompts("機能", cl)
+            head = ps[1]["prompt"].splitlines()[0]
+            assert [p["part"] for p in ps] == [1, 2] and head.startswith("あなたは part 2") and "_audit_part_2.json" in head and "AC026〜AC030" in head, head
+            assert "主語26" in ps[1]["prompt"] and ps[0]["claims"][0]["id"] == "AC001", "判定項目に主語・claims の写し"
+
+            def write(n, ids, extra=None):
+                rows = [{"id": i, "verdict": "ok", "evidence_line": 1, "reason": "r"} for i in ids] + (extra or [])
+                (Path(td) / f"機能_audit_part_{n}.json").write_text(json.dumps(rows), encoding="utf-8")
+            write(1, ps[0]["ids"])
+            v, pr = audit_part_problems("機能", ps)
+            assert sorted(pr) == [2] and "書かれていない" in pr[2][0] and len(v) == 25, (pr, len(v))
+            write(2, ps[0]["ids"][:5])  # 呼出元が part 1 の依頼を2体に渡した形(part 2 の名前に part 1 の項目を書く)
+            v, pr = audit_part_problems("機能", ps)
+            assert sorted(pr) == [2] and any("項目でない id" in m for m in pr[2]) and any("欠けている" in m for m in pr[2]), pr
+            write(2, ps[1]["ids"], extra=[{"id": "AC030", "verdict": "ok"}])  # 重複
+            assert "重複" in " ".join(audit_part_problems("機能", ps)[1][2])
+            write(2, ps[1]["ids"])
+            v, pr = audit_part_problems("機能", ps)
+            assert pr == {} and len(v) == 30, pr
+        finally:
+            INTER = old
     check_step_args("テスト機能")
 
 
@@ -365,30 +392,83 @@ def audit_sendbacks(rows, units):
 AUDIT_BATCH = 25  # WHY: 1依頼あたりの判定項目の上限。Haiku の1回の読みを小さく保ち、part を分けて書かせる
 
 
+def _audit_item(c):
+    """判定項目 1 件を、判定の担当に渡す形(id・主語・文・抜粋)にする。audit の依頼文と再判定の依頼文が同じ形を使う。
+    WHY: 文だけでは何の記述か分からない項目(「点数と金額の2列。左段」)があり、担当が unknown を返していた。主語(subject)を添える。"""
+    return {"id": c["id"], "subject": c.get("subject") or "", "statement": c["text"],
+            "src_excerpt": {**(c.get("src_ref") or {}), "text": c.get("src_excerpt") or ""}}
+
+
 def build_audit_prompts(feat, claims):
     """判定項目を AUDIT_BATCH 件ずつに分け、Haiku の判定の依頼文の配列を返す。
 
     WHY: 判定の入力を part ごとに渡し、結果も part ごとに書かせて audit-check で1つにまとめる。
-    各依頼文に結果の書き先 <機能名>_audit_part_<n>.json を明記する(書き先が無いと part の番号が揃わない)。
-    接続: 呼出元 = main の audit 分岐。手順書は prompts/AU_意味の照合.md(入力の形は判定項目の statement・src_excerpt)。
+    各依頼文の先頭に「あなたは part N。書き先は …_audit_part_N.json。判定項目は ACxxx〜ACyyy」を明記する。
+    WHY(2026-10-15 run13): 呼出元が「配列の n 番目(0 始まり)」で依頼を渡し、2体が同じ part_1 を書いて AC101〜125 の part が欠けた。
+    part の番号は 1 始まりで、配列の位置とは別に各要素が持ち(part)、本文にも書く。audit-check はこの part と ids を正として照合する。
+    各要素の claims は、audit が判定に渡した判定項目の写し。audit-check はこれを正とする
+    (claims.json が audit の後で作り直されて id がずれても、判定を別の項目に結ばないため)。
+    接続: 呼出元 = main の audit 分岐。手順書は prompts/AU_意味の照合.md(入力の形は判定項目の subject・statement・src_excerpt)。
     """
     au = SKILL / "prompts" / "AU_意味の照合.md"
+    chunks = [claims[s:s + AUDIT_BATCH] for s in range(0, len(claims), AUDIT_BATCH)]
     prompts = []
-    for n, start in enumerate(range(0, len(claims), AUDIT_BATCH), 1):
-        batch = claims[start:start + AUDIT_BATCH]
+    for n, batch in enumerate(chunks, 1):
         out = INTER / f"{feat}_audit_part_{n}.json"
-        items = [{"id": c["id"], "statement": c["text"],
-                  "src_excerpt": {**(c.get("src_ref") or {}), "text": c.get("src_excerpt") or ""}}
-                 for c in batch]
+        first, last = batch[0]["id"], batch[-1]["id"]
         prompt = "\n".join([
-            f"design-doc の意味の照合(haiku)。機能名: {feat}。判定項目 {len(batch)} 件。",
+            f"あなたは part {n}(全 {len(chunks)} part)。書き先は {out}。判定項目は {first}〜{last} の {len(batch)} 件。",
+            f"design-doc の意味の照合(haiku)。機能名: {feat}。",
             f"- 手順書: {au}(読んで従う。正解はソースの抜粋だけ)",
-            f"- 書くのは {out} の1ファイルだけ。中身は判定の JSON 配列(id・verdict・evidence_line・reason)を、判定項目と同じ順で",
+            f"- 書くのは {out} の1ファイルだけ。他の part のファイルは書かない。"
+            f"中身は判定の JSON 配列(id・verdict・evidence_line・reason)を、下の判定項目と同じ順・同じ {len(batch)} 件で。id は {first}〜{last} のものだけ",
             "- 判定項目:",
-            json.dumps(items, ensure_ascii=False, indent=1),
+            json.dumps([_audit_item(c) for c in batch], ensure_ascii=False, indent=1),
         ]) + "\n"
-        prompts.append({"part": n, "model": "haiku", "out": str(out), "ids": [c["id"] for c in batch], "prompt": prompt})
+        prompts.append({"part": n, "model": "haiku", "out": str(out), "first_id": first, "last_id": last,
+                        "ids": [c["id"] for c in batch], "claims": batch, "prompt": prompt})
     return prompts
+
+
+def audit_part_problems(feat, prompts):
+    """audit_prompts の各 part について、書かれた判定(_audit_part_<n>.json)が過不足なく1回ずつかを確かめる。
+
+    返り値 (verdict の辞書 {id: 行}, 問題 {part の番号: [文面]})。
+    WHY: 欠け(担当が書かなかった part)・他の part の項目を書いた・同じ id の重複・壊れた JSON を、判定の集計の前に止める。
+    問題のある part の行は辞書に入れない(別の項目の判定を今回の id に結ばないため)。
+    """
+    verdicts, problems = {}, {}
+    for p in prompts:
+        n, expected = p["part"], list(p["ids"])
+        part_p = INTER / f"{feat}_audit_part_{n}.json"
+        msgs, rows, readable = [], [], False
+        if not part_p.exists():
+            msgs.append(f"書かれていない: {part_p.name}")
+        else:
+            try:
+                data = json.loads(part_p.read_text(encoding="utf-8"))
+                rows = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+                readable = isinstance(data, list)
+                if not readable or len(rows) != len(data):
+                    msgs.append("JSON の配列でない行がある")
+            except (OSError, ValueError):
+                msgs.append(f"JSON として読めない: {part_p.name}")
+        ids = [str(r.get("id")) for r in rows]
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        stray = [i for i in dict.fromkeys(ids) if i not in expected]
+        lost = [i for i in expected if i not in ids] if readable else []
+        if dup:
+            msgs.append(f"同じ id が重複: {','.join(dup[:8])}")
+        if stray:
+            msgs.append(f"この part(part {n}: {p['first_id']}〜{p['last_id']})の項目でない id: {','.join(stray[:8])}" + ("…" if len(stray) > 8 else ""))
+        if lost:
+            msgs.append(f"判定が欠けている id: {','.join(lost[:8])}" + (f"…(計 {len(lost)} 件)" if len(lost) > 8 else ""))
+        if msgs:
+            problems[n] = msgs
+            continue
+        for r in rows:
+            verdicts[str(r.get("id"))] = r
+    return verdicts, problems
 
 
 def main(argv=None):
@@ -466,6 +546,9 @@ def main(argv=None):
         out = INTER / f"{a.feature}_audit_prompts.json"
         out.write_text(json.dumps(prompts, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"判定項目 {len(claims)} 件を {len(prompts)} 依頼に分けて {out} に書いた")
+        # WHY: 呼出元が part の番号を取り違えないよう、番号と範囲を並べて見せる(配列の位置ではなく各要素の part を使う)
+        for p in prompts:
+            print(f"  part {p['part']}: {p['first_id']}〜{p['last_id']}({len(p['ids'])}件) → {Path(p['out']).name}")
         return 0
     if a.cmd == "audit-check":
         # WHY: 意味の照合(audit)の判定(part)を集めて結果にまとめ、ng は owner ごとの差し戻しにする。
@@ -476,13 +559,40 @@ def main(argv=None):
             print(f"判定項目が無い: {claims_p}(build_audit_claims.py を先に流す)", file=sys.stderr)
             return 1
         claims = json.loads(claims_p.read_text(encoding="utf-8"))
-        # WHY: 再判定の結果(_retry.json)は最後に読み、先の判定を上書きする。名前順だけでは retry が先に来うるため並べ替える
-        verdicts = {}
-        parts = sorted(INTER.glob(f"{a.feature}_audit_part_*.json"),
-                       key=lambda p: (p.name.endswith("_retry.json"), p.name))
-        for part in parts:
-            for row in json.loads(part.read_text(encoding="utf-8")):
-                verdicts[str(row.get("id"))] = row
+        # WHY: audit が書いた audit_prompts.json の各 part(ids と claims の写し)を正とし、全判定項目が1回ずつ判定されたかを確かめる。
+        # claims.json は after の再実行などで作り直され、前回 ok の項目が除かれて id が振り直されうる(2026-10-15 run13 で本文が4件ずれていた)。
+        # 判定は audit が渡した項目に結ぶので、claims.json でなく audit_prompts.json の claims を使い、食い違いは警告する。
+        plan_p = INTER / f"{a.feature}_audit_prompts.json"
+        plan = json.loads(plan_p.read_text(encoding="utf-8")) if plan_p.exists() else None
+        if plan and all("claims" in p for p in plan):
+            frozen = [c for p in plan for c in p["claims"]]
+            if {c["id"]: c["text"] for c in frozen} != {c["id"]: c["text"] for c in claims}:
+                print(f"[警告] {claims_p.name} が audit の後で作り直されている。判定は audit_prompts.json の判定項目に結ぶ"
+                      "(判定項目を作り直したなら audit からやり直す)", file=sys.stderr)
+            claims = frozen
+            verdicts, problems = audit_part_problems(a.feature, plan)
+            if problems:
+                # WHY: 欠け・重複・他の part の項目があるまま集計すると、欠けが unknown に化けて sonnet の再判定に回り、原因(担当の取り違え)が隠れる。
+                # 集計せず、やり直す part の番号と、その part の依頼文の場所を返す
+                print(json.dumps({
+                    "ok": False, "redo_parts": sorted(problems), "problems": {str(n): m for n, m in sorted(problems.items())},
+                    "hint": f"{plan_p} の part N の prompt に従って、その part だけ担当を起動し直す(書き先は各 part の out)。直したら audit-check をもう一度流す",
+                    "prompts": str(plan_p)}, ensure_ascii=False, indent=1))
+                return 1
+        else:
+            # 古い形の audit_prompts.json(claims の写しが無い)・または audit を通っていない場合は従来どおり、番号つきの part を全部読む
+            verdicts = {}
+            for part in sorted(INTER.glob(f"{a.feature}_audit_part_*.json")):
+                if re.fullmatch(r"\d+", part.stem.rsplit("_", 1)[-1]):
+                    for row in json.loads(part.read_text(encoding="utf-8")):
+                        verdicts[str(row.get("id"))] = row
+        # WHY: 再判定の結果(_retry.json)は最後に読み、先の判定を上書きする
+        retry_p = INTER / f"{a.feature}_audit_part_retry.json"
+        if retry_p.exists():
+            ids_now = {c["id"] for c in claims}
+            for row in json.loads(retry_p.read_text(encoding="utf-8")):
+                if str(row.get("id")) in ids_now:
+                    verdicts[str(row.get("id"))] = row
         results = []
         for c in claims:
             row = verdicts.get(c["id"])
@@ -493,7 +603,7 @@ def main(argv=None):
             else:
                 verdict, reason = "unknown", "判定の値が不正"
             results.append({
-                "id": c["id"], "kind": c.get("kind"), "owner": c.get("owner"),
+                "id": c["id"], "kind": c.get("kind"), "owner": c.get("owner"), "subject": c.get("subject"),
                 "text": c.get("text"), "src_excerpt": c.get("src_excerpt"),
                 "verdict": verdict, "evidence_line": (row or {}).get("evidence_line"), "reason": reason,
             })
@@ -518,9 +628,7 @@ def main(argv=None):
         if unknown and not (INTER / f"{a.feature}_audit_part_retry.json").exists():
             # WHY: Haiku で決められなかった件(unknown)だけを sonnet に1回判定させる。ok を含む全件は読み直さない
             retry_out = INTER / f"{a.feature}_audit_part_retry.json"
-            items = [{"id": c["id"], "statement": c["text"],
-                      "src_excerpt": {**(c.get("src_ref") or {}), "text": c.get("src_excerpt") or ""}}
-                     for c in unknown]
+            items = [_audit_item(c) for c in unknown]
             prompt = "\n".join([
                 f"design-doc の意味の照合の再判定(sonnet)。機能名: {a.feature}。",
                 f"- 手順書: {SKILL / 'prompts' / 'AU_意味の照合.md'}(読んで従う)",
