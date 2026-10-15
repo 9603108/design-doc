@@ -450,6 +450,172 @@ SELFTESTS.append(_selftest_example_arith_miss)
 SELFTESTS.append(_selftest_example_arith_floor)
 
 
+# 画面が件数を表示する式: JSX の {X.length} とテンプレートの ${X.length}。直後が } か算術演算子のものだけを拾う。
+# WHY: 件数を条件に使う式({rows.length > 1 && …}・disabled={!rows.length})は表示でなく、写しを求めない。
+#      field_usage は .length の使用を載せないので、写し漏れ([写しの漏れ])の検査では拾えない(run14 の IT14・IT64)。画面のソースの字面から直接拾う。
+_COUNT_SHOWN = re.compile(r"(?:\$\{|\{)\s*([A-Za-z_]\w*)\.length\s*(?:\}|[+\-*/])")
+# 件数の写しと認める transform の語(api_field_path が件数の形でないときの救済)
+_COUNT_WORDS = re.compile(r"length|件数|行数|店数|レジ数|台数|個数|の数|数を|何件|件の")
+
+
+def _count_mapping_ok(maps, item_name, resp_key) -> bool:
+    """item_name への写しに、応答 resp_key の件数の写しがあるか。api_field_path が resp_key・resp_key[]・resp_key.length・resp_key[].length
+    のどれか、または transform に件数の語があるもの(根は resp_key)。呼出元: check_count_mapping。
+    resp_key が None のとき(下書きが応答のキーを持たない古い版)は、根を問わず同じ形・語で見る。"""
+    for m in maps:
+        if m.get("screen_item_name") != item_name:
+            continue
+        path = str(m.get("api_field_path") or "").strip()
+        shape = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\])?(?:\.length)?", path)
+        root = re.split(r"[\[.]", path)[0]
+        if shape and (resp_key is None or shape.group(1) == resp_key):
+            return True
+        if _COUNT_WORDS.search(str(m.get("transform") or "")) and (resp_key is None or root == resp_key):
+            return True
+    return False
+
+
+def check_count_mapping(d) -> list:
+    """画面が配列の件数({shops.length}・${rows.length})を表示している項目に、その応答の件数の写しが無ければ指摘する(WARN)。
+    対: react_draft.failure_effects[].on_success_from(state → 応答のキー)で API の応答から入る配列 state の .length を、画面項目の
+    出典(src)の行範囲の字面から拾い、api_spec[].response_to_screen_mapping に同じ項目名への件数の写しがあるかを見る。
+    WHY: 件数は応答の1項目でなく配列の長さなので、field_usage(rows[].xxx の使用)に載らず、[写しの漏れ] が拾えない。件数がどの応答から来るかが
+    写しに無いと、設計書だけでは数の出所が分からない(run14: IT14 の「N レジ分」・IT64 の「N 店だけ」)。
+    1つの式を複数の項目の src が囲むとき(Card の見出しと副題など)は、いちばん狭い範囲の項目だけを持ち主とする(囲む側を誤検出しない)。
+    Where: 呼出元は run(_vs_checks_ext.run_all 経由で verify_vs_source.main)。
+    読むキー: main.screen_layout.items[].item_name・no・src、main.api_spec[].response_to_screen_mapping、react_draft.failure_effects。
+    必要な JSON が d に無いときは [] を返す。"""
+    main = d.get("main")
+    rd = d.get("react_draft")
+    if not main or not rd:
+        return []
+    # 応答から入る配列 state → 応答のキー。on_success_from(新しい下書き)が正。無い古い下書きは、成功時に設定する state のうち初期値が [] のものを、
+    # 応答のキー不明(None)で入れる(run8・run9 の下書きは on_success_from を持たない)
+    empty_arr = {s.get("state") for s in rd.get("state_initials") or [] if isinstance(s, dict) and str(s.get("initial") or "").strip() == "[]"}
+    arr_of = {}
+    for fe in rd.get("failure_effects") or []:
+        if not isinstance(fe, dict):
+            continue
+        frm = fe.get("on_success_from") if isinstance(fe.get("on_success_from"), dict) else {}
+        arr_of.update({k: v for k, v in frm.items() if k and v})
+        for st in fe.get("on_success") or []:
+            if st in empty_arr:
+                arr_of.setdefault(st, None)
+    if not arr_of:
+        return []
+    items = [i for i in (main.get("screen_layout") or {}).get("items") or [] if isinstance(i, dict)]
+    maps = [m for a in main.get("api_spec") or [] if isinstance(a, dict) for m in a.get("response_to_screen_mapping") or [] if isinstance(m, dict)]
+    files = {}
+    for it in items:
+        for s in it.get("src") or []:
+            if isinstance(s, dict) and s.get("file"):
+                files.setdefault(s["file"], None)
+    out = []
+    for f in files:
+        try:
+            lines = Path(f).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for ln, text in enumerate(lines, 1):
+            for m in _COUNT_SHOWN.finditer(text):
+                state = m.group(1)
+                if state not in arr_of:
+                    continue
+                # この行を囲む出典を持つ項目のうち、範囲がいちばん狭いもの(同じ狭さは全部)
+                cover = [(int(s["line_end"]) - int(s["line_start"]), it) for it in items for s in it.get("src") or []
+                         if isinstance(s, dict) and s.get("file") == f and isinstance(s.get("line_start"), int)
+                         and s["line_start"] <= ln <= int(s.get("line_end") or s["line_start"])]
+                if not cover:
+                    continue
+                narrow = min(w for w, _ in cover)
+                owners = list({id(it): it for w, it in cover if w == narrow}.values())
+                # WHY: 同じ範囲の項目が複数あるとき(Card の見出しと副題が同じ行範囲を持つ run11 の IT13・IT14)は、どれが件数を出すか src で決められない。
+                #      どれかに件数の写しがあれば足り、1件も無いときだけ、候補を並べて1件で指摘する(同じ式で項目の数だけ指摘して重ねない)
+                if any(_count_mapping_ok(maps, o.get("item_name"), arr_of[state]) for o in owners):
+                    continue
+                key = arr_of[state]  # None は古い下書き(応答のキー不明)
+                names = "・".join(f"「{o.get('item_name')}」" for o in owners) + ("のどれか" if len(owners) > 1 else "")
+                nos = "・".join(str(o.get("no") or o.get("item_name")) for o in owners)
+                where = f"screen_layout.items[{nos}] ({Path(f).name}:{ln})"
+                msg = (f"画面は {state}.length({'応答 ' + key if key else '応答の配列'} の件数)を表示しているが、response_to_screen_mapping に{names}への"
+                       f"件数の写しが無い。api_field_path を {key or '<配列名>'}.length にし、transform に件数を何として出すかを書く → 差し戻し先 S2")
+                out.append(_vs_common.warn("件数の写し", where, msg))
+    return list(dict.fromkeys(out))
+
+
+def _count_mapping_out(maps, same_span_item=None, react=None) -> list:
+    """selftest 用: 件数を表示する2行(IT64 の {shops.length}・IT14 の ${rows.length})、条件に使う行(.length > 1・!rows.length)、
+    それらを囲む広い項目(IT13)を持つ一時の TSX と、その d(写しは maps)に check_count_mapping を掛けた結果を返す。呼出元: _selftest_count_mapping_*。"""
+    with tempfile.TemporaryDirectory() as td:
+        tsx = Path(td, "C.tsx")
+        tsx.write_text("\n".join([
+            "{rows.length > 1 && (",                                   # 1
+            "  <Card",                                                  # 2
+            "    subtitle={`${applied.from} / ${rows.length}レジ分`}",  # 3
+            "  />",                                                     # 4
+            ")}",                                                       # 5
+            "<button disabled={!rows.length}>CSV</button>",             # 6
+            "<div>POSがあるのは",                                       # 7
+            "  {shops.length}店だけ",                                   # 8
+            "</div>",                                                   # 9
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+
+        def span(a, b):
+            return [{"file": f, "line_start": a, "line_end": b}]
+        items = [{"no": "IT13", "item_name": "合計カードの見出し", "src": span(1, 5)},
+                 {"no": "IT14", "item_name": "合計カードの副題", "src": span(3, 3)},
+                 {"no": "IT8", "item_name": "CSV出力", "src": span(6, 6)},
+                 {"no": "IT64", "item_name": "注記", "src": span(7, 9)}]
+        if same_span_item:  # 同じ範囲(3 行目)を持つもう1つの項目(IT14 と同じ狭さ)
+            items.append(dict(same_span_item, src=span(3, 3)))
+        d = {
+            "main": {"screen_layout": {"items": items}, "api_spec": [{"response_to_screen_mapping": maps}]},
+            "react_draft": react or {"failure_effects": [{"call": "fetchShops", "on_success_from": {"shops": "rows"}},
+                                                         {"call": "fetchRows", "on_success_from": {"rows": "rows"}}]},
+        }
+        return check_count_mapping(d)
+
+
+def _selftest_count_mapping_hit() -> bool:
+    """check_count_mapping の当たり: 件数の写しが無ければ表示している2項目(IT14・IT64)だけ出る。囲む広い項目(IT13)・条件の .length(IT8 など)は出ない。"""
+    out = _count_mapping_out([{"api_field_path": "rows[].id", "screen_item_name": "注記"}])
+    return len(out) == 2 and any("IT14" in o for o in out) and any("IT64" in o for o in out) and not any("IT13" in o or "IT8" in o for o in out) \
+        and all(o.endswith("差し戻し先 S2") for o in out)
+
+
+def _selftest_count_mapping_miss() -> bool:
+    """check_count_mapping の外れ: 件数の写し(path が rows.length)・transform に件数の語がある写しがあれば出ない。応答の根が違う写しは件数と認めない。"""
+    ok = [{"api_field_path": "rows.length", "screen_item_name": "合計カードの副題", "transform": "行数を出す"},
+          {"api_field_path": "rows[].id", "screen_item_name": "注記", "transform": "選択肢の件数を「N 店」に出す"}]
+    other_root = [{"api_field_path": "items.length", "screen_item_name": "合計カードの副題"},
+                  {"api_field_path": "rows.length", "screen_item_name": "注記"}]
+    return _count_mapping_out(ok) == [] and len(_count_mapping_out(other_root)) == 1
+
+
+def _selftest_count_mapping_tie_old() -> bool:
+    """check_count_mapping の同じ範囲・古い下書き。
+    同じ範囲の項目が2つ(IT14 と IT15)あり件数の写しが無ければ、IT14 の分は1件にまとまり(「のどれか」)、どちらかに写しがあれば出ない(run11 の IT13・IT14)。
+    on_success_from が無い古い下書き(run8・run9)は、成功時に設定する初期値 [] の state を配列とし、応答のキーを問わず件数の形の写しを認める。"""
+    tie = _count_mapping_out([], same_span_item={"no": "IT15", "item_name": "副題の別名"})
+    tie_hit = [o for o in tie if "IT14" in o]
+    ok = _count_mapping_out([{"api_field_path": "rows.length", "screen_item_name": "副題の別名"}], same_span_item={"no": "IT15", "item_name": "副題の別名"})
+    old = {"failure_effects": [{"call": "fetchShops", "on_success": ["shops"]}, {"call": "fetchRows", "on_success": ["rows", "other"]}],
+           "state_initials": [{"state": "shops", "initial": "[]"}, {"state": "rows", "initial": "[]"}, {"state": "other", "initial": "false"}]}
+    old_hit = _count_mapping_out([], react=old)
+    old_ok = _count_mapping_out([{"api_field_path": "items.length", "screen_item_name": "合計カードの副題"},
+                                 {"api_field_path": "rows", "screen_item_name": "注記"}], react=old)
+    return (len(tie_hit) == 1 and "IT14・IT15" in tie_hit[0] and "のどれか" in tie_hit[0] and all("IT13" not in o for o in tie)
+            and [o for o in ok if "IT14" in o] == [] and len(old_hit) == 2 and old_ok == [])
+
+
+# 件数の写しの検査を CHECKS と SELFTESTS に登録する(run と selftest が呼ぶ)
+CHECKS.append(check_count_mapping)
+SELFTESTS.append(_selftest_count_mapping_hit)
+SELFTESTS.append(_selftest_count_mapping_miss)
+SELFTESTS.append(_selftest_count_mapping_tie_old)
+
+
 def run(inter_dir, feature) -> list:
     """d = _vs_common.load(...) を各 check に渡し、指摘の行を連結して返す。呼出元: _vs_checks_ext.run_all。"""
     d = _vs_common.load(Path(inter_dir), feature)

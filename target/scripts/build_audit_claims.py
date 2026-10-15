@@ -77,15 +77,140 @@ def _src_from_api(merged, row):
     return None
 
 
-def _candidates(merged):
+def _src_from_error(merged, row):
+    """出典の無い検査(VL)が message_id を持つとき、同じ message_id の error_patterns・messages の出典を当てる。引けなければ None。
+    WHY: API 側の入力検査(kind=API検査)は、request_params の名前が文に無くても、エラーの行(message_id で結ぶ)が出典を持つ。"""
+    mid = row.get("message_id")
+    if not mid:
+        return None
+    for api in merged.get("api_spec") or []:
+        for e in api.get("error_patterns") or []:
+            if isinstance(e, dict) and e.get("message_id") == mid and _src_of(e):
+                return _src_of(e)
+    for key in ("messages_backend", "messages"):
+        for m in merged.get(key) or []:
+            if isinstance(m, dict) and m.get("message_id") == mid and _src_of(m):
+                return _src_of(m)
+    return None
+
+
+def _src_from_screen(merged, row):
+    """出典の無い検査(VL)の対象(field)が画面項目の名前なら、その項目の出典を、領域(エリア)の名前なら、領域の項目の出典の範囲(同じファイルの最小〜最大の行)を返す。
+    WHY: 最後の手段。検査が元にした画面の場所(対象の項目・エリア)の行を最低限入れ、抜粋を空にしない。引けなければ None。"""
+    field = str(row.get("field") or "").strip()
+    if not field:
+        return None
+    sl = merged.get("screen_layout") or {}
+    items = [i for i in sl.get("items") or [] if isinstance(i, dict)]
+    for it in items:
+        if it.get("item_name") == field and _src_of(it):
+            return _src_of(it)
+    for ar in sl.get("areas") or []:
+        if isinstance(ar, dict) and ar.get("area_name") == field:
+            srcs = [_src_of(it) for it in items if it.get("area_ref") == ar.get("area_no") and _src_of(it)]
+            if srcs:
+                same = [s for s in srcs if s["file"] == srcs[0]["file"]]
+                return {"file": srcs[0]["file"], "line_start": min(s["line_start"] for s in same),
+                        "line_end": max(int(s.get("line_end") or s["line_start"]) for s in same)}
+    return None
+
+
+def _src_from_react(react, section, name):
+    """出典の無い行(画面項目の備考・計算の備考)の出典を、react 下書きの同じ名前の行から引く。引けなければ None。
+    section: "item"=jsx_elements[].label と display_rows[].labels / "calc"=calc_candidates[].label。名前が同じ行の最初の出典を返す。
+    WHY: 古い版の中間 JSON は計算・画面項目に src が無く、抜粋が空 → 判定が必ず unknown だった(run10〜run12 の CA・備考)。下書きは機械抽出で出典が正。"""
+    name = str(name or "").strip()
+    if not name or not react:
+        return None
+    if section == "calc":
+        rows = [c for c in react.get("calc_candidates") or [] if isinstance(c, dict) and c.get("label") == name]
+    else:
+        rows = [e for e in react.get("jsx_elements") or [] if isinstance(e, dict) and e.get("label") == name]
+        rows += [r for r in react.get("display_rows") or [] if isinstance(r, dict) and name in (r.get("labels") or [])]
+    for r in rows:
+        if _src_of(r):
+            return _src_of(r)
+    return None
+
+
+# validations[].kind → react 下書きの behaviors[].kind。verify_vs_source._KIND_OF と同じ対応
+_VL_TO_BEHAVIOR = {"入力検査": "input_check", "表示切替": "display_toggle", "活性切替": "enable_toggle", "絞り込み": "data_filter"}
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+def _srcs_overlap(a, b):
+    """出典 a・b(file・line_start・line_end の dict)が同じファイルで行が重なるか。"""
+    return a.get("file") == b.get("file") and not (int(a.get("line_end") or a["line_start"]) < b["line_start"]
+                                                   or a["line_start"] > int(b.get("line_end") or b["line_start"]))
+
+
+def _behavior_pair_score(merged, v, b):
+    """検査 v(validations の行)と振る舞い b(react 下書きの behaviors の行)が同じ処理を指す見込みの点数。0 は無関係。
+    (a) b.target(画面に出す文言)が v の文に「…」で引かれている +3 / (b) v の文と b の cond・target に共通の英数字の識別子 +1 ずつ /
+    (c) v の対象(field)の画面項目の出典と b の出典(src・control_src)が重なる +2。呼出元: _vl_behavior_srcs。"""
+    text = f"{v.get('rule') or ''} {v.get('applied_when') or ''}"
+    score = 0
+    target = str(b.get("target") or "").strip()
+    if target and f"「{target}」" in text:
+        score += 3
+    score += len(set(_WORD_RE.findall(f"{b.get('cond') or ''} {target}")) & set(_WORD_RE.findall(text)))
+    field = v.get("field")
+    bsrcs = [s for s in (b.get("src") or []) + (b.get("control_src") or []) if isinstance(s, dict) and isinstance(s.get("line_start"), int)]
+    for it in (merged.get("screen_layout") or {}).get("items") or []:
+        if isinstance(it, dict) and it.get("item_name") == field:
+            if any(_srcs_overlap(s, x) for s in (it.get("src") or []) if isinstance(s, dict) and isinstance(s.get("line_start"), int) for x in bsrcs):
+                score += 2
+                break
+    return score
+
+
+def _vl_behavior_srcs(merged, react, lacking):
+    """出典の無い検査 lacking(validations の添字の一覧)の出典を、react 下書きの behaviors から引いて {添字: src} で返す。
+    WHY(2026-10-15 run14): validations は合成が src を付けず(_units._fill_src の対象外)、検査の元になった画面の処理は react 下書きの
+    behaviors(表示切替・活性切替・絞り込み・入力検査)にある。run14 は VL5〜VL15 の11件が出典なしで、抜粋が空 → 判定が必ず unknown だった。
+    対応づけ: 同じ kind の中で、点数(_behavior_pair_score)が高い組から1対1に決める。残りが同数なら、決めた組の順序が単調(検査の並び=ソースの並び)
+    のときだけ並び順で結ぶ(順序が食い違うなら、別の処理の行を渡して誤判定させるより、空のまま次の手段に回す)。"""
+    vls = merged.get("validations") or []
+    out = {}
+    for kind_ja, kind_b in _VL_TO_BEHAVIOR.items():
+        mine = [i for i in lacking if isinstance(vls[i], dict) and vls[i].get("kind") == kind_ja]
+        bhs = [b for b in (react or {}).get("behaviors") or [] if isinstance(b, dict) and b.get("kind") == kind_b and _src_of(b)]
+        if not mine or not bhs:
+            continue
+        pairs = sorted(((_behavior_pair_score(merged, vls[i], b), -i, -j, i, j) for i in mine for j, b in enumerate(bhs)), reverse=True)
+        used_v, used_b, matched = set(), set(), []
+        for score, _ni, _nj, i, j in pairs:
+            if score > 0 and i not in used_v and j not in used_b:
+                used_v.add(i)
+                used_b.add(j)
+                matched.append((i, j))
+        left_v = [i for i in mine if i not in used_v]
+        left_b = [j for j in range(len(bhs)) if j not in used_b]
+        ordered = [j for _i, j in sorted(matched)]
+        if left_v and len(left_v) == len(left_b) and ordered == sorted(ordered):
+            matched += list(zip(left_v, left_b))
+        for i, j in matched:
+            out[i] = _src_of(bhs[j])
+    return out
+
+
+def _candidates(merged, react=None):
     """判定項目の候補 (kind, 欄の道筋, 記述の本文, src, 主語)。空の記述は候補にしない。
     WHY: 種類は「意味の判定が要る記述」に限る。型・件数のような機械で決まる欄は verify_* 系に任せる。
-    主語(subject)は、文だけでは何の記述か分からない項目(「点数と金額の2列。左段」)の対象を判定者に伝える。"""
+    主語(subject)は、文だけでは何の記述か分からない項目(「点数と金額の2列。左段」)の対象を判定者に伝える。
+    react は react 下書き(無ければ None)。出典の無い検査(VL)の出典を behaviors から引くのに使う。"""
     out = []
+    vls = merged.get("validations") or []
+    # 出典の無い検査: 自分の src → request_params の API → 同じ処理の振る舞い → 同じ message_id のエラー・メッセージの行 → 対象の画面項目・エリア の順に探す
+    # WHY: 振る舞い(表示の条件の行)を message_id のメッセージ(文言を出す行だけ)より先にする。VL12 は条件(290 行)でなく文言(292〜294 行)だけが渡っていた
+    lacking = [i for i, v in enumerate(vls) if isinstance(v, dict) and str(v.get("rule") or "").strip()
+               and not (_src_of(v) or _src_from_api(merged, v))]
+    beh = _vl_behavior_srcs(merged, react, lacking)
     for i, it in enumerate((merged.get("screen_layout") or {}).get("items") or []):
         if str(it.get("remarks") or "").strip():
             subj = f"画面項目「{it.get('item_name') or ''}」({it.get('item_type') or ''})の備考"
-            out.append(("remarks", f"screen_layout.items[{i}].remarks", it["remarks"], _src_of(it), subj))
+            out.append(("remarks", f"screen_layout.items[{i}].remarks", it["remarks"],
+                        _src_of(it) or _src_from_react(react, "item", it.get("item_name")), subj))
     for i, fp in enumerate(merged.get("front_processes") or []):
         for j, st in enumerate(fp.get("steps") or []):
             if str(st.get("description") or "").strip():
@@ -96,13 +221,15 @@ def _candidates(merged):
         if str(cl.get("description") or "").strip():
             out.append(("cl", f"common_logic[{i}].description", cl["description"], _src_of(cl),
                         f"共通ロジック {cl.get('no') or ''}「{cl.get('name') or ''}」の説明"))
-    for i, v in enumerate(merged.get("validations") or []):
+    for i, v in enumerate(vls):
         if str(v.get("rule") or "").strip():
-            out.append(("vl", f"validations[{i}].rule", v["rule"], _src_of(v) or _src_from_api(merged, v),
+            out.append(("vl", f"validations[{i}].rule", v["rule"],
+                        _src_of(v) or _src_from_api(merged, v) or beh.get(i) or _src_from_error(merged, v) or _src_from_screen(merged, v),
                         f"検査 {v.get('no') or ''}(対象: {v.get('field') or ''})の rule"))
     for i, c in enumerate(merged.get("calculations") or []):
         if str(c.get("remarks") or "").strip():
-            out.append(("calc_remarks", f"calculations[{i}].remarks", c["remarks"], _src_of(c),
+            out.append(("calc_remarks", f"calculations[{i}].remarks", c["remarks"],
+                        _src_of(c) or _src_from_react(react, "calc", c.get("name")),
                         f"計算 {c.get('no') or ''}「{c.get('name') or ''}」の備考"))
     return out
 
@@ -398,12 +525,13 @@ def _excerpt(src, project_root, cache, merged=None, statement=""):
     return ex.text()
 
 
-def build_claims(merged, project_root, prior_ok, units):
+def build_claims(merged, project_root, prior_ok, units, react=None):
     """判定項目の一覧を作る。prior_ok は前回 ok だった (text, src_excerpt) の集合で、そのまま除く（キャッシュ）。
-    呼出元 = main() と _selftest()。owner は run_units.owner_of で欄の道筋から決める（引けなければ None）。"""
+    呼出元 = main() と _selftest()。owner は run_units.owner_of で欄の道筋から決める（引けなければ None）。
+    react は react 下書き(出典の無い検査の出典を behaviors から引く。無ければ None)。"""
     cache = {}
     claims = []
-    for kind, road, text, src, subject in _candidates(merged):
+    for kind, road, text, src, subject in _candidates(merged, react):
         excerpt = _excerpt(src, project_root, cache, merged, text) if src else ""
         if (text, excerpt) in prior_ok:
             continue
@@ -512,6 +640,59 @@ def _selftest():
         if "def handler" not in c3[0]["src_excerpt"]:
             print(f"[selftest NG] 出典の無い VL に API の出典が当たっていない: {c3[0]['src_excerpt']!r}")
             return 0
+        # 画面の処理の検査(表示切替・活性切替)で出典が無いものは、react 下書きの behaviors から引く(run14 の VL5〜VL15)。
+        # VL1(「新」の印・文言で結ぶ)・VL2(エラー・変数で結ぶ)・VL3(対象項目の出典で結ぶ)・VL4(点数が付かない2件を並び順で結ぶ)・VL5(対象がエリアで behaviors が無い)
+        vui = Path(tmp) / "v.tsx"
+        vui.write_text("\n".join(f"v{i}" for i in range(1, 31)) + "\n", encoding="utf-8")
+
+        def sp(a, b=None):
+            return [{"file": str(vui), "line_start": a, "line_end": b or a}]
+        m4 = {"screen_layout": {"items": [{"item_name": "CSV出力", "item_type": "Button", "src": sp(20)},
+                                          {"item_name": "左の項目", "item_type": "Label", "area_ref": "AR1", "src": sp(3, 4)},
+                                          {"item_name": "右の項目", "item_type": "Label", "area_ref": "AR1", "src": sp(8, 9)}],
+                                "areas": [{"area_no": "AR1", "area_name": "表エリア"}]},
+              "validations": [
+                  {"no": "VL1", "field": "表エリア", "kind": "表示切替", "rule": "行の見出しに「新」の印を付ける", "applied_when": "追加の行のとき"},
+                  {"no": "VL2", "field": "表エリア", "kind": "表示切替", "rule": "取得に失敗したとき、エラー内容を画面に出す", "applied_when": "error に値が入ったとき"},
+                  {"no": "VL3", "field": "CSV出力", "kind": "活性切替", "rule": "行が0件のとき押せない", "applied_when": "行の件数だけで決まる"},
+                  {"no": "VL4", "field": "表エリア", "kind": "表示切替", "rule": "1つ目の何か", "applied_when": "a"},
+                  {"no": "VL5", "field": "表エリア", "kind": "入力検査", "rule": "何かを調べる", "applied_when": "b"}],
+              "front_processes": [], "common_logic": [], "calculations": []}
+        react = {"behaviors": [
+            {"id": "BH1", "kind": "display_toggle", "cond": "s.added", "target": "新", "src": sp(11)},
+            {"id": "BH2", "kind": "display_toggle", "cond": "error", "target": "div", "src": sp(12)},
+            {"id": "BH3", "kind": "display_toggle", "cond": "x", "target": "y", "src": sp(13)},
+            {"id": "BH4", "kind": "enable_toggle", "cond": "!rows.length", "target": "CSV出力", "src": sp(20)}]}
+        c4 = {c["subject"].split("(")[0]: c for c in build_claims(m4, "", set(), units, react)}
+        want = {"検査 VL1": "v11", "検査 VL2": "v12", "検査 VL3": "v20", "検査 VL4": "v13"}
+        for k, line in want.items():
+            if line not in c4[k]["src_excerpt"].splitlines():
+                print(f"[selftest NG] 出典の無い VL {k} に behaviors の出典 {line} が当たっていない: {c4[k]['src_excerpt']!r}")
+                return 0
+        # VL5 は同じ kind(入力検査)の behaviors が無い → 対象(表エリア)の項目の範囲(3〜9 行)
+        if "v3" not in c4["検査 VL5"]["src_excerpt"].splitlines() or "v9" not in c4["検査 VL5"]["src_excerpt"].splitlines():
+            print(f"[selftest NG] 出典の無い VL に対象エリアの出典が当たっていない: {c4['検査 VL5']['src_excerpt']!r}")
+            return 0
+        # behaviors が無い(react=None)でも、対象の画面項目・エリアの出典で抜粋は空にならない
+        if any(not c["src_excerpt"] for c in build_claims(m4, "", set(), units)):
+            print("[selftest NG] react が無いときに抜粋が空の VL が残った")
+            return 0
+        # 計算の備考・画面項目の備考で src が無いものは、react 下書きの同じ名前(calc_candidates・jsx_elements の label)の出典を使う
+        m6 = {"screen_layout": {"items": [{"item_name": "合計", "item_type": "Label", "remarks": "全行の合算"}]},
+              "calculations": [{"no": "CA1", "name": "差引", "remarks": "小計から返品を引く"}]}
+        r6 = {"calc_candidates": [{"label": "差引", "src": sp(5)}], "jsx_elements": [{"label": "合計", "src": sp(15)}]}
+        c6 = {c["kind"]: c for c in build_claims(m6, "", set(), units, r6)}
+        if "v5" not in c6["calc_remarks"]["src_excerpt"].splitlines() or "v15" not in c6["remarks"]["src_excerpt"].splitlines():
+            print(f"[selftest NG] 出典の無い計算・画面項目の備考に react 下書きの出典が当たっていない: {c6}")
+            return 0
+        # 並び順の結びは、点数で決めた組の順序が食い違うときは使わない(別の処理の行を渡さない)
+        m5 = dict(m4, validations=[{"no": "VL1", "field": "表エリア", "kind": "表示切替", "rule": "「y」を出す", "applied_when": "a"},
+                                   {"no": "VL2", "field": "表エリア", "kind": "表示切替", "rule": "「新」を出す", "applied_when": "b"},
+                                   {"no": "VL3", "field": "表エリア", "kind": "表示切替", "rule": "何か", "applied_when": "c"}])
+        got = _vl_behavior_srcs(m5, react, [0, 1, 2])
+        if got.get(0, {}).get("line_start") != 13 or got.get(1, {}).get("line_start") != 11 or 2 in got:
+            print(f"[selftest NG] 点数で決めた組(VL1→行13・VL2→行11)の順序が食い違うのに、並び順で残りを結んだ: {got}")
+            return 0
     print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加")
     return 0
 
@@ -532,10 +713,18 @@ def main(argv):
         sc = load_screen_config(feature)
     except FileNotFoundError:
         sc = {}
-    claims = build_claims(merged, sc.get("project_root") or "", load_prior_ok(feature), load_units())
+    # react 下書き(無ければ None)。出典の無い検査(VL)の出典を behaviors から引く
+    try:
+        react = json.loads((INTERMEDIATE_DIR / f"{feature}_react_draft.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        react = None
+    claims = build_claims(merged, sc.get("project_root") or "", load_prior_ok(feature), load_units(), react)
     out = INTERMEDIATE_DIR / f"{feature}_audit_claims.json"
     out.write_text(json.dumps(claims, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"判定項目 {len(claims)} 件を {out} に書いた（owner が None の件数 {sum(1 for c in claims if c['owner'] is None)}）")
+    # WHY: 抜粋が空の項目は判定が必ず unknown になる(run14 の VL5〜VL15)。件数を出して、出典の引けなかった項目に気づけるようにする
+    empty = [c["id"] for c in claims if not c["src_excerpt"]]
+    print(f"判定項目 {len(claims)} 件を {out} に書いた（owner が None の件数 {sum(1 for c in claims if c['owner'] is None)}、"
+          f"src_excerpt が空の件数 {len(empty)}" + (f": {', '.join(empty[:10])}" if empty else "") + "）")
     return 0
 
 

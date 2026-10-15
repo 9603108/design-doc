@@ -11,6 +11,7 @@ d(_vs_common.load の戻り)の読み方は _vs_common の docstring。
 【検査の足し方】
   1. check(d) -> list[str] の関数を書く。指摘が無ければ []。必要な JSON が d に無いときも [] を返す(何も言わない)。
   2. 行は _vs_common.warn(tag, where, msg) で作る(新しい検査は [WARN]。終了コードに影響しない)。
+     例外: check_csv_column_name([CSV列名])は、依頼で ERROR とされたため、このファイルの _error で [ERROR] の行を作る(終了コード 1)。
   3. 関数を CHECKS に足す。
   4. 検査の正例・負例を、引数なしで bool を返す selftest 用の関数に書き、SELFTESTS に足す(selftest() が全部呼ぶ)。
 
@@ -179,6 +180,7 @@ def check_transform_zero_fill(d) -> list:
     """表示行(display_rows)の列で、null_as_zero(空を0として表示するか)と、写しの transform に0の扱いが書かれているかが
     食い違うものを指摘する。WHY: 0扱いの片側だけ仕様に残ると、空を0にするかどうかが写しから読めず、画面の表示が仕様と食い違う。
     列は specs の kin・cnt に対応する写し(api_field_path の末尾が列のキー)で結ぶ。transform が「そのまま」で始まるものは対象外。
+    null_as_zero は spec ごとの値を優先し(1列の行は single)、無ければ行単位の cell_format、それも None なら判定外。
     呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
     rd = d.get("react_draft")
     main = d.get("main")
@@ -197,7 +199,17 @@ def check_transform_zero_fill(d) -> list:
                 key = spec.get(kind)
                 if not key:
                     continue
-                zero = bool((cf.get(kind) or {}).get("null_as_zero"))
+                # WHY: 0扱いの事実は列(spec)ごとの null_as_zero({kin・cnt} か、1列の行は {single})が正。行単位の
+                # cell_format は三項演算の枝が決まらないと None のままになり、bool(None) を「0にしない」と断定すると
+                # run14 では全35列(spec は全部 true)が誤検出になった。1列の行(cnt 無し)の kin は single のキーで読む。
+                # spec に無いときだけ行単位へ落とし、それも None(未判定)なら「0にしない」とは言えないので対象外にする。
+                nz_key = "single" if kind == "kin" and not spec.get("cnt") else kind
+                zero = (spec.get("null_as_zero") or {}).get(nz_key)
+                if zero is None:
+                    zero = (cf.get(nz_key) or {}).get("null_as_zero")
+                if zero is None:
+                    continue
+                zero = bool(zero)
                 for m in mappings:
                     if m.get("api_field_path") != f"rows[].{key}" or m.get("screen_item_name") != spec.get("label"):
                         continue
@@ -233,7 +245,126 @@ def _selftest_transform_zero_fill() -> bool:
         }
     good = check_transform_zero_fill(d_with("金額を円で表示する。空のときは0", "件数として表示する"))
     bad = check_transform_zero_fill(d_with("金額を円で表示する", "件数として表示する。空のときは0"))
-    return good == [] and len(bad) == 2
+    # WHY: run14 の誤検出(全35列)の再現。cell_format が None(未判定)でも、spec の null_as_zero が true で
+    # transform に0の記述があれば指摘なし。1列の行(cnt 無し)は single で読む。spec が false で0を書けば1件。
+    def d_spec(nz, text, cf):
+        return {
+            "main": {"api_spec": [{"response_to_screen_mapping": [
+                {"api_field_path": "rows[].sou_kin", "screen_item_name": "総売上", "transform": text}]}]},
+            "react_draft": {"display_rows": [{"array": "LEFT", "src": [{"file": f, "line_start": 1, "line_end": 2}],
+                                              "cell_format": cf,
+                                              "specs": [{"label": "総売上", "kin": "sou_kin", "cnt": None, "null_as_zero": nz}]}]},
+        }
+    none_cf = {"kin": {"null_as_zero": None}, "single": {"null_as_zero": None}}
+    spec_ok = check_transform_zero_fill(d_spec({"single": True}, "金額として表示する。空のときは0", none_cf)) == []
+    # 行単位が None で spec も無ければ判定外(0を書いていても言わない)
+    undecided = check_transform_zero_fill(d_spec(None, "金額として表示する。空のときは0", none_cf)) == []
+    # spec が false なのに0を書けば1件(spec を優先する。行単位の true には引きずられない)
+    spec_false = len(check_transform_zero_fill(d_spec({"single": False}, "空のときは0", {"single": {"null_as_zero": True}}))) == 1
+    return good == [] and len(bad) == 2 and spec_ok and undecided and spec_false
+
+
+# WHY: 「列名「A」「B」」のように「」が続く書き方もあるので、列名の直後に続く「」をまとめて取り、後で1つずつ照合する
+_CSV_NAME_RE = re.compile(r"列名[^「」。\n]{0,6}((?:「[^」]+」[、・,]?)+)")
+_QUOTED_RE = re.compile(r"「([^」]+)」")
+
+
+def _csv_col_names(rd):
+    """ソースの CSV 見出しの列名(display_rows の specs の csv ?? label。cnt のある列は cnt_suffixes を付けた2列)を
+    集合で返す。csv_exports が無い・specs が無いときは None(判定しない)。
+    WHY: CSV の見出しは s.csv ?? s.label で作る(PosReport.tsx:200-232)ので、備考の列名はこれと字面が一致しなければならない。
+    呼出元: check_csv_column_name。"""
+    if not rd.get("csv_exports") or not rd.get("display_rows"):
+        return None
+    sfx = ["(点数)", "(金額)"]
+    for ce in rd["csv_exports"]:
+        for sp in (ce.get("header") or {}).get("spread") or []:
+            if sp.get("cnt_suffixes"):
+                sfx = list(sp["cnt_suffixes"])
+    names = set()
+    for dr in rd["display_rows"]:
+        for spec in dr.get("specs") or []:
+            n = spec.get("csv") or spec.get("label")  # fallback-ok: ソースの見出しが s.csv ?? s.label なので、csv が無ければ label を使うのが事実どおり
+            if not n:
+                continue
+            if spec.get("cnt"):
+                names.update(n + s for s in sfx)
+            else:
+                names.add(n)
+    if not names:
+        return None
+    return names
+
+
+def _error(tag: str, where: str, msg: str) -> str:
+    """検査の指摘の1行([ERROR] 付き。verify_vs_source の終了コードが1になる)。
+    WHY: _vs_common.warn は [WARN] 専用で ERROR の書式が無く、_vs_common は別の担当の持ち分なので、この検査だけ自前で組む。
+    書式は verify_vs_source の他の ERROR 行('[ERROR] [<tag>] <where>: <msg>')と同じ。呼出元: check_csv_column_name。"""
+    return f"[ERROR] [{tag}] {where}: {msg}"
+
+
+def check_csv_column_name(d) -> list:
+    """備考(画面項目の remarks・計算の remarks)に書かれた CSV の列名「X」が、ソースの CSV 見出しの列名と
+    字面で一致するかを見る(ERROR)。列名は display_rows の specs の csv ?? label(cnt のある列は(点数)(金額)付きの2列)。
+    WHY: 論理名の説明文を CSV 列名の欄に入れた備考(run14 の IT54 点数・IT56 客数: 「合計した点数。…」)は、利用者が
+    CSV を開いて見る名前と別物になる。FR の step3 の見出し行は正しいのに備考だけ食い違う形は、他の検査では捕まらない。
+    「列名」の直後の「」だけを見るので、他の語を「」で引く文は拾わない。csv_exports か display_rows が無ければ何も言わない。
+    呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    rd = d.get("react_draft")
+    main = d.get("main")
+    if not rd or not main:
+        return []
+    names = _csv_col_names(rd)
+    if names is None:
+        return []
+    # WHY: 画面項目名が列の label と同じ(括弧書きを除いた芯で一致)なら、期待する列名をその spec の csv ?? label で添える
+    by_core: dict = {}
+    for dr in rd.get("display_rows") or []:
+        for spec in dr.get("specs") or []:
+            if spec.get("label"):
+                by_core.setdefault(_name_core(spec["label"]), set()).add(spec.get("csv") or spec["label"])  # fallback-ok: 見出しは csv ?? label
+    out = []
+    holders = [("screen_layout.items", it, it.get("no") or it.get("item_name"), it.get("item_name"))
+               for it in (main.get("screen_layout") or {}).get("items") or []]
+    holders += [("calculations", c, c.get("no") or c.get("name"), c.get("name"))
+                for c in main.get("calculations") or []]
+    for kind, obj, ident, label in holders:
+        quoted = [x for g in _CSV_NAME_RE.findall(str(obj.get("remarks") or "")) for x in _QUOTED_RE.findall(g)]
+        for x in quoted:
+            if x in names:
+                continue
+            exp = sorted(by_core.get(_name_core(label), ()))
+            hint = f"この項目に対応する列の CSV 列名は「{'」「'.join(exp)}」" if exp else "ソースの CSV 見出しに無い名前"
+            out.append(_error(
+                "CSV列名", f"{kind}[{ident}]({label})",
+                f"備考の CSV 列名「{x}」が、ソースの CSV 見出し(csv ?? label)と一致しない。{hint}。列名を字面で揃える → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_csv_column_name() -> bool:
+    """check_csv_column_name の正例・負例。合成 d で、備考の列名が csv ?? label に一致すれば指摘なし、説明文が入っていれば
+    ERROR 1件、cnt のある列は(点数)(金額)付きでも通る。csv_exports が無ければ何も言わない。WHY: 誤検出を実データの前に合成で確かめる。呼出元: selftest。"""
+    def d_with(remarks_cnt, remarks_csv, remarks_sum):
+        return {
+            "main": {"screen_layout": {"items": [
+                {"no": "IT1", "item_name": "点数", "remarks": remarks_cnt},
+                {"no": "IT2", "item_name": "小計", "remarks": remarks_csv},
+                {"no": "IT3", "item_name": "売上訂正", "remarks": remarks_sum}]}},
+            "react_draft": {
+                "csv_exports": [{"header": {"spread": [{"cnt_suffixes": ["(点数)", "(金額)"]}]}}],
+                "display_rows": [{"array": "LEFT", "specs": [
+                    {"label": "点数", "csv": None, "kin": "a", "cnt": None},
+                    {"label": "小計", "csv": "小計1(値引前)", "kin": "b", "cnt": None},
+                    {"label": "売上訂正", "csv": None, "kin": "c", "cnt": "d"}]}],
+            },
+        }
+    good = d_with("CSVでは列名「点数」で出す。", "CSVでは列名「小計1(値引前)」で出す。", "CSVでは列名「売上訂正(点数)」「売上訂正(金額)」で出す。")
+    bad = d_with("CSVでは列名「合計した点数。レジ締め会計の行を合算した値」で出す。", "合計の説明。「CSV」とは別の語。", "")
+    got = check_csv_column_name(bad)
+    nodata = d_with("CSVでは列名「何か」で出す。", "", "")
+    nodata["react_draft"].pop("csv_exports")
+    return (check_csv_column_name(good) == [] and len(got) == 1 and got[0].startswith("[ERROR] [CSV列名] screen_layout.items[IT1]")
+            and "「点数」" in got[0] and "差し戻し先 S1" in got[0] and check_csv_column_name(nodata) == [])
 
 
 def _name_core(s) -> str:
@@ -300,10 +431,11 @@ def _selftest_response_display_name() -> bool:
 
 
 # 検査の本体(check(d) -> list[str])。後で1検査ずつ足す
-CHECKS: list = [check_mapping_target, check_mapping_missing, check_transform_zero_fill, check_response_display_name]
+CHECKS: list = [check_mapping_target, check_mapping_missing, check_transform_zero_fill, check_response_display_name,
+                check_csv_column_name]
 # 検査の自己テスト(引数なし・bool を返す)
 SELFTESTS: list = [_selftest_mapping_target, _selftest_mapping_missing, _selftest_transform_zero_fill,
-                   _selftest_response_display_name]
+                   _selftest_response_display_name, _selftest_csv_column_name]
 
 
 def run(inter_dir, feature) -> list:

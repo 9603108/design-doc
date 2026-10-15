@@ -17,6 +17,7 @@ CSV 出力(react 下書きの csv_exports)の記述、共通ロジックの呼�
 【接続情報】
   呼出元: _vs_checks_ext.run_all / selftest(verify_vs_source.main と --selftest から)
 """
+import json
 import os
 import re
 from pathlib import Path
@@ -368,6 +369,255 @@ def selftest_error_order() -> bool:
 
 CHECKS.append(check_error_order)
 SELFTESTS.append(selftest_error_order)
+
+
+def _src_list(src) -> list:
+    """src(dict か dict の配列)を (file, 開始行, 終了行) の配列にする。読めない要素は捨てる。呼出元: check_event_verb。"""
+    if isinstance(src, dict):
+        src = [src]
+    out = []
+    for s in src or []:
+        sp = _span(s)
+        if sp:
+            out.append(sp)
+    return out
+
+
+# クリック系の語。WHY: 押す操作の語を、押さない要素(onChange だけの input・select)に使った食い違いを見るため
+_CLICK_WORDS = ("クリック", "押下")
+# 要素の種類ごとに手順書(02_イベント一覧.md)の型が求める語。WHY: チェックボックスの change は「チェック」、ラジオは「選択」で書く型のため
+_TYPE_VERB = {"checkbox": ("チェック", "チェックボックス"), "radio": ("選択",)}
+
+
+def check_event_verb(d) -> list[str]:
+    """main の events[] を、src が重なる react_draft の jsx_elements(要素の種類 type・tag と、イベント属性 on)と照らし、
+    アクション語が要素の種類と食い違う行を指摘する。同じ location の trigger_groups の trigger も同じ語なので、EV と TR を1行にまとめる。
+    食い違い: (1) checkbox・radio が手順書の型の語(チェック・選択)で無い。(2) onChange だけの要素(select・input)が「クリック」「押下」。
+    WHY: 要素の種類と属性は画面ソースで決まる事実で、アクション語はその型の語で書く約束のため。onClick を持つ要素(button・label 等)は対象外。
+    呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] の events・trigger_groups と d["react_draft"] の jsx_elements。"""
+    main = d.get("main")
+    rd = d.get("react_draft")
+    if not main or not rd:
+        return []
+    jsx = [(j, _src_list(j.get("src"))) for j in rd.get("jsx_elements", [])]
+    out = []
+    for ev in main.get("events", []):
+        act = ev.get("action") or ""
+        spans = _src_list(ev.get("src"))
+        verdict = None
+        for j, js in jsx:
+            if not any(_overlap(a, b) for a in spans for b in js):
+                continue
+            ons = j.get("on") or []
+            if "onClick" in ons or "onChange" not in ons:
+                continue
+            typ = (j.get("type") or "").lower()
+            want = _TYPE_VERB.get(typ)
+            if want and not any(w in act for w in want):
+                verdict = f"{typ} の onChange なのにアクション語が「{act}」(型の語は「{want[0]}」)"
+            elif not want and any(w in act for w in _CLICK_WORDS):
+                verdict = f"{j.get('tag') or typ} の onChange だけの要素なのにアクション語が「{act}」(型の語は「変更」「選択」など)"
+            if verdict:
+                break
+        if not verdict:
+            continue
+        loc = ev.get("location")
+        trs = []
+        for g in main.get("trigger_groups", []):
+            for t in g.get("triggers", []):
+                if loc and t.get("location") == loc and (t.get("action") or "") == act:
+                    trs.append(t.get("trigger_no") or "")
+        where = "/".join([ev.get("no") or ""] + [t for t in trs if t])
+        out.append(_vs_common.warn("イベントの語", where, verdict))
+    return out
+
+
+def selftest_event_verb() -> bool:
+    """checkbox の onChange が「クリック」(当たり)・「チェック」(外れ)と、button の onClick が「クリック」(外れ)で確かめる。"""
+    def make(action: str, typ: str, on: list) -> dict:
+        src = [{"file": "/x/s.tsx", "line_start": 7, "line_end": 7}]
+        return {
+            "main": {"events": [{"no": "EV1", "action": action, "src": src, "location": ["画面", "A"]}],
+                     "trigger_groups": [{"triggers": [{"trigger_no": "TR1", "action": action, "location": ["画面", "A"]}]}]},
+            "react_draft": {"jsx_elements": [{"id": "JX1", "tag": "input", "type": typ, "on": on, "src": src}]},
+        }
+    hit = check_event_verb(make("クリック", "checkbox", ["onChange"]))
+    return (len(hit) == 1 and "TR1" in hit[0]
+            and check_event_verb(make("チェック", "checkbox", ["onChange"])) == []
+            and check_event_verb(make("クリック", "button", ["onClick"])) == []
+            and len(check_event_verb(make("クリック", "text", ["onChange"]))) == 1)
+
+
+CHECKS.append(check_event_verb)
+SELFTESTS.append(selftest_event_verb)
+
+
+def _fn_name_at(text_lines, line_no):
+    """ソースの line_no(1始まり)の行に定義される関数・定数の名前を返す。無ければ None。呼出元: check_cl_rerender。"""
+    if not (1 <= line_no <= len(text_lines)):
+        return None
+    m = re.search(r"(?:\bconst|\blet|\bfunction)\s+([A-Za-z_$][\w$]*)", text_lines[line_no - 1])
+    return m.group(1) if m else None
+
+
+def check_cl_rerender(d) -> list[str]:
+    """画面側(frontend)の common_logic の関数が、state の変化による再描画で走るのに、その state を変える FR が used_by_processes_ids に無いものを指摘する。
+    state を変える FR: react_draft の events の source.handler に setter(setShowDead(...) 等)があり、event の src が FR の src と重なるもの。
+    走る条件: CL の関数(CL の src の行で const/function に定義される名前)の呼出行が、その state の参照行(宣言と setter を除く)の
+    直後 8 行以内にある(フィルタ条件の state の下で関数を呼ぶ形)。ソースのテキストを読む近似なので WARN のみ。
+    WHY: 表示の切替だけの FR でも、切替で行が増えれば CL の関数が初めて走る。呼出元の列に挙げないと、CL の使われ方が仕様から抜ける。
+    呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] の common_logic・front_processes と d["react_draft"] の events・state_initials。"""
+    main = d.get("main")
+    rd = d.get("react_draft")
+    if not main or not rd:
+        return []
+    inits = rd.get("state_initials", [])
+    setter_of = {s.get("setter"): s.get("state") for s in inits if s.get("setter") and s.get("state")}
+    decl_lines = {(sp[0], sp[1]) for s in inits for sp in _src_list(s.get("src"))}
+    # FR ごとに変える state(event の handler に setter が出るもの)
+    fr_states = {}
+    for e in rd.get("events", []):
+        h = (e.get("source") or {}).get("handler") or ""
+        states = {st for setter, st in setter_of.items() if re.search(r"\b" + re.escape(setter) + r"\s*\(", h)}
+        if not states:
+            continue
+        for fp in main.get("front_processes", []):
+            if any(_overlap(a, b) for a in _src_list(e.get("src")) for b in _src_list(fp.get("src"))):
+                fr_states.setdefault(fp.get("process_id"), set()).update(states)
+    if not fr_states:
+        return []
+    cache = {}
+    def lines_of(f):
+        if f not in cache:
+            try:
+                cache[f] = Path(f).read_text(encoding="utf-8").splitlines()
+            except OSError:
+                cache[f] = None
+        return cache[f]
+    out = []
+    for cl in main.get("common_logic", []):
+        used = cl.get("used_by_processes_ids") or []
+        sp = _span(cl.get("src"))
+        if not used or not sp or not sp[0].endswith((".tsx", ".ts", ".jsx", ".js")):
+            continue
+        lines = lines_of(sp[0])
+        name = _fn_name_at(lines, sp[1]) if lines else None
+        if not name:
+            continue
+        calls = [i + 1 for i, ln in enumerate(lines) if re.search(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", ln) and (i + 1) != sp[1]]
+        for pid, states in sorted(fr_states.items()):
+            if pid in used:
+                continue
+            for st in sorted(states):
+                setter = next((k for k, v in setter_of.items() if v == st), "")
+                refs = [i + 1 for i, ln in enumerate(lines)
+                        if re.search(r"(?<![\w$.])" + re.escape(st) + r"(?![\w$])", ln)
+                        and (sp[0], i + 1) not in decl_lines
+                        and not (setter and re.search(r"\b" + re.escape(setter) + r"\b", ln))]
+                if any(r <= c <= r + 8 for r in refs for c in calls):
+                    out.append(_vs_common.warn("CL呼出元の再描画", cl.get("no") or "", f"「{cl.get('name')}」の関数 {name}() は state {st} の変化による再描画でも走るが、{st} を変える {pid} が呼出元に無い"))
+    return out
+
+
+def selftest_cl_rerender() -> bool:
+    """showDead の下で conv() を呼ぶ小さな tsx で、FR2(setShowDead を持つ)が CL の呼出元に無いと1件、有ると0件になることで確かめる。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        f = os.path.join(tmp, "s.tsx")
+        Path(f).write_text(
+            "const conv = (v: unknown) => Number(v);\n"
+            "const [showDead, setShowDead] = useState(false);\n"
+            "const rows = list.filter((s) => showDead || !s.dead)\n"
+            "  .map((s) => conv(s.v));\n"
+            "<input onChange={(e) => setShowDead(e.target.checked)} />\n", encoding="utf-8")
+        def make(used: list) -> dict:
+            return {
+                "main": {"front_processes": [{"process_id": "FR1", "src": [{"file": f, "line_start": 3, "line_end": 4}]},
+                                             {"process_id": "FR2", "src": [{"file": f, "line_start": 5, "line_end": 5}]}],
+                         "common_logic": [{"no": "CL1", "name": "変換", "used_by_processes_ids": used,
+                                           "src": [{"file": f, "line_start": 1, "line_end": 1}]}]},
+                "react_draft": {"state_initials": [{"state": "showDead", "setter": "setShowDead",
+                                                    "src": [{"file": f, "line_start": 2, "line_end": 2}]}],
+                                "events": [{"event_code": "EV1", "source": {"file": f, "line": 5, "handler": "(e) => setShowDead(e.target.checked)"},
+                                            "src": [{"file": f, "line_start": 5, "line_end": 5}]}]},
+            }
+        return len(check_cl_rerender(make(["FR1"]))) == 1 and check_cl_rerender(make(["FR1", "FR2"])) == []
+
+
+CHECKS.append(check_cl_rerender)
+SELFTESTS.append(selftest_cl_rerender)
+
+
+_GT_RE = re.compile(r"(\d+)\s*(?:行|件|店|レジ|枚|個|つ|人|回|日|列)?\s*(?:を超え|超え|より多)")
+_GE_RE = re.compile(r"(\d+)\s*(?:行|件|店|レジ|枚|個|つ|人|回|日|列)?\s*以上")
+_SRC_LEN_RE = re.compile(r"\.length\s*(>=|>)\s*(\d+)")
+
+
+def _min_counts(text: str) -> list:
+    """文から「N を超えて」(最小は N+1)と「N 以上」(最小は N)の閾値を (最小の件数, 語) の配列で返す。呼出元: check_threshold_wording。"""
+    out = [(int(n) + 1, f"{n}を超えて") for n in _GT_RE.findall(text)]
+    out += [(int(n), f"{n}以上") for n in _GE_RE.findall(text)]
+    return out
+
+
+def check_threshold_wording(d) -> list[str]:
+    """画面項目の備考・検証の文・FR の手順などの文の、件数の閾値の言い換えを指摘する(WARN)。
+    (1) 1文の中に「Nを超えて」と「N以上」が混在して最小の件数が食い違う(「2行を超えて(2行以上)」)。
+    (2) 文の最小の件数が、ソースの比較(react_draft の behaviors・jsx_elements・ui_strings の `.length > N` `.length >= N`)の最小に
+        1 だけずれる(超える/以上の取り違え)。ソースの最小の集合に入る閾値は通す。
+    WHY: 表示条件の閾値は超える/以上の1語で意味が1件変わるのに、言い換えのときに取り違えやすい。ソースの比較との突合は、無関係な比較に当たる誤検出を避けるため、1件ずれる場合だけ指摘する。
+    呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] と d["react_draft"]。"""
+    main = d.get("main")
+    rd = d.get("react_draft")
+    if not main:
+        return []
+    texts = []
+    for it in (main.get("screen_layout") or {}).get("items", []):
+        texts.append((it.get("no") or "", it.get("remarks")))
+    for v in main.get("validations", []):
+        texts.append((v.get("no") or "", v.get("rule")))
+        texts.append((v.get("no") or "", v.get("applied_when")))
+    for fp in main.get("front_processes", []):
+        for st in fp.get("steps", []):
+            texts.append((fp.get("process_id") or "", st.get("description")))
+    for ep in main.get("event_processes", []):
+        for t in ep.get("details", []):
+            texts.append((ep.get("event_ref") or "", t))
+    for c in main.get("calculations", []):
+        texts.append((c.get("no") or "", c.get("remarks")))
+    src_min = set()
+    if rd:
+        blob = json.dumps([rd.get(k) for k in ("behaviors", "jsx_elements", "ui_strings")], ensure_ascii=False)
+        for op, n in _SRC_LEN_RE.findall(blob):
+            src_min.add(int(n) + 1 if op == ">" else int(n))
+    out = []
+    for where, text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        found = _min_counts(text)
+        if not found:
+            continue
+        if len({m for m, _ in found}) > 1:
+            out.append(_vs_common.warn("閾値の言い換え", where, f"1文の中で閾値の言い方が食い違う({' / '.join(w for _, w in found)})"))
+            continue
+        m, w = found[0]
+        if src_min and m not in src_min and any(abs(m - s) == 1 for s in src_min):
+            out.append(_vs_common.warn("閾値の言い換え", where, f"「{w}」はソースの比較(最小 {sorted(src_min)} 件)と1件ずれる"))
+    return out
+
+
+def selftest_threshold_wording() -> bool:
+    """「2行を超えて(2行以上)」の混在で1件、ソースが length > 1 のとき「2行を超えて」だけの文で1件、「2行以上」で0件になることで確かめる。"""
+    def make(remarks: str) -> dict:
+        return {"main": {"screen_layout": {"items": [{"no": "IT1", "remarks": remarks}]}},
+                "react_draft": {"behaviors": [{"cond": "rows.length > 1"}]}}
+    return (len(check_threshold_wording(make("会計レポートが2行を超えて(2行以上)あるときだけ表示する"))) == 1
+            and len(check_threshold_wording(make("2行を超えてあるときだけ表示する"))) == 1
+            and check_threshold_wording(make("2行以上あるときだけ表示する")) == [])
+
+
+CHECKS.append(check_threshold_wording)
+SELFTESTS.append(selftest_threshold_wording)
 
 
 def run(inter_dir, feature) -> list:

@@ -466,6 +466,78 @@ def check_composed_gaps(composed, frags):
     return problems
 
 
+# 識別子の抜き出しから外す「業務の文」の形。verify_intermediate.main がソースの識別子を作るときの正規表現と同じ
+# WHY: 文字列・コメント・日本語を含む JSX の文は業務の文なので、識別子から外す(「POS会計」の POS を識別子と取り違えない)。
+#      verify_intermediate.main の中に直書きされていて import できないので、同じものをここに持つ(変えるなら両方を直す)
+_PROSE_RE = re.compile(r'/\*.*?\*/|"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|//[^\n]*|#[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`[^`]*`'
+                       r'|[^<>{}\n]*[^\x00-\x7f][^<>{}\n]*', re.S)
+
+
+def _verify_overrides(directory):
+    """directory(断片のフォルダ)の project_config・screen_config から、合成後の概要の検査(check_description_granularity)に渡す
+    verify_overrides を作る。無い設定は空にする(その分の判定は共通のものだけ)。呼出元: check_s2_overview。
+    WHY: 部品の段でも合成後と同じ基準で見るため、同じ入力(案件の業界用語・参照 ID の接頭辞・ソースの識別子)を同じ作り方で渡す。
+         ソースの識別子が空だと POS のような業務の略語を物理名と取り違えるので、source_files と backend_files から作る。"""
+    d = Path(directory)
+    vo, sc = {}, {}
+    for suffix, slot in (("_project_config.json", "pc"), ("_screen_config.json", "sc")):
+        for p in sorted(d.glob(f"*{suffix}"))[:1]:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if slot == "pc":
+                vo = dict(data.get("verify_overrides") or {})
+            else:
+                sc = data
+    import os
+    root = Path(os.path.expanduser(os.path.expandvars(sc.get("project_root") or ".")))
+    srcs = list(sc.get("source_files") or []) + [str(root / f) for f in sc.get("backend_files") or []]
+    idents = set()
+    for s in srcs:
+        try:
+            idents |= set(re.findall(r"[A-Za-z0-9_]+", _PROSE_RE.sub(" ", Path(os.path.expanduser(os.path.expandvars(s))).read_text(encoding="utf-8"))))
+        except OSError:
+            continue
+    vo["source_identifiers"] = sorted(idents)
+    return vo
+
+
+def _bp_overview(api):
+    """api_spec の1行から、合成後の backend_processes[].overview になる文を返す。migrate_v17_to_v18 の backend_processes の組み立てと同じ決め方。
+    WHY: name が無いと name は description の1文目から作られるので、overview は2文目以降(あれば)になる。name があれば description そのまま。
+         同じ決め方でないと、部品の段で 30 字内でも合成後に超える(または逆)食い違いが出る。決め方が変わるなら migrate_v17_to_v18 の側と両方を直す。"""
+    name = str(api.get("name") or "").strip()
+    desc = api.get("description") or ""
+    if name:
+        return desc
+    _, sep, rest = desc.partition("。")
+    return rest.strip() if sep and rest.strip() else desc
+
+
+def check_s2_overview(composed, frags, directory):
+    """S2 の api_spec[].description が、合成後の概要(backend_processes[].overview)の検査を満たすかを部品の段で見る(ERROR)。差し戻し先 S2。
+    WHY(run14): description が 30 字を超える・register() のような関数名(物理名)を含むと、合成の後の verify_intermediate
+    (check_description_granularity)でようやく ERROR になり、S2 への差し戻しが後の段まで遅れた。同じ関数を同じ入力(verify_overrides)で
+    呼ぶので、字数の上限(30 字)・物理名の判定は合成後と一致する。S2 が書いた API(actions)だけを見る。
+    接続: 呼出元 = main_units。合成後の行(name を含む)から overview を作る(_bp_overview)。"""
+    s2_actions = {a.get("action") for a in (frags.get("S2") or {}).get("api_spec") or [] if isinstance(a, dict)}
+    if not s2_actions:
+        return []
+    import verify_intermediate as vi
+    vo = _verify_overrides(directory)
+    out = []
+    for a in composed.get("api_spec") or []:
+        if not isinstance(a, dict) or a.get("action") not in s2_actions or not str(a.get("description") or "").strip():
+            continue
+        probe = {"backend_processes": [{"process_id": str(a.get("action")), "overview": _bp_overview(a)}]}
+        for level, msg in vi.check_description_granularity(probe, vo):
+            if level == "ERROR":
+                out.append(f"[概要] api_spec[{a.get('action')}].description: {msg} → 差し戻し先 S2"
+                           "(業務の言葉で30字以内の1文にする。関数名・物理名は書かない)")
+    return out
+
+
 # 説明の要の語の判定に使う英数字の識別子(3字以上)。日本語は見ない(ソース内の表記が揺れるため)
 _KEY_TERM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 # 例示値の穴 {名前}。実行時に決まる値の書き方なので、例示値に残ると例として読めない
@@ -624,6 +696,8 @@ def main_units(directory, only=None):
     # 合成後の穴(画面への写しの欠け・400 の検査の漏れ)。project_config を渡して下書きの展開済み ID へ寄せた形で見る
     composed = _units.compose(spec, frags, {})  # check_composed_gaps と check_src_warn(合成の後に数える)で使い回す
     extra += check_composed_gaps(composed, frags)
+    # S2 の description が合成後の概要の検査(30 字・物理名)を満たすか。合成後の verify_intermediate を待たずに S2 へ戻す
+    extra += check_s2_overview(composed, frags, directory)
     # W1 b)(c): S1 の CL の src 無し・S2 の根拠の無いエラー行は ERROR。WARN には重ねない(skip に入れる)
     cl_errs, err_errs = check_cl_src(frags), check_error_rows(frags)
     extra += cl_errs + err_errs
@@ -912,6 +986,26 @@ def selftest_warn():
                                                               {"condition": "DB 例外が起きたとき(推測)"}]}]}}
     out = check_db_exception_wording(dbx)
     assert len(out) == 2 and out[0].endswith("差し戻し先 H4") and out[1].endswith("差し戻し先 S2"), out
+    # S2 の description: 合成後の概要と同じ基準(30 字・物理名)。name が無ければ2文目以降が overview になる(migrate_v17_to_v18 と同じ)
+    long_desc = "あ" * 31
+    s2f = {"S2": {"api_spec": [{"action": "a"}]}}
+
+    def s2_out(desc, name=None):
+        row = {"action": "a", "description": desc}
+        if name:
+            row["name"] = name
+        return check_s2_overview({"api_spec": [row]}, s2f, "/nonexistent")
+
+    assert s2_out("店舗の一覧を返す") == [], s2_out("店舗の一覧を返す")
+    out = s2_out(long_desc)
+    assert len(out) == 1 and out[0].startswith("[概要] api_spec[a].description") and "30 字超" in out[0] and out[0].count("差し戻し先 S2") == 1, out
+    out = s2_out("店舗を登録する register() を呼ぶ")
+    assert len(out) == 1 and "物理名" in out[0] and "func:register()" in out[0], out
+    # 1文目が長くても、name が無く2文目があれば overview は2文目(合成後の決め方)なので、2文目が短ければ通る
+    assert s2_out(long_desc + "。店舗を返す") == [], s2_out(long_desc + "。店舗を返す")
+    assert len(s2_out(long_desc + "。店舗を返す", name="一覧")) == 1, "name があれば description 全体が overview"
+    assert check_s2_overview({"api_spec": [{"action": "z", "description": long_desc}]}, s2f, "/nonexistent") == [], "S2 が書いていない API を見た"
+    assert check_s2_overview({"api_spec": [{"action": "a", "description": long_desc}]}, {"H3": {}}, "/nonexistent") == [], "S2 未着で見た"
     print("[selftest OK] verify_partials.warn")
 
 
