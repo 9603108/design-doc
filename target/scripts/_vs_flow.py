@@ -460,6 +460,37 @@ def _fn_name_at(text_lines, line_no):
     return m.group(1) if m else None
 
 
+_FN_DEF_RE = re.compile(r"\s*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=>|\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")
+
+
+def _in_event_handler(lines, line_no):
+    """line_no(1始まり)の行が、イベントの handler として渡される名前つきの関数(onClick={exportCsv} の exportCsv)の本体の中なら True。
+    WHY(2026-10-15 run15): CSV出力の関数 exportCsv の中で呼ぶ q() を「applied の変化による再描画でも走る」と WARN した誤検出。
+    exportCsv は onClick でクリックされたときだけ走り、state の変化による再描画では走らない。再描画で走るのは描画の本体
+    (JSX を返す関数・render・useMemo の中)だけなので、handler の中の呼出は再描画の根拠に数えない。
+    見方: 呼出行から外側へ、インデントが浅くなる行ごとに const X = (...) => か function X( を拾い、X が on*={X} などで handler に
+    渡されていれば True。インライン handler(onClick={() => ...})は見ない(名前が無い)。呼出元: check_cl_rerender。"""
+    if not (1 <= line_no <= len(lines)):
+        return False
+    text = "\n".join(lines)
+
+    def indent(s):
+        return len(s) - len(s.lstrip())
+    cur = indent(lines[line_no - 1])
+    for k in range(line_no - 2, -1, -1):
+        ln = lines[k]
+        if not ln.strip() or indent(ln) >= cur:
+            continue
+        cur = indent(ln)
+        m = _FN_DEF_RE.match(ln)
+        name = (m.group(1) or m.group(2)) if m else None
+        if name and re.search(r"\bon[A-Z]\w*\s*=\s*\{\s*(?:\([^)]*\)\s*=>\s*)?" + re.escape(name) + r"\b", text):
+            return True
+        if cur == 0:
+            break
+    return False
+
+
 def check_cl_rerender(d) -> list[str]:
     """画面側(frontend)の common_logic の関数が、state の変化による再描画で走るのに、その state を変える FR が used_by_processes_ids に無いものを指摘する。
     state を変える FR: react_draft の events の source.handler に setter(setShowDead(...) 等)があり、event の src が FR の src と重なるもの。
@@ -504,7 +535,9 @@ def check_cl_rerender(d) -> list[str]:
         name = _fn_name_at(lines, sp[1]) if lines else None
         if not name:
             continue
-        calls = [i + 1 for i, ln in enumerate(lines) if re.search(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", ln) and (i + 1) != sp[1]]
+        # WHY: handler(クリックで走る関数)の中の呼出は、state の変化による再描画では走らない。除く(_in_event_handler の WHY)
+        calls = [i + 1 for i, ln in enumerate(lines) if re.search(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", ln) and (i + 1) != sp[1]
+                 and not _in_event_handler(lines, i + 1)]
         for pid, states in sorted(fr_states.items()):
             if pid in used:
                 continue
@@ -541,7 +574,33 @@ def selftest_cl_rerender() -> bool:
                                 "events": [{"event_code": "EV1", "source": {"file": f, "line": 5, "handler": "(e) => setShowDead(e.target.checked)"},
                                             "src": [{"file": f, "line_start": 5, "line_end": 5}]}]},
             }
-        return len(check_cl_rerender(make(["FR1"]))) == 1 and check_cl_rerender(make(["FR1", "FR2"])) == []
+        ok = len(check_cl_rerender(make(["FR1"]))) == 1 and check_cl_rerender(make(["FR1", "FR2"])) == []
+        # WHY(run15 の誤検出の再現): CL の関数 q() を、onClick でクリックされる exportCsv の中だけで呼ぶとき、
+        # applied の参照行の直後 8 行以内でも再描画では走らないので指摘なし。JSX を返す render の中で呼ぶ num() は従来どおり1件
+        g = os.path.join(tmp, "h.tsx")
+        Path(g).write_text(
+            "const q = (v: unknown) => `\"${v}\"`;\n"
+            "const [applied, setApplied] = useState(0);\n"
+            "const exportCsv = () => {\n"
+            "  const line = (r: Row | null) =>\n"
+            "    [\n"
+            "      applied.from,\n"
+            "      q(r),\n"
+            "    ].join(\",\");\n"
+            "};\n"
+            "<button onClick={exportCsv} />\n"
+            "<form onSubmit={() => setApplied(1)} />\n", encoding="utf-8")
+        h = {
+            "main": {"front_processes": [{"process_id": "FR2", "src": [{"file": g, "line_start": 11, "line_end": 11}]}],
+                     "common_logic": [{"no": "CL5", "name": "引用符囲み", "used_by_processes_ids": ["FR9"],
+                                       "src": [{"file": g, "line_start": 1, "line_end": 1}]}]},
+            "react_draft": {"state_initials": [{"state": "applied", "setter": "setApplied", "src": [{"file": g, "line_start": 2, "line_end": 2}]}],
+                            "events": [{"event_code": "EV2", "source": {"file": g, "line": 11, "handler": "() => setApplied(1)"},
+                                        "src": [{"file": g, "line_start": 11, "line_end": 11}]}]},
+        }
+        in_handler = _in_event_handler(Path(g).read_text(encoding="utf-8").splitlines(), 7)
+        in_render = _in_event_handler(Path(f).read_text(encoding="utf-8").splitlines(), 4)
+        return ok and check_cl_rerender(h) == [] and in_handler and not in_render
 
 
 CHECKS.append(check_cl_rerender)

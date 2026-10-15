@@ -415,7 +415,7 @@ def check_items(items, jsx, display_rows=None):
     # WHY: 行名そのもの(括弧付きの行名も含む)や react の jsx の label と一字一句同じ項目名は、括弧書きの足し方ではないので通す
     known = set(labels) | {j["label"] for j in jsx or [] if isinstance(j, dict) and j.get("label")}
     # WHY: 既存の行名に括弧書きを足した項目名(「小計（現金計）」)は行名と字面が違うので、表示行の名前が1つに決まらない。行名どおりに書かせる
-    split = [f"[画面項目] screen_layout.items[{name}]: 表示行の行名「{lb}」に括弧書きを足した名前 → 行名どおり「{lb}」と書く(差し戻し先 S1)"
+    split = [f"[画面項目] screen_layout.items[{name}]: 表示行の行名「{lb}」に括弧書きを足した名前。行名どおり「{lb}」と書く → 差し戻し先 S1"
              for name in by_name if isinstance(name, str) and name not in known for lb in labels
              if name.startswith(lb) and name[len(lb):len(lb) + 1] in ("（", "(")]
     disp = ([f"[画面項目] screen_layout.items: react 下書きの display_rows の行名 {', '.join(lack)} が無い → 差し戻し先 S1"]
@@ -975,7 +975,9 @@ def check_enum_mentions(data, react_draft):
             d = str(a.get("description") or "")
             found = [o for o in opts if o in d]
             if found and len(found) < len(opts) and not _DEFAULT_WORDS.search(d):
-                problems.append(f"[列挙] api_spec[{a.get('action')}].description: 選択肢「{'・'.join(opts)}」(画面の{el.get('label')})のうち「{'・'.join(found)}」だけを書いている → 全部並べるか既定値を添える(差し戻し先 S2)")
+                # WHY(2026-10-15 run15): 末尾が「→ 全部並べるか既定値を添える(差し戻し先 S2)」で、[ERROR] の印も「→ 差し戻し先 X」の形も無く、
+                # run_units.parse_sendbacks が拾えず after の差し戻しが「unknown: ERROR 0 件の INFO 行」になった。他の ERROR 行と同じ形にする
+                problems.append(f"[ERROR] [列挙] api_spec[{a.get('action')}].description: 選択肢「{'・'.join(opts)}」(画面の{el.get('label')})のうち「{'・'.join(found)}」だけを書いている。全部並べるか既定値を添える → 差し戻し先 S2")
     return problems
 
 
@@ -1155,6 +1157,31 @@ def check_transform_format(api_spec, items, display_rows):
             if leaf in leaves and "#,##0" in fmt and str(m.get("transform") or "").startswith("そのまま"):
                 problems.append(f"[ERROR] [写し] api_spec[{a.get('action')}].response_to_screen_mapping[{path}]: 画面は {fmt} で出すが transform が「{m.get('transform')}」 → 差し戻し先 S2")
     return problems
+
+
+_LEVEL_RE = re.compile(r"\[(?:ERROR|WARN|INFO)\]")
+_SENDBACK_TAIL_RE = re.compile(r"→ 差し戻し先 \S+")
+
+
+def normalize_findings(lines):
+    """指摘の行を共通の形にそろえる: [WARN]・[ERROR]・[INFO] の印で始まらない行は、先頭に「[ERROR] 」を付ける。
+    WHY(2026-10-15 run15): この main は「[WARN] で始まらない行」を ERROR として終了コード 1 にするが、[ERROR] の印を持たない行
+    ([別名]・[CTE]・[列挙] など)は run_units.parse_sendbacks が ERROR 行と見なせず、末尾に「→ 差し戻し先 X」も無いと拾われなかった。
+    出力の入口(main)で印をそろえ、検査の側が印を付け忘れても差し戻しの読み取りから落ちないようにする。呼出元: main。"""
+    return [ln if _LEVEL_RE.match(ln) else "[ERROR] " + ln for ln in lines]
+
+
+def lines_without_sendback(lines):
+    """[ERROR] の行のうち、「→ 差し戻し先 <単位>」を持たない行を返す(呼出元の差し戻し先の引き当てが欄名頼みになる行)。
+    WHY: 検査を足すときに差し戻し先を書き忘れた行を、実走の出力の INFO 行の件数と selftest で見つけるため。呼出元: main・selftest。"""
+    return [ln for ln in lines if ln.startswith("[ERROR]") and not _SENDBACK_TAIL_RE.search(ln)]
+
+
+def form_info_line(lines):
+    """出力の形の照合の INFO 行(差し戻し先の印を持たない ERROR 行の件数)。
+    WHY: この行自体に「→ 差し戻し先 <語>」の形を書くと、run_units.parse_sendbacks が拾って「X」などの unknown を作る(実走で確認)ので、
+    その形を避けて書く。selftest が parse_sendbacks で拾われないことを確かめる。呼出元: main。"""
+    return f"[INFO] 出力の形の照合(ERROR 行の末尾の差し戻し先の印): 持たない行 {len(lines_without_sendback(lines))} 件(0 件でなければ検査の書式の不備)"
 
 
 def selftest():
@@ -1441,9 +1468,16 @@ def selftest():
     rd_e = {"jsx_elements": [{"tag": "select", "label": "集計単位", "options": [{"value": "register", "text": "レジ別（現行と同じ）"}, {"value": "shop", "text": "店舗別（レジ合算）"}]},
                              {"tag": "select", "label": "店舗", "options": [{"value": "", "text": "- 全店 -"}]}]}
     got = check_enum_mentions({"api_spec": [{"action": "act", "description": "POS会計データを店舗別に期間集計する"}]}, rd_e)
-    assert len(got) == 1 and got[0].startswith("[列挙]") and "差し戻し先 S2" in got[0] and "レジ別" in got[0], got
+    assert len(got) == 1 and got[0].startswith("[ERROR] [列挙]") and got[0].endswith("→ 差し戻し先 S2") and "レジ別" in got[0], got
     assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別かレジ別で集計する"}]}, rd_e) == []
     assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別に集計する(既定)"}]}, rd_e) == []
+    # 形(run15): [列挙] の行が run_units.parse_sendbacks で S2 に拾われる。印の無い行は main の入口で [ERROR] が付く。差し戻し先の無い ERROR 行は数えられる
+    import run_units
+    assert list(run_units.parse_sendbacks("\n".join(normalize_findings(got)), run_units.load_units())) == ["S2"], got
+    assert normalize_findings(["[別名] x → 差し戻し先 H2", "[WARN] w", "[ERROR] e → 差し戻し先 S1", "[INFO] i"]) == \
+        ["[ERROR] [別名] x → 差し戻し先 H2", "[WARN] w", "[ERROR] e → 差し戻し先 S1", "[INFO] i"]
+    assert lines_without_sendback(normalize_findings(got)) == [] and len(lines_without_sendback(["[ERROR] [x] 差し戻し先を書き忘れた行", "[WARN] w"])) == 1
+    assert run_units.parse_sendbacks(form_info_line(["[ERROR] [x] 書き忘れ"]), run_units.load_units()) == {}, "INFO 行が差し戻しとして拾われる"
     # B15 d: SQL の日本語の文字列は、対の応答項目に字面どおり書く
     # fallback-ok: COALESCE は SQL の式の字面そのもの(検査の入力)。既定値への切り替えではない
     apis_l = {"act": {"db_operations": [{"columns": [{"alias_name": "shop_name", "expression": "COALESCE(s.name, '(不明:' || p.mise_no || ')')"}, {"alias_name": "kyakusuu", "expression": "SUM(t.n)"}]}]}}
@@ -1464,6 +1498,8 @@ def selftest():
     # B15 f: 行名に括弧書きを足した項目名は ERROR。表示専用の行名の欠けも ERROR(接頭辞の WARN は付けない)
     got = check_items([{"item_name": "小計（現金計）"}, {"item_name": "小計"}], [], [{"specs": [{"label": "小計"}]}])
     assert len(got) == 1 and "括弧書き" in got[0] and not got[0].startswith("[WARN]"), got
+    # 形(run8 の旧書式「→ 行名どおり…(差し戻し先 S1)」は parse_sendbacks が拾えなかった): 末尾が「→ 差し戻し先 S1」
+    assert got[0].endswith("→ 差し戻し先 S1") and lines_without_sendback(normalize_findings(got)) == [], got
     # 正例: 行名そのものが括弧付き(display_rows の labels・specs[].label と一字一句同じ)は通す
     assert check_items([{"item_name": "小計（税込売上金額）"}], None, [{"labels": ["小計（税込売上金額）"]}]) == []
     assert check_items([{"item_name": "小計（値引後 税抜売上金額）"}], None, [{"specs": [{"label": "小計（値引後 税抜売上金額）"}]}]) == []
@@ -1662,6 +1698,8 @@ def main(argv=None):
     # WHY: 追加の照合(写し・例示値・手順・DB。_vs_*.py)は [WARN] だけを返すので、終了コードの判定(下)に混ぜても変わらない
     import _vs_checks_ext
     all_lines += _vs_checks_ext.run_all(INTERMEDIATE_DIR, feat)
+    # WHY: ERROR の行は「[ERROR] 〜 → 差し戻し先 X」の形にそろえて出す(run_units.parse_sendbacks が読む形。normalize_findings の WHY)
+    all_lines = normalize_findings(all_lines)
     for p in all_lines:
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]
@@ -1681,6 +1719,8 @@ def main(argv=None):
     print(f"[INFO] 画面規則の照合(FR の手順に押せ・活性などを書いた行): ERROR {len(front_problems)} 件")
     print(f"[INFO] 表示切替の文面と CSV の動き・CSV の整形の照合: ERROR {len(state_problems) + len(csv_format_problems)} 件")
     print(f"[INFO] 例示値の行数・transform の書式の照合: ERROR {len(w11_problems)} 件")
+    # 形の照合: ERROR 行は末尾に差し戻し先の印を持つ。無い行は、差し戻し先が欄名の引き当て頼み(引けなければ unknown)になる。
+    print(form_info_line(all_lines))
     # WHY: 終了コードは、WARN の接頭辞が無い行(ERROR)が1件でもあれば 1。WARN だけでは止めない
     return 1 if any(not p.startswith("[WARN]") for p in all_lines) else 0
 

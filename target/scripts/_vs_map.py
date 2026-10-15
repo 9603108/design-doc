@@ -210,21 +210,25 @@ def check_transform_zero_fill(d) -> list:
                 if zero is None:
                     continue
                 zero = bool(zero)
-                for m in mappings:
-                    if m.get("api_field_path") != f"rows[].{key}" or m.get("screen_item_name") != spec.get("label"):
-                        continue
-                    t = str(m.get("transform") or "")
-                    if t.startswith("そのまま"):
-                        continue
-                    mentioned = bool(_ZERO_RE.search(t))
-                    if zero and not mentioned:
-                        out.append(_vs_common.warn(
-                            "写しの0扱い", f"{where} {m['api_field_path']}",
-                            f"列「{spec.get('label')}」({kind}) は空を0にして表示するのに、写しの transform に0の扱いが書かれていない"))
-                    elif not zero and mentioned:
-                        out.append(_vs_common.warn(
-                            "写しの0扱い", f"{where} {m['api_field_path']}",
-                            f"列「{spec.get('label')}」({kind}) は空を0にしないのに、写しの transform に0の扱いが書かれている"))
+                # WHY(2026-10-15 run15): 同じ API 項目 × 画面項目に写しの行が複数あるのは普通(表示用の行 + 計算の入力として使う行
+                # 「小計から合計を引いて表示」「点数で割る小計として使う」)。0の扱いを書くのは表示用の1行でよいので、
+                # 1行ずつ見ると、計算用の行が「0扱いが無い」と誤検出になった(syoukei_3・total_2・aridaka・kaisyuu の4件)。
+                # 同じ組の写しをまとめて見て、「空を0にする」のに組のどの行にも0の扱いが無いときだけ指摘する。
+                group = [m for m in mappings
+                         if m.get("api_field_path") == f"rows[].{key}" and m.get("screen_item_name") == spec.get("label")
+                         and not str(m.get("transform") or "").startswith("そのまま")]
+                if not group:
+                    continue
+                path = group[0]["api_field_path"]
+                mentioned = any(_ZERO_RE.search(str(m.get("transform") or "")) for m in group)
+                if zero and not mentioned:
+                    out.append(_vs_common.warn(
+                        "写しの0扱い", f"{where} {path}",
+                        f"列「{spec.get('label')}」({kind}) は空を0にして表示するのに、写しの transform に0の扱いが書かれていない"))
+                elif not zero and mentioned:
+                    out.append(_vs_common.warn(
+                        "写しの0扱い", f"{where} {path}",
+                        f"列「{spec.get('label')}」({kind}) は空を0にしないのに、写しの transform に0の扱いが書かれている"))
     return list(dict.fromkeys(out))
 
 
@@ -261,7 +265,19 @@ def _selftest_transform_zero_fill() -> bool:
     undecided = check_transform_zero_fill(d_spec(None, "金額として表示する。空のときは0", none_cf)) == []
     # spec が false なのに0を書けば1件(spec を優先する。行単位の true には引きずられない)
     spec_false = len(check_transform_zero_fill(d_spec({"single": False}, "空のときは0", {"single": {"null_as_zero": True}}))) == 1
-    return good == [] and len(bad) == 2 and spec_ok and undecided and spec_false
+    # WHY(run15 の誤検出の再現): 同じ項目の写しが複数(表示用 + 計算の入力として使う行)で、表示用の行に0の扱いがあれば指摘なし。
+    # どの行にも0の扱いが無ければ(組に対して)1件だけ
+    def d_multi(texts):
+        return {
+            "main": {"api_spec": [{"response_to_screen_mapping": [
+                {"api_field_path": "rows[].sou_kin", "screen_item_name": "総売上", "transform": t} for t in texts]}]},
+            "react_draft": {"display_rows": [{"array": "LEFT", "src": [{"file": f, "line_start": 1, "line_end": 2}],
+                                              "cell_format": {},
+                                              "specs": [{"label": "総売上", "kin": "sou_kin", "cnt": None, "null_as_zero": {"single": True}}]}]},
+        }
+    multi_ok = check_transform_zero_fill(d_multi(["金額として出す。値が無いときは0として出す", "小計から合計を引いて表示", "点数で割る総売上として使う"])) == []
+    multi_bad = len(check_transform_zero_fill(d_multi(["金額として出す", "小計から合計を引いて表示"]))) == 1
+    return good == [] and len(bad) == 2 and spec_ok and undecided and spec_false and multi_ok and multi_bad
 
 
 # WHY: 「列名「A」「B」」のように「」が続く書き方もあるので、列名の直後に続く「」をまとめて取り、後で1つずつ照合する

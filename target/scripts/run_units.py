@@ -204,6 +204,23 @@ def parse_sendbacks(text, units=None):
     return out
 
 
+# 指摘らしい行: [種別] で始まる(INFO・OK を除く)・ERROR・Traceback・例外名・→ を含む
+FINDING_LINE_RE = re.compile(r"^\s*\[(?!INFO\]|OK\])[^\]]+\]|ERROR|Traceback|Error\b|→")
+INFO_LINE_RE = re.compile(r"^\s*\[(?:INFO|OK)\]")
+FALLBACK_TAIL = 40  # 指摘らしい行が1つも取れないときに残す、出力の末尾の行数
+
+
+def fallback_unknown(out, cmd):
+    """終了コードが 0 でないのに parse_sendbacks が何も拾えなかったとき、unknown に残す行を返す。
+    WHY(2026-10-15 run15): 以前は出力の最終行だけを残していた。検査の最終行は「[INFO] …ERROR 0 件」の集計行になりがちで、
+    止めた本当の指摘([ERROR] の印も「→ 差し戻し先」も無い行)が消え、unknown の中身から原因が読めなかった。
+    1) [INFO]・[OK] の行を除いた、指摘らしい行(FINDING_LINE_RE)をすべて残す。2) 無ければ出力の末尾 FALLBACK_TAIL 行(全出力)を残す。
+    3) 出力が空なら起動したコマンド。呼出元: run_after。"""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    findings = [ln for ln in lines if not INFO_LINE_RE.match(ln) and FINDING_LINE_RE.search(ln)]
+    return findings or lines[-FALLBACK_TAIL:] or [cmd]
+
+
 def diagram_commands(feat):
     # WHY: 構成図の id は設定から得る(id を書き並べない)。ipo_flowchart は別経路なので除く。
     probe = (
@@ -242,7 +259,8 @@ def run_after(feat):
         # 各検査は ERROR があれば exit 1 を返す(verify_call_graph.py・verify_docx_layout.py で確認)。
         if p.returncode != 0:
             # WHY: 差し戻し先を拾えないまま止まると、メインが次に何をするか決まらない。最低でも unknown に残す。
-            sendbacks = parse_sendbacks(out, load_units()) or {"unknown": (out.strip().splitlines() or [cmd])[-1:]}
+            # 残すのは最終行ではなく、印の無い指摘らしい行(fallback_unknown)。最終行は「ERROR 0 件」の INFO 行になりがちで原因が消える(2026-10-15 run15)
+            sendbacks = parse_sendbacks(out, load_units()) or {"unknown": fallback_unknown(out, cmd)}
             result = {
                 "stopped_at": cmd,
                 "sendbacks": sendbacks,
@@ -304,6 +322,18 @@ def selftest():
     assert sorted(parse_sendbacks("x → 差し戻し先 H2,H3（説明）", units)) == ["H2", "H3"]
     # 単位名で始まらない差し戻し先(担当外の側)は従来どおり丸ごと unknown に残す
     assert list(parse_sendbacks("[重複] x: 同じ欄を書いた → 差し戻し先 担当外の側", units)) == ["unknown"]
+    # 印も「→ 差し戻し先」も無い指摘(2026-10-15 run15 の [列挙] の旧書式)は parse_sendbacks が拾えない。unknown には最終行(INFO)でなく指摘の行を残す
+    old_enum = ("[INFO] 画面項目の照合: WARN 0 件\n"
+                "[列挙] api_spec[a].description: 選択肢「レジ別・店舗別」のうち「レジ別」だけを書いている → 全部並べるか既定値を添える(差し戻し先 S2)\n"
+                "[INFO] 例示値の行数・transform の書式の照合: ERROR 0 件\n")
+    assert parse_sendbacks(old_enum, units) == {}, "印の無い行は parse_sendbacks では拾えない前提"
+    fb = fallback_unknown(old_enum, "cmd")
+    assert len(fb) == 1 and fb[0].startswith("[列挙]"), fb
+    assert fallback_unknown("[INFO] ok 1\n[INFO] ERROR 0 件\n", "cmd") == ["[INFO] ok 1", "[INFO] ERROR 0 件"], "指摘らしい行が無ければ全出力(末尾)"
+    assert fallback_unknown("", "cmd") == ["cmd"]
+    assert fallback_unknown("x\nTraceback (most recent call last):\n  File a\nValueError: bad\n", "cmd")[0].startswith("Traceback")
+    # 共通の形([ERROR] と「→ 差し戻し先 X」)なら拾える
+    assert list(parse_sendbacks("[ERROR] [列挙] a: b → 差し戻し先 S2\n[INFO] 照合: ERROR 1 件", units)) == ["S2"]
     # retry は units 表に無い単位で KeyError にせず、分かる文言で終了コード 2
     import contextlib
     import io

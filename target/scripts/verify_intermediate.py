@@ -1350,7 +1350,7 @@ def check_intermediate_strict(merged: dict) -> list:
             issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
         # 例示値の {名前} は WARN に留める(最終段で残れば S1 へ差し戻す)。ERROR にすると docx 生成前に止まり、S1 の手戻りを機械的に強制しすぎるため
         elif EXAMPLE_PATH_RE.match(path) and EXAMPLE_HOLE_RE.search(s):
-            issues.append(("WARN", f"{path}: 例示値に {{…}} の穴が残る（書式の例を実値で書き直す。差し戻し先 S1）: '{s[:80]}'"))
+            issues.append(("WARN", f"{path}: 例示値に {{…}} の穴が残る（書式の例を実値で書き直す）: '{s[:80]}' → 差し戻し先 S1"))
     # (4) メッセージ ID の形式と、同じ ID の文面の一致
     seen_msg = {}
     for m in merged.get("messages", []) or []:
