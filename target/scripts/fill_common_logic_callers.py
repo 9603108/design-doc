@@ -28,6 +28,8 @@ runs_on が「ブラウザ」の CL は、src の関数・定数を TSX で使�
   その条件の state を変えるイベント(空欄項目の表示切替)も呼出元に入れる(round14 R3。dead の項目の計算は条件が真のときだけ走る)。
   関数の呼出が、表示用の state(showDead 等)を参照する描画の中にあるときも、その state を変えるイベントを呼出元に入れる
   (2026-10-15 run16。基準は検査 _vs_flow.check_cl_rerender と同じ。描画に使わず送信時に読むだけの入力欄の state は足さない)。
+  state の宣言の初期値の中で呼ぶ関数(`useState(todayJst())` の todayJst)は、初期表示の処理(EV00 の FR)を呼出元に入れる
+  (2026-10-15 run17。画面を開いたときに走る。宣言の行は参照に数えないため、これが無いと呼出元が空になり verify_intermediate が止まる)。
 WHY: 候補が無くても、定数や補助関数の参照で BE を絞れる。候補と行が重ならない共通ロジックで「全部足す」に
 倒れると、別の BE まで呼出元に入る(run10 の CL4・CL5 は BE1 が誤って入っていた)。
 WHY: サーバー・DB で動くロジックは、呼ぶ FR が呼ぶ BE の中で動くため、呼出元の鎖として BE も示す。
@@ -325,6 +327,18 @@ def _word_in(name, line):
     return re.search(r"(?<![A-Za-z0-9_$])" + re.escape(name) + r"(?![A-Za-z0-9_$])", line) is not None
 
 
+def _used_in_initial(name, init):
+    """state の初期値の式 init に、識別子 name の使用(呼出・参照)があるか。オブジェクトのキー(`{ from: ...` の from)は使用に数えない。
+    WHY(2026-10-15 run17): `useState({ from: todayJst() })` のキー from が、同名の関数 from の使用に取り違えられないようにする
+    (_render_ref_states が宣言行のキー名を参照と取り違えない扱いと同じ趣旨)。キーは「{ か , の直後で、名前の直後が : 」の形だけ。
+    三項演算子の `c ? FOO : 1` は、FOO の前が ? なのでキーではなく使用に数える。"""
+    for m in re.finditer(r"(?<![A-Za-z0-9_$.])" + re.escape(name) + r"(?![A-Za-z0-9_$])", init):
+        is_key = re.match(r"\s*:", init[m.end():]) and re.search(r"[{,]\s*$", init[:m.start()])
+        if not is_key:
+            return True
+    return False
+
+
 def _top_blocks(lines):
     """モジュール直下の宣言ごとの行範囲(1始まり)と宣言名。次の「行頭が英字・/ の行」までを1ブロックとする。"""
     starts = [i for i, ln in enumerate(lines) if ln[:1].isalpha() or ln.startswith("//")]
@@ -514,6 +528,8 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
     3. 参照の行がイベントの範囲(events[].src・csv_exports[].src)に入れば、そのイベントを呼出元にする
     3b. 出典の項目が「旗: true」(dead: true 等)を持ち、描画側が `showDead || !s.dead` で旗の項目を落とすなら、
         表示の条件の state(props で渡されるなら渡す元の state)も依存の state にする(round14 R3)
+    3c. 参照の行が state の宣言の行で、その state の初期値(state_initials[].initial)に名前があるとき(`useState(todayJst())`)は、
+        初期表示のイベント(EV00。マウント時)を呼出元にする(2026-10-15 run17。初期値の呼出は画面を開いたときに走る)
     4. 依存の state を変えるイベント(failure_effects の on_success・ハンドラの set<State>( )も呼出元にする
     5. event_code → idx の ev_to_name → fr_by_name で FR の ID に写す
     react 下書きが無い・src に画面のファイルが無いときは空。"""
@@ -528,6 +544,11 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
     def add_ev(code):
         if code and code not in ev_codes:
             ev_codes.append(code)
+
+    # 初期表示(マウント時)のイベントの event_code。パイプラインの決まりで EV00(handler は「useEffect(マウント時)」)。
+    # WHY: 宣言の初期値の中で呼ばれる関数の呼出元は、このイベントの FR にする。名前は決め打ちせず、下書きの events から拾う。
+    mount_codes = [ev.get("event_code") for ev in events
+                   if ev.get("event_code") == "EV00" or "マウント" in ((ev.get("source") or {}).get("handler") or "")]  # fallback-ok: handler が無いイベントはマウント時ではない扱い
 
     dep_states = set()
 
@@ -586,6 +607,12 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                 if _same_file(r.get("file"), f):
                     for code in ce.get("trigger_events") or []:  # fallback-ok: 起点のイベントが無ければ足さない
                         ev_ranges.append((r.get("line_start", 0), r.get("line_end", 0), code))  # fallback-ok: 同上
+        # state の宣言(state_initials[].src)ごとの行範囲と初期値の式。宣言の初期値の中の呼出を、下の鎖で初期表示のイベントに結ぶ
+        init_ranges = []
+        for st_info in states.values():
+            for sp in st_info.get("src") or []:  # fallback-ok: 宣言の出典が無い state は初期値の呼出を拾えない(拾わないだけ)
+                if _same_file(sp.get("file"), f) and st_info.get("initial"):
+                    init_ranges.append((sp.get("line_start", 0), sp.get("line_end", 0), str(st_info["initial"])))  # fallback-ok: 行欠けは範囲が空
         done, todo = set(), list(defs)
         chain_lines = []  # 鎖の中の名前を参照している行(1始まり)。下の「表示の条件」の判定で、描画する宣言を特定する
         while todo:
@@ -602,6 +629,15 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                 if not _word_in(name, ln) or any(a <= n <= b for a, b in own):
                     continue
                 chain_lines.append(n)
+                # WHY(2026-10-15 run17): state の宣言の初期値(`useState(todayJst())`)の中で呼ばれる関数は、画面を開いて最初に描くときに走る。
+                # 初期表示の処理(EV00。マウント時のイベント)が呼出元になる。ここを拾わないと、todayJst のように宣言の初期値でしか呼ばれない
+                # 共通関数は、どのイベントの範囲・useMemo・描画にも当たらず呼出元が空のままになり、verify_intermediate が止まる。
+                # 宣言の行そのものは参照として数えない(_render_ref_states)が、初期値の中の呼出は「初期表示で走る」事実なので別に拾う。
+                # 名前が初期値の式(initial)に現れるときだけ採る。キー名・state 名が同じ名前でも、初期値に無ければ呼出ではない。
+                for a, b, init in init_ranges:
+                    if a <= n <= b and _used_in_initial(name, init):
+                        for code in mount_codes:
+                            add_ev(code)
                 # WHY(run15 差3): name がコンポーネントで、この行が `<name` で描いているなら、描く値の元の state を集める。
                 # 描画の中で走る関数(num・fmt など)は、その state が変わるたびに走る。useMemo の依存にも CSV にも出ない経路なので、
                 # ここで拾わないと鎖が止まる。集めた state のうち取得・再取得で変わるものだけを、下の 4. で依存に足す
@@ -1111,6 +1147,64 @@ def _selftest_front_state():
         fill(data2, {"EV10": "表示切替", "EV11": "開始日"}, [], {}, rd2)
         assert data2["common_logic"][0]["used_by_processes_ids"] == ["FR1"], data2["common_logic"][0]
     print("[selftest OK] fill_common_logic_callers front state")
+    _selftest_front_init()
+
+
+def _selftest_front_init():
+    """run17: state の宣言の初期値の中で呼ぶ関数(todayJst)は、初期表示(EV00)の FR を呼出元にする。
+    初期値に呼出が無い関数(キー名・state 名が同じ名前でも)・宣言の外で呼ぶだけの関数には足さない。冪等。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "Page.tsx"
+        tsx.write_text("\n".join([
+            "function todayJst() {",                                              # 1
+            "  return 'x';",                                                      # 2
+            "}",                                                                  # 3
+            "function from() {",                                                  # 4
+            "  return 'y';",                                                      # 5
+            "}",                                                                  # 6
+            "",                                                                   # 7
+            "export default function Page() {",                                   # 8
+            "  const [from, setFrom] = useState(todayJst().slice(0, 8));",       # 9
+            "  const [applied, setApplied] = useState({ from: todayJst() });",   # 10
+            "  const [note, setNote] = useState(\"\");",                         # 11
+            "  return <input onChange={(e) => setNote(e.target.value)} />;",     # 12
+            "}",                                                                  # 13
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+
+        def decl(state, setter, initial, line):
+            return {"state": state, "setter": setter, "initial": initial, "src": [{"file": f, "line_start": line, "line_end": line}]}
+        rd = {
+            "state_initials": [decl("from", "setFrom", "todayJst().slice(0, 8)", 9),
+                               decl("applied", "setApplied", "{ from: todayJst() }", 10),
+                               decl("note", "setNote", "\"\"", 11)],
+            "events": [
+                {"event_code": "EV00", "source": {"handler": "useEffect(マウント時)"}, "src": [{"file": f, "line_start": 20, "line_end": 20}]},
+                {"event_code": "EV01", "source": {"handler": "(e) => setFrom(e.target.value)"}, "src": [{"file": f, "line_start": 21, "line_end": 21}]},
+            ],
+        }
+        data = {
+            "events": [{"no": c, "event_code": c} for c in ("EV00", "EV01")],
+            "front_processes": [{"process_id": "FR1", "name": "初期表示", "steps": []}, {"process_id": "FR2", "name": "開始日の入力", "steps": []}],
+            "backend_processes": [],
+            "common_logic": [
+                # 初期値の中で呼ぶ(2つの state の宣言): 初期表示の FR1 だけ。from を変える FR2(入力欄)は入らない
+                {"name": "TODAY", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 1, "line_end": 3}]},
+                # 同じ名前の state(from)が宣言されるが、初期値に呼出は無い: 何も足さない
+                {"name": "FROM_FN", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 4, "line_end": 6}]},
+            ],
+        }
+        pn = {"EV00": "初期表示", "EV01": "開始日の入力"}
+        fill(data, pn, [], {}, rd)
+        cl = {c["name"]: c for c in data["common_logic"]}
+        assert cl["TODAY"]["used_by_processes_ids"] == ["FR1"], cl["TODAY"]
+        assert cl["FROM_FN"]["used_by_processes_ids"] == [], cl["FROM_FN"]
+        # 冪等
+        before = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        fill(data, pn, [], {}, rd)
+        assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before
+    print("[selftest OK] fill_common_logic_callers front init")
 
 
 def main():
