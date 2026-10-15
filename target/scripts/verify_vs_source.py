@@ -1183,9 +1183,35 @@ def check_state_setters(validations, behaviors, failure_effects, csv_exports):
     return problems
 
 
+# 否定の語(「整形しない」「使わず」「CSVでは使わない」「画面でなくCSV」)。節がこの語を持てば、その節は整形すると言っていない
+_NEGATION = re.compile(r"ない|なく|せず|わず|さず|れず|めず|ません|対象外")
+# 節を切る所(読点)と、前後が逆の主張に変わる所(「…しないが、画面は…」「一方、…」)
+_CLAUSE_SPLIT = re.compile(r"[、,，]")
+_CONTRAST_SPLIT = re.compile(r"が[、,，]|一方[、,，]?|ものの[、,，]?|だが[、,，]?")
+
+
+def csv_format_claimed(sentence) -> bool:
+    """1つの文が「CSV の値を整形する」と肯定で言っているか。「CSV」の語と整形の語(桁区切り・整形・書式)が同じ文にあり、
+    整形の語を持つ節が否定(_NEGATION)でないときだけ True。
+    WHY(run17 の CL2): 「画面の表示だけに使い、CSVの値は整形しない」「画面でだけ使い、CSVでは使わない」は、CSV を整形しないと書いた文だが、
+    以前の検査は「CSV」と「整形」が同じ文にあるだけで ERROR にした(否定を肯定と取る誤検出。run14 の CL6 も同じ型の疑い)。
+    文を、逆の主張に変わる所(「…しないが、」「一方、」)で区切り、各区間を読点の節に分け、「CSV」が現れた後の節で整形の語を持つものが否定でなければ肯定とみなす
+    (「表示・CSVで使う値を、3桁区切りに整形する」は CSV の節の後に整形の節が続く肯定。「CSVは整形しないが、画面は整形する」は区間が分かれるので肯定でない)。
+    呼出元: check_cl_csv_format。"""
+    for seg in _CONTRAST_SPLIT.split(sentence):
+        seen_csv = False
+        for clause in _CLAUSE_SPLIT.split(seg):
+            if "CSV" in clause:
+                seen_csv = True
+            if seen_csv and any(w in clause for w in _CSV_FORMAT_WORDS) and not _NEGATION.search(clause):
+                return True
+    return False
+
+
 def check_cl_csv_format(common_logic, csv_exports):
-    """CSV が数値を整形しない(csv_exports の formats_numbers が全部 false)のに、共通ロジックの文が「CSV」と整形の語(桁区切り・整形・書式)を同じ文に書くものを ERROR にする(新9)。
-    文は「。」と改行で切る。formats_numbers が null・欄なしのときは読み飛ばす(判定できない)。
+    """CSV が数値を整形しない(csv_exports の formats_numbers が全部 false)のに、共通ロジックの文が「CSV の値を整形する」と肯定で書くものを ERROR にする(新9)。
+    文は「。」と改行で切り、肯定かどうかは csv_format_claimed が決める(否定文「CSVの値は整形しない」「CSVでは使わない」は通す。第20回)。
+    formats_numbers が null・欄なしのときは読み飛ばす(判定できない)。
     WHY: 画面の整形と CSV の値を1文に混ぜると、CSV も整形すると読まれる(run11 の CL2)。呼出元: main。"""
     fmt = {c.get("formats_numbers") for c in csv_exports or [] if isinstance(c, dict)} - {None}
     if fmt != {False}:
@@ -1196,7 +1222,7 @@ def check_cl_csv_format(common_logic, csv_exports):
             continue
         texts = [str(c.get(k) or "") for k in ("name", "description", "expression")] + [str(s.get("description") or "") for s in c.get("processing_steps") or [] if isinstance(s, dict)]
         sents = [x for t in texts for x in re.split(r"[。\n]", t)]
-        if any("CSV" in x and any(w in x for w in _CSV_FORMAT_WORDS) for x in sents):
+        if any(csv_format_claimed(x) for x in sents):
             problems.append(f"[ERROR] [CSV整形] common_logic[{c.get('no') or c.get('name')}]: CSV の値を整形すると書いているが、CSV 出力は数値を整形しない(formats_numbers=false)。画面だけの整形と書き分ける → 差し戻し先 S1")
     return problems
 
@@ -1748,6 +1774,19 @@ def selftest():
     assert check_cl_csv_format(v7_cl, [{"formats_numbers": False}, {"formats_numbers": True}]) == [], "整形する CSV が1つでもあれば読み飛ばす"
     ok_cl = [{"no": "CL9", "expression": "画面の表示は3桁区切りで整形する。CSVの合計行は2行以上のときだけ足す"}]
     assert check_cl_csv_format(ok_cl, [{"formats_numbers": False}]) == [], "文を分けた書き分けを拾った"
+    # 第20回(run17 の CL2): CSV を整形しないと否定で書いた文は、「CSV」と整形の語が同じ文にあっても通す。肯定の文・否定と肯定が並ぶ文は従来どおり ERROR
+    neg_cl = [{"no": "CL2", "name": "金額・点数の3桁区切り", "description": "画面の数値を3桁区切りで整える",
+               "expression": "数値を日本語の表記(1,234 のように3桁区切り)の文字列にする。画面でだけ使い、CSVでは使わない",
+               "processing_steps": [{"description": "数値を日本語の表記で3桁ごとにカンマ区切りの文字列にする"}, {"description": "画面の表示だけに使い、CSVの値は整形しない"}]}]
+    assert check_cl_csv_format(neg_cl, [{"formats_numbers": False}]) == [], "否定文(整形しない・CSVでは使わない)を肯定と取った"
+    for neg in ("CSV出力の値は桁区切りにしない", "CSVの値は整形せず、そのまま出す", "画面でだけ整形し、CSVは整形しない", "整形は画面だけで、CSVには書式を適用しない",
+                "CSVは整形しないが、画面は3桁区切りで整形する", "整形でなくCSVの値はそのまま出す", "CSVの書式は対象外"):
+        assert not csv_format_claimed(neg), f"否定文を肯定と取った: {neg}"
+    for pos in ("CSV出力の値も3桁区切りに整形する", "画面の表示とCSVの値を桁区切りで整形する", "表示・CSV出力で使う値が空のときは0として扱い、3桁区切りの日本式で整形する",
+                "画面では整形せず、CSVの値も、桁区切りに整形する", "CSVの値を整形し、画面は整形しない"):
+        assert csv_format_claimed(pos), f"肯定文を拾えなかった: {pos}"
+    both = [{"no": "CL3", "expression": "画面の表示は整形しない。CSVの値は3桁区切りで整形する"}]
+    assert len(check_cl_csv_format(both, [{"formats_numbers": False}])) == 1, "別の文の肯定を見落とした"
     # 追加の照合(_vs_*.py)の自己テスト。WHY: 検査は4つのモジュールに足すので、ここは入口の selftest を1回呼ぶだけにする
     import _vs_checks_ext
     assert _vs_checks_ext.selftest(), "_vs_checks_ext.selftest が False"

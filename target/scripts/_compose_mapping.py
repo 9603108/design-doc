@@ -15,6 +15,9 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
 入れ替え: モデルの行の項目が候補に無ければ、候補の1番目へ入れ替える(transform はそのまま。log に書く)。
   ただし、その項目が「応答の項目を被演算子にする計算(calc_candidates)の出力先」(calc の label = 画面項目名)なら入れ替えない(run15 差1)。
   候補のうち行が無いものは行を足す。候補が空の欄は触らない。冪等(2回目は何も変えない)。
+件数の写し(第20回): 画面が配列の件数({rows.length}・${shops.length})を表示する所(react 下書きの count_displays)は、応答のキーに結ばれる API の
+  response_to_screen_mapping へ件数の行(api_field_path は response_items の配列の key。無ければ <キー>.length)を足す(単位と表示条件は下書きの事実。S2 が書いていれば足さない。_add_count_rows)。
+  WHY: [件数の写し] の WARN が run15・16・17 で毎回 S2 に出た。件数の表示は下書きの事実で決まるので、S2 に書かせず機械で足す。
 """
 import json
 import re
@@ -336,6 +339,118 @@ def _write_rows(api, path, cands, items, log, keep=frozenset()):
         log.append(f"[写し] api_spec[{action}].response_to_screen_mapping[{path}] に画面項目 {row['screen_item_name']} を足す")
 
 
+def _state_keys(drafts):
+    """配列 state → 応答のキー({"rows": "rows", "shops": "rows"})。failure_effects[].on_success_from が正。決まらない state は入れない。
+    WHY: 件数の写しの api_field_path(rows.length)の根は、画面の state 名でなく応答のキーのため。呼出元: _add_count_rows。"""
+    out = {}
+    for d in drafts:
+        for fe in d.get("failure_effects") or []:
+            frm = fe.get("on_success_from") if isinstance(fe, dict) and isinstance(fe.get("on_success_from"), dict) else {}
+            out.update({k: v for k, v in frm.items() if k and v})
+    return out
+
+
+def _call_action(drafts, event, call):
+    """イベント event の呼出(event_processes[].calls[])のうち、出典(api.ts の呼出の行)の直前3行を含む範囲に API 関数名 call が字面である呼出の action。
+    ちょうど1つに決まるときだけ返す(複数・無し・ファイルが読めない場合は None)。
+    WHY: 初期表示のように複数の API を呼ぶイベントは、失敗経路の呼出名(fetchPosShops)と action(list_pos_shops)の対応を _single_action では決められない
+    (推測しない)。呼出の出典 src は API 関数の本体(return call(…"list_pos_shops"…))を指し、関数名はその数行上にあるので、その範囲の字面で結ぶ。"""
+    acts = set()
+    for d in drafts:
+        for ep in d.get("event_processes") or []:
+            if not isinstance(ep, dict) or ep.get("event_code") != event:
+                continue
+            for c in ep.get("calls") or []:
+                for s in (c.get("src") if isinstance(c, dict) else None) or []:
+                    try:
+                        lines = Path(s["file"]).read_text(encoding="utf-8").splitlines()
+                    except (OSError, KeyError):
+                        continue
+                    window = "\n".join(lines[max(0, int(s["line_start"]) - 4):int(s.get("line_end") or s["line_start"])])
+                    if re.search(rf"(?<![\w$.]){re.escape(call)}(?![\w$])", window):
+                        acts.add(c.get("action"))
+    acts.discard(None)
+    return next(iter(acts)) if len(acts) == 1 else None
+
+
+def _count_owners(items, cd):
+    """件数の表示(count_displays の1件)の行を囲む出典を持つ画面項目のうち、範囲がいちばん狭いものの index の list(同じ狭さは全部)。無ければ空。
+    WHY: _vs_example.check_count_mapping と同じ持ち主の決め方(囲む広い項目に写しを足さない)。"""
+    s = cd["src"][0]
+    ln = s["line_start"]
+    cover = []
+    for i, it in enumerate(items):
+        for r in it.get("src") or []:
+            if (isinstance(r, dict) and r.get("file") == s.get("file") and isinstance(r.get("line_start"), int)
+                    and r["line_start"] <= ln <= int(r.get("line_end") or r["line_start"])):
+                cover.append((int(r.get("line_end") or r["line_start"]) - r["line_start"], i))
+    if not cover:
+        return []
+    narrow = min(w for w, _ in cover)
+    return sorted({i for w, i in cover if w == narrow})
+
+
+def _pick_owner(items, owners, cd):
+    """同じ狭さの項目が複数あるとき、件数を出す1つを決める。画面の単位(units)が example に出る項目がちょうど1つならそれ、決まらなければ最初の項目。
+    WHY: Card の見出しと副題が同じ行範囲を持つ(run11・run17 の IT13・IT14)。例示値(S1 が画面の字面から書く)に単位があるほうが、件数を出す項目。"""
+    units = [u for u in cd.get("units") or [] if u]
+    hit = [i for i in owners if any(u in str(items[i].get("example") or "") for u in units)]
+    return hit[0] if len(hit) == 1 else owners[0]
+
+
+def _count_transform(key, name, cd):
+    """件数の写しの transform: 何の件数を、どの項目に、どんな単位の形で、どんなときに出すか。画面の字面(単位・表示条件)は下書きの事実をそのまま使う。"""
+    units = [u for u in cd.get("units") or [] if u]
+    shape = ("に" + "または".join(f"「N{u}」" for u in units) + "の形で出す") if units else "に出す"
+    cond = cd.get("visible_if") or []
+    return f"応答 {key} の件数を、{name}{shape}" + (f"。出るのは {' かつ '.join(cond)} のとき" if cond else "")
+
+
+def _add_count_rows(out, drafts, items, log):
+    """画面が配列の件数({rows.length}・${shops.length})を表示する所(下書きの count_displays)に、response_to_screen_mapping の件数の写しを足す(第20回)。
+    行: api_field_path=応答の配列の key(response_items にある rows。key が無く <キー>.length だけがあればそれ)・screen_item_name=件数を出す項目・
+    transform=単位と表示条件の文(_count_transform)。response_items が無い下書きは <キー>.length。
+    足さない(推測しない): その件数を持つ項目(同じ狭さの項目のどれか)に S2 が既に件数の写し(_react_facts.is_count_map)を書いている・
+    state が応答のどのキーから入るか決まらない・その応答を返す API が単一の API を呼ぶイベントから決まらない・件数の式を囲む項目が無い。
+    WHY: [件数の写し] の WARN は run15・16・17 で毎回 S2 に出た。件数の表示は下書きの事実で全部決まるので、S2 に書かせず機械で足す。冪等(2回目は何も足さない)。"""
+    import _react_facts
+    cds = [c for d in drafts for c in d.get("count_displays") or [] if isinstance(c, dict) and c.get("state") and c.get("src")]
+    if not cds:
+        return
+    arr_of = _state_keys(drafts)
+    apis = [a for a in out.get("api_spec") or [] if isinstance(a, dict) and isinstance(a.get("response_to_screen_mapping"), list)]
+    for cd in cds:
+        key = arr_of.get(cd["state"])
+        owners = _count_owners(items, cd)
+        if not key or not owners:
+            continue
+        names = {items[i].get("item_name") for i in owners}
+        maps = [m for a in apis for m in a["response_to_screen_mapping"] if isinstance(m, dict)]
+        if any(m.get("screen_item_name") in names and _react_facts.is_count_map(m, key) for m in maps):
+            continue
+        target = next((a for a in apis if cd["state"] in _states_for(a.get("action"), drafts, key)), None)
+        if target is None:
+            # 複数の API を呼ぶイベント(初期表示)の失敗経路は、呼出名を API 関数の出典の字面で action へ結ぶ(_call_action)。1つに決まらなければ足さない
+            acts = {_call_action(drafts, fe.get("event"), fe.get("call")) for d in drafts for fe in d.get("failure_effects") or []
+                    if isinstance(fe, dict) and fe.get("call") and isinstance(fe.get("on_success_from"), dict)
+                    and cd["state"] in fe["on_success_from"]} - {None}
+            target = next((a for a in apis if a.get("action") in acts), None) if len(acts) == 1 else None
+        if target is None:
+            continue
+        # WHY: api_field_path は response_items の key に無いと verify_partials の [参照] が S2 へ戻す(rows.length は key に無い)。
+        #      件数を持つ配列の key(rows)そのものを使い、配列の写しでないことは transform の「件数」が示す(is_count_map は rows も件数の写しと認める)。
+        #      key が response_items に無く rows.length だけがあるなら、それを使う。どちらも無ければ足さない(推測しない)
+        keys = {x.get("key") for x in target.get("response_items") or [] if isinstance(x, dict)}
+        path = next((p for p in (key, f"{key}.length") if p in keys), None) if keys else f"{key}.length"
+        if path is None:
+            continue
+        row = {"api_field_path": path}
+        _place(row, items, _pick_owner(items, owners, cd))
+        row["transform"] = _count_transform(key, row["screen_item_name"], cd)
+        target["response_to_screen_mapping"].append(row)
+        log.append(f"[写し] api_spec[{target.get('action')}].response_to_screen_mapping に件数の写し {row['api_field_path']} → {row['screen_item_name']} を足す")
+
+
 def fill(out, log):
     """api_spec ごとに、応答の項目の写しを react 下書きの事実で補う(N2・N3)。下書きや画面項目が無ければ何もしない。"""
     from _config_loader import INTERMEDIATE_DIR
@@ -370,6 +485,8 @@ def fill(out, log):
             elif _key_only(usage, states, leaf):
                 # WHY: 使用が key だけで候補が無い項目は、モデルが書いた写しの行も消す(V6)
                 _drop_rows(api, path, log)
+    # 件数の表示の写しは、応答の項目ごとの処理(上)の後で足す(上の処理は "[]." の path だけを見るので、rows.length の行には触れない)
+    _add_count_rows(out, drafts, items, log)
 
 
 def _selftest():
@@ -542,6 +659,100 @@ def _selftest_w6():
     print("[selftest OK] _compose_mapping W6 (入れ物の候補外し・spec の transform)")
 
 
+def _selftest_count_rows():
+    """第20回: 画面が件数を表示する所(下書きの count_displays)に件数の写しを足す。
+    (1) 応答のキーに結ばれる API ごとに rows.length の行が足り、transform に単位と表示条件が入る。同じ狭さの2項目は example に単位がある項目を選ぶ。
+    (2) 同じ狭さの別の項目に S2 が件数の写しを書いていれば足さない。2回目は何も足さない。
+    (3) state が応答のキーに結べない(on_success_from が無い)・囲む項目が無いときは足さない(推測しない)。"""
+    import copy
+    F = "F.tsx"
+
+    def span(a, b):
+        return [{"file": F, "line_start": a, "line_end": b}]
+    drafts = [{
+        "event_processes": [{"event_code": "EV1", "calls": [{"action": "get_rows"}]}, {"event_code": "EV2", "calls": [{"action": "get_shops"}]}],
+        "failure_effects": [{"event": "EV1", "on_success": ["rows"], "on_success_from": {"rows": "rows"}},
+                            {"event": "EV2", "on_success": ["shops"], "on_success_from": {"shops": "rows"}}],
+        "count_displays": [
+            {"state": "rows", "units": ["店舗分", "レジ分"], "visible_if": ["rows.length > 1"], "src": span(3, 3)},
+            {"state": "shops", "units": ["店だけ"], "visible_if": [], "src": span(8, 8)},
+            {"state": "other", "units": [], "visible_if": [], "src": span(8, 8)}]}]
+    items = [{"item_name": "見出し", "screen_no": "1", "example": "合計", "src": span(1, 5)},
+             {"item_name": "副題", "screen_no": "1", "example": "2026-10-01 / 11レジ分", "src": span(1, 5)},
+             {"item_name": "注記", "screen_no": "1", "example": "POSがあるのは11店だけ", "src": span(7, 9)}]
+
+    def mk(pre=None):
+        return {"api_spec": [{"action": "get_rows", "response_to_screen_mapping": list(pre or [])},
+                             {"action": "get_shops", "response_to_screen_mapping": []}]}
+    out, log = mk(), []
+    _add_count_rows(out, drafts, items, log)
+    r1, r2 = out["api_spec"][0]["response_to_screen_mapping"], out["api_spec"][1]["response_to_screen_mapping"]
+    assert len(r1) == 1 and r1[0]["api_field_path"] == "rows.length" and r1[0]["screen_item_name"] == "副題", r1
+    assert r1[0]["transform"] == "応答 rows の件数を、副題に「N店舗分」または「Nレジ分」の形で出す。出るのは rows.length > 1 のとき", r1
+    assert len(r2) == 1 and r2[0]["api_field_path"] == "rows.length" and r2[0]["screen_item_name"] == "注記" and r2[0]["screen_no"] == "1", r2
+    assert r2[0]["transform"] == "応答 rows の件数を、注記に「N店だけ」の形で出す", r2
+    assert len(log) == 2, log
+    snap = copy.deepcopy(out)
+    log2 = []
+    _add_count_rows(out, drafts, items, log2)
+    assert out == snap and log2 == [], "2回目で変わった(冪等でない)"
+    # S2 が同じ狭さの別の項目(見出し)に件数の写しを書いていれば、副題へ足さない
+    own = mk([{"api_field_path": "rows.length", "screen_item_name": "見出し", "transform": "件数を出す"}])
+    _add_count_rows(own, drafts, items, [])
+    assert len(own["api_spec"][0]["response_to_screen_mapping"]) == 1, own["api_spec"][0]
+    # 応答の根が違う写し(items.length)は件数の写しと認めず、足す
+    other = mk([{"api_field_path": "items.length", "screen_item_name": "副題", "transform": "x"}])
+    _add_count_rows(other, drafts, items, [])
+    assert len(other["api_spec"][0]["response_to_screen_mapping"]) == 2, other["api_spec"][0]
+    # api_field_path は response_items の key にあるもの: rows があれば rows、rows.length だけなら rows.length、どちらも無ければ足さない
+    with_key = mk()
+    with_key["api_spec"][0]["response_items"] = [{"key": "rows"}, {"key": "rows[].id"}]
+    with_key["api_spec"][1]["response_items"] = [{"key": "rows.length"}]
+    _add_count_rows(with_key, drafts, items, [])
+    assert [m["api_field_path"] for m in with_key["api_spec"][0]["response_to_screen_mapping"]] == ["rows"], with_key["api_spec"][0]
+    assert [m["api_field_path"] for m in with_key["api_spec"][1]["response_to_screen_mapping"]] == ["rows.length"], with_key["api_spec"][1]
+    no_key = mk()
+    no_key["api_spec"][0]["response_items"] = [{"key": "rows[].id"}]
+    _add_count_rows(no_key, drafts, items, [])
+    assert no_key["api_spec"][0]["response_to_screen_mapping"] == [], no_key["api_spec"][0]
+    # 複数の API を呼ぶイベント(初期表示)は、失敗経路の呼出名を API 関数の出典の字面で action へ結ぶ。結べなければ足さない
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        api_ts = Path(td, "api.ts")
+        api_ts.write_text("\n".join(['export function fetchRows() {', '  return call("get_rows", {});', '}',
+                                     'export function fetchShops() {', '  return call("get_shops", {});', '}']) + "\n", encoding="utf-8")
+
+        def csrc(n):
+            return [{"file": str(api_ts), "line_start": n, "line_end": n}]
+        multi = copy.deepcopy(drafts)
+        multi[0]["event_processes"] = [{"event_code": "EV9", "calls": [{"action": "get_rows", "src": csrc(2)}, {"action": "get_shops", "src": csrc(5)}]}]
+        multi[0]["failure_effects"] = [{"event": "EV9", "call": "fetchRows", "on_success_from": {"rows": "rows"}},
+                                       {"event": "EV9", "call": "fetchShops", "on_success_from": {"shops": "rows"}}]
+        assert _call_action(multi, "EV9", "fetchShops") == "get_shops" and _call_action(multi, "EV9", "fetchRows") == "get_rows"
+        assert _call_action(multi, "EV9", "fetchNone") is None and _call_action(multi, "EV0", "fetchRows") is None
+        out_m = mk()
+        _add_count_rows(out_m, multi, items, [])
+        assert [m["screen_item_name"] for m in out_m["api_spec"][0]["response_to_screen_mapping"]] == ["副題"], out_m["api_spec"][0]
+        assert [m["screen_item_name"] for m in out_m["api_spec"][1]["response_to_screen_mapping"]] == ["注記"], out_m["api_spec"][1]
+        # 呼出名が出典の近くに無い(結べない)ときは足さない
+        multi[0]["failure_effects"][1]["call"] = "fetchElsewhere"
+        multi[0]["failure_effects"][0]["call"] = "fetchElsewhere2"
+        out_n = mk()
+        _add_count_rows(out_n, multi, items, [])
+        assert out_n == mk(), out_n
+    # on_success_from が無い古い下書き・囲む項目が無い式は足さない
+    old = copy.deepcopy(drafts)
+    for fe in old[0]["failure_effects"]:
+        fe.pop("on_success_from")
+    none = mk()
+    _add_count_rows(none, old, items, [])
+    assert none == mk(), none
+    nowhere = mk()
+    _add_count_rows(nowhere, drafts, [{"item_name": "遠い項目", "src": span(50, 60)}], [])
+    assert nowhere == mk(), nowhere
+    print("[selftest OK] _compose_mapping 件数の写しの足し(第20回)")
+
+
 def _selftest_calc_target():
     """run15 差1: 被演算子 leaf から計算した結果を出す項目(calc の label)への行は、候補に無くても付け替えない。
     出力先でない項目への行は従来どおり候補の1番目へ入れ替える。"""
@@ -569,6 +780,7 @@ if __name__ == "__main__":
         _selftest()
         _selftest_w6()
         _selftest_calc_target()
+        _selftest_count_rows()
     else:
         print("usage: _compose_mapping.py --selftest (fill は _units.compose から呼ばれる)")
         sys.exit(2)

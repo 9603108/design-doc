@@ -288,11 +288,18 @@ def check_docstring_terms(d) -> list:
     #      集計の別名などの派生の名なので、列の出典の指摘の対象にしない
     settled = {(r.get("physical_table"), r.get("physical_column")) for r in rows
                if r.get("logical_column") and not r.get("logical_column").endswith("(推定)")}
+    # WHY(第20回 run17): 集計の別名(min(kai_date) AS first_date など)の行は、列そのものの名前でなく「関数 + 列」から付けた名前
+    #      (最初の会計日(推定)・最後の会計日(推定))。H2 の手順書は式と別名から付けた名に「(推定)」を付けると決めており、列の語(会計日)が
+    #      docstring にあっても「最初の」「最後の」という集計の意味までは語が決めない。列の出典の指摘の対象にすると、手順書どおりの名に毎回 WARN が出る
+    agg_alias = {a.get("alias") for op in (d.get("main") or {}).get("db_operations") or [] if isinstance(op, dict)
+                 for a in op.get("aggregate") or [] if isinstance(a, dict) and a.get("alias")}
     out = []
     for row in rows:
         col = row.get("physical_column")
         lc = row.get("logical_column") or ""
         if (row.get("physical_table"), col) in settled:
+            continue
+        if row.get("alias_name") in agg_alias:
             continue
         if col in terms and lc.endswith("(推定)"):
             out.append(_vs_common.warn(
@@ -342,8 +349,20 @@ def selftest_docstring_terms() -> bool:
                "main": {"logical_names": [
                    {"physical_table": "t", "physical_column": "cnt", "logical_column": "件数"},
                    {"physical_table": "t", "physical_column": "cnt", "logical_column": "件数(推定)"}]}}
+    # 第20回(run17): 集計の別名(min・max の alias)の行は、列の語(会計日)があっても列の出典の指摘にしない。同じ列の別名なしの行は従来どおり指摘する
+    agg = {"backend_draft": {"docstring_terms": {"kai_date": ["会計日"]}},
+           "main": {"logical_names": [
+               {"physical_table": "t", "physical_column": "kai_date", "logical_column": "最初の会計日(推定)", "alias_name": "first_date", "derived": True},
+               {"physical_table": "t", "physical_column": "kai_date", "logical_column": "最後の会計日(推定)", "alias_name": "last_date", "derived": True}],
+               "db_operations": [{"id": "DB1", "aggregate": [{"function": "min", "target": "p.kai_date", "alias": "first_date"},
+                                                              {"function": "max", "target": "p.kai_date", "alias": "last_date"}]}]}}
+    plain = {"backend_draft": agg["backend_draft"],
+             "main": {"logical_names": agg["main"]["logical_names"] + [
+                 {"physical_table": "u", "physical_column": "kai_date", "logical_column": "日(推定)", "alias_name": "d"}],
+                 "db_operations": agg["main"]["db_operations"]}}
     return (len(check_docstring_terms(case("件数(推定)"))) == 1 and check_docstring_terms(case("件数")) == []
-            and check_docstring_terms(settled) == [])
+            and check_docstring_terms(settled) == [] and check_docstring_terms(agg) == []
+            and len(check_docstring_terms(plain)) == 1)
 
 
 def selftest_logical_unit_word() -> bool:

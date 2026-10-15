@@ -905,6 +905,60 @@ def _csv_formats_numbers(csv_exports, sources):
         c["formats_numbers"] = _csv_formats(c, fmt)
 
 
+# 関数の宣言・アロー関数の本体の始まり: function 宣言の引数の ( か、`= (…) =>`・`= x =>`・`= async`・`= function`(_decl_body は名前の後ろから返す)
+_FUNC_START = re.compile(r"\s*(?:\(|=\s*(?:async\b|function\b|\(|[A-Za-z_$][\w$]*\s*=>))")
+
+
+def _csv_reachable_names(csv_exports, sources):
+    """CSV 出力の関数本体から、直接・間接に名前が出る識別子の集まり(出力に使う関数の候補を見分けるため)。呼出元: _attach_csv_called。
+
+    本体の識別子を全部取り、その識別子が宣言(_DECL)の名前なら、その宣言の本体の識別子も足す(入れ子の関数・別の共通関数を包む関数を辿る)。
+    WHY: 共通関数が CSV から呼ばれるかは、CSV の関数が直に呼ぶ場合だけでなく rowsToCsv → fmt のような間接もある(_formatter_names と同じ辿り方)。
+    辿る宣言は、行頭(モジュール直下)のもの、または関数の形のもの(_FUNC_START)だけ。字下げした局所の変数(const a = …・const n = …)は名前が短く、
+    別の関数の局所と同名で衝突し、無関係な宣言の本体まで辿って fmt を「CSV から呼ばれる」と誤る(run17 で a → Card → fmt と辿った)。"""
+    decls = {}
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _DECL.finditer(text):
+            body = _decl_body(text, m.end())
+            # 宣言(const・function)の語の前が行頭か export・async だけなら、モジュール直下
+            prefix = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+            if re.fullmatch(r"(?:export\s+(?:default\s+)?)?(?:async\s+)?", prefix) or _FUNC_START.match(body):
+                decls.setdefault(m.group(1), []).append(body)
+    reach = set()
+    for c in csv_exports:
+        src = (c.get("src") or [None])[0]
+        if src:
+            text = Path(src["file"]).read_text(encoding="utf-8")
+            reach |= set(_IDENT.findall("\n".join(text.splitlines()[src["line_start"] - 1:src["line_end"]])))
+    grew = True
+    while grew:
+        grew = False
+        for n in [n for n in decls if n in reach]:
+            more = {t for b in decls[n] for t in _IDENT.findall(b)} - reach
+            if more:
+                reach |= more
+                grew = True
+    return reach
+
+
+def _attach_csv_called(draft, sources):
+    """logic_candidates の各共通関数に csv_called(true=CSV 出力が呼ぶ / false=呼ばない)を足す。CSV 出力(csv_exports)が無い画面は足さない。呼出元: main()。
+
+    WHY: S1 は「画面だけの整形」と「CSV でも使う処理」を1つの文に混ぜ、CSV は整形しないのに CSV の値を整形すると読める文を書いた(run11・run14・run15・run17)。
+    関数ごとの事実(CSV から呼ばれるか)を下書きに持てば、S1 が書き分けでき、合成が false の関数に「CSV 出力では呼ばない」の文を機械で足せる。
+    csv_exports の関数本体(src)から辿れる識別子に関数名があれば true。判定の元は _csv_reachable_names。"""
+    cands = draft.get("logic_candidates") or []
+    if not cands or not draft.get("csv_exports"):
+        return
+    reach = _csv_reachable_names(draft["csv_exports"], sources)
+    for c in cands:
+        if isinstance(c, dict) and c.get("name"):
+            c["csv_called"] = c["name"] in reach
+
+
 def _continuous_fact_map(ops):
     """連続操作の後から届く応答・読込中表示の事実(outcomes)を、その操作のイベントの fact_lines の形で返す。呼出元: main()。"""
     out = {}
@@ -1601,6 +1655,10 @@ def main(argv=None):
     _attach_option_facts(draft)
     # 目的(第19回): 画面側の共通関数(num・fmt・todayJst など、2か所以上から呼ぶ非 JSX の関数)を logic_candidates に足す。接続: verify_vs_source の _vs_map.check_front_logic_dropped
     draft.update(_react_facts.logic_candidates(sources))
+    # 目的(第20回): 各共通関数を CSV 出力が呼ぶか(logic_candidates[].csv_called)を足す。S1 が「画面だけの整形」と書き分け、合成 _compose_csv_scope が文を足す。接続: _attach_csv_called
+    _attach_csv_called(draft, sources)
+    # 目的(第20回): 画面が配列の件数を表示する所(count_displays)を足す。合成 _compose_mapping が response_to_screen_mapping に件数の写しを機械で足す。接続: _react_facts.count_displays
+    draft.update(_react_facts.count_displays(sources))
     # 目的: 派生配列(useMemo・素の filter 等で作る配列)を下書きに足す。接続: _react_facts.derived_arrays。B4 の配線(B5 が担当)
     draft.update(_react_facts.derived_arrays(sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
@@ -1906,6 +1964,50 @@ def _selftest_v5():
         return 1
     except Exception as e:
         print(f"[selftest NG] V5 例外: {e!r}")
+        return 1
+    return 0
+
+
+def _selftest_csv_called():
+    """共通関数ごとの csv_called(第20回): CSV の関数が直に呼ぶ・入れ子の関数を介して呼ぶ関数は true、画面だけで呼ぶ関数は false。
+    CSV 出力が無い画面・logic_candidates が無い画面には何も足さない。呼出元: selftest()。終了コード 0=OK / 1=NG。"""
+    import tempfile
+    tsx = [
+        "const num = (v) => Number(v);",                    # 1
+        "const fmt = (n) => n.toLocaleString();",            # 2
+        "const pad = (n) => String(n);",                     # 3
+        "export default function P() {",                     # 4
+        "  function rowsToCsv(rows) {",                      # 5
+        "    return rows.map((r) => num(r.kin)).join(\",\");",  # 6
+        "  }",                                               # 7
+        "  const exportCsv = () => {",                       # 8
+        "    const a = []; const body = rowsToCsv(rows);",   # 9(局所の変数 a。下の Other の局所 a と同名)
+        "    const blob = new Blob([body]);",                # 10
+        "  };",                                              # 11
+        "  return <td>{fmt(pad(1))}</td>;",                  # 12
+        "}",
+        "function Other() {",
+        "  const a = fmt(3);",                               # 別の関数の局所と同名でも、局所の変数は辿らない(run17 の a → Card → fmt)
+        "  return a;",
+        "}",
+    ]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td) / "P.tsx"
+            tp.write_text("\n".join(tsx) + "\n", encoding="utf-8")
+            csv = [{"function": "exportCsv", "src": [{"file": str(tp), "line_start": 8, "line_end": 11}]}]
+            draft = {"csv_exports": csv, "logic_candidates": [{"name": "num"}, {"name": "fmt"}, {"name": "pad"}]}
+            _attach_csv_called(draft, [tp])
+            got = {c["name"]: c["csv_called"] for c in draft["logic_candidates"]}
+            assert got == {"num": True, "fmt": False, "pad": False}, got
+            no_csv = {"csv_exports": [], "logic_candidates": [{"name": "num"}]}
+            _attach_csv_called(no_csv, [tp])
+            assert "csv_called" not in no_csv["logic_candidates"][0], no_csv
+            none = {"csv_exports": csv}
+            _attach_csv_called(none, [tp])
+            assert none == {"csv_exports": csv}, none
+    except AssertionError as e:
+        print(f"[selftest NG] csv_called {e}")
         return 1
     return 0
 
@@ -2273,6 +2375,8 @@ def selftest():
     if _selftest_u6():
         return 1
     if _selftest_v5():
+        return 1
+    if _selftest_csv_called():
         return 1
     if _selftest_w7():
         return 1

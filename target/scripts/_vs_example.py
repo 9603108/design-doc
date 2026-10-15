@@ -25,6 +25,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+import _react_facts
 import _vs_common
 import verify_vs_source as _vs
 
@@ -450,23 +451,11 @@ SELFTESTS.append(_selftest_example_arith_miss)
 SELFTESTS.append(_selftest_example_arith_floor)
 
 
-# 画面が件数を表示する式: JSX の {X.length} とテンプレートの ${X.length}。直後が } か算術演算子のものだけを拾う。
-# WHY: 件数を条件に使う式({rows.length > 1 && …}・disabled={!rows.length})は表示でなく、写しを求めない。
-#      field_usage は .length の使用を載せないので、写し漏れ([写しの漏れ])の検査では拾えない(run14 の IT14・IT64)。画面のソースの字面から直接拾う。
-_COUNT_SHOWN = re.compile(r"(?:\$\{|\{)\s*([A-Za-z_]\w*)\.length\s*(?:\}|[+\-*/])")
-# 件数の写しと認める transform の語(api_field_path が件数の形でないときの救済)
-_COUNT_WORDS = re.compile(r"length|件数|行数|店数|レジ数|台数|個数|の数|数を|何件|件の")
-
-
-def _is_count_map(m, resp_key) -> bool:
-    """写し m が、応答 resp_key の件数の写しか。api_field_path が resp_key・resp_key[]・resp_key.length・resp_key[].length のどれか、
-    または transform に件数の語があり根が resp_key のもの。resp_key が None のときは根を問わない。呼出元: _count_mapping_ok・check_count_mapping。"""
-    path = str(m.get("api_field_path") or "").strip()
-    shape = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\])?(?:\.length)?", path)
-    root = re.split(r"[\[.]", path)[0]
-    if shape and (resp_key is None or shape.group(1) == resp_key):
-        return True
-    return bool(_COUNT_WORDS.search(str(m.get("transform") or "")) and (resp_key is None or root == resp_key))
+# 件数の表示の式・件数の写しの判定・単位の読み方は _react_facts が正本(第20回)。下書きの count_displays と合成 _compose_mapping が同じものを使うため、
+# ここには定義を持たず別名で受ける(WHY の詳細は _react_facts の COUNT_SHOWN・shown_units・is_count_map)。
+_COUNT_SHOWN = _react_facts.COUNT_SHOWN
+_COUNT_WORDS = _react_facts.COUNT_WORDS
+_is_count_map = _react_facts.is_count_map
 
 
 def _count_mapping_ok(maps, item_name, resp_key) -> bool:
@@ -475,29 +464,8 @@ def _count_mapping_ok(maps, item_name, resp_key) -> bool:
     return any(m.get("screen_item_name") == item_name and _is_count_map(m, resp_key) for m in maps)
 
 
-# 件数の直後の字面(単位)を取る正規表現。JSX の {X.length}店だけ と テンプレートの ${X.length}${cond ? "店舗" : "レジ"}分 の
-# 「件数の式の後ろ」から、式(穴 ${…} か {…})の文字列リテラルと、その直後の日本語の語を拾う。呼出元: _shown_units
-_UNIT_HOLE = re.compile(r"^\s*\$?\{([^{}]*)\}")
-_UNIT_WORD = re.compile(r"^\s*([぀-ヿ一-鿿]+)")
-_QUOTED = re.compile(r"[\"'`]([^\"'`]*)[\"'`]")
-
-
-def _shown_units(after) -> list:
-    """画面が件数の直後に出す単位の語の候補を返す。after は件数の式(X.length})の直後の行の残り。
-    直後が日本語の語ならその語、直後が式の穴で文字列リテラルを持つなら(リテラル + 穴の直後の語)ごとに1つずつ。
-    例: `店だけ` → ["店だけ"]、`${group === "shop" ? "店舗" : "レジ"}分` → ["店舗分", "レジ分"]。読めなければ [] を返し、照合しない。
-    WHY: transform が件数の単位をどう書くかは、画面が実際に出す字面(PosReport.tsx:308 の「N店舗分」「Nレジ分」)と合わせる約束のため。呼出元: check_count_mapping。"""
-    m = _UNIT_WORD.match(after)
-    if m:
-        return [m.group(1)]
-    m = _UNIT_HOLE.match(after)
-    if not m:
-        return []
-    # WHY: 三項演算子の条件の文字列("shop" と比べる側)は画面に出ない。出るのは ? より後ろ(結果の2つ)のリテラルだけ
-    expr = m.group(1).split("?", 1)[1] if "?" in m.group(1) else m.group(1)
-    lits = [x for x in _QUOTED.findall(expr) if x]
-    tail = _UNIT_WORD.match(after[m.end():])
-    return [x + (tail.group(1) if tail else "") for x in lits]
+# 件数の直後の字面(単位)の読み方(shown_units)も _react_facts が正本。呼出元: check_count_mapping
+_shown_units = _react_facts.shown_units
 
 
 # transform が件数の形を書く部分「N件」「N 店」の N の直後の日本語の語。呼出元: _unit_mismatch
@@ -592,7 +560,8 @@ def check_count_mapping(d) -> list:
                             break
                     continue
                 msg = (f"画面は {state}.length({'応答 ' + key if key else '応答の配列'} の件数)を表示しているが、response_to_screen_mapping に{names}への"
-                       f"件数の写しが無い。api_field_path を {key or '<配列名>'}.length にし、transform に件数を何として出すかを書く → 差し戻し先 S2")
+                       f"件数の写しが無い。api_field_path を応答の配列の key({key or '<配列名>'}。response_items に {key or '<配列名>'}.length の key があればそれ)にし、"
+                       "transform に件数を何として出すかを書く → 差し戻し先 S2")
                 out.append(_vs_common.warn("件数の写し", where, msg))
     return list(dict.fromkeys(out))
 

@@ -1713,6 +1713,143 @@ def logic_candidates(sources):
     return {"logic_candidates": out}
 
 
+# --- 件数の表示(第20回): 画面が配列の件数({rows.length}・${rows.length})を出す所を下書きの事実にする ---
+# 画面が件数を表示する式: JSX の {X.length} とテンプレートの ${X.length}。直後が } か算術演算子のものだけを拾う。
+# WHY: 件数を条件に使う式({rows.length > 1 && …}・disabled={!rows.length})は表示でなく、写しを求めない。
+#      field_usage は .length の使用を載せないので、写し漏れ([写しの漏れ])の検査では拾えない(run14 の IT14・IT64)。
+#      検査(_vs_example.check_count_mapping)と合成(_compose_mapping)が同じ式・同じ単位の読み方を使えるよう、ここを正本にする。
+COUNT_SHOWN = re.compile(r"(?:\$\{|\{)\s*([A-Za-z_]\w*)\.length\s*(?:\}|[+\-*/])")
+# 件数の写しと認める transform の語(api_field_path が件数の形でないときの救済)
+COUNT_WORDS = re.compile(r"length|件数|行数|店数|レジ数|台数|個数|の数|数を|何件|件の")
+# 件数の直後の字面(単位)を取る正規表現。JSX の {X.length}店だけ と テンプレートの ${X.length}${cond ? "店舗" : "レジ"}分 の
+# 「件数の式の後ろ」から、式(穴 ${…} か {…})の文字列リテラルと、その直後の日本語の語を拾う。呼出元: shown_units
+_UNIT_HOLE = re.compile(r"^\s*\$?\{([^{}]*)\}")
+_UNIT_WORD = re.compile(r"^\s*([぀-ヿ一-鿿]+)")
+_QUOTED = re.compile(r"[\"'`]([^\"'`]*)[\"'`]")
+# 単位の語の後ろに文が続くとき(「店だけなのでその店だけを出している」)の切れ目。先頭の1字は切らない
+_UNIT_CUT = re.compile(r"(?<=.)(?:なので|ので|のに|から|など|を|は|が|に|も|へ)")
+
+
+def _unit_word(s):
+    """s の先頭の日本語の語を単位として返す。語の後ろに助詞・接続(_UNIT_CUT)が続くときはその手前まで。日本語で始まらなければ None。
+    WHY: JSX の文は「{shops.length}店だけなのでその店だけを出している。」と続くため、続く文まで単位に取ると transform に長い文が入る。"""
+    m = _UNIT_WORD.match(s)
+    return _UNIT_CUT.split(m.group(1), 1)[0] if m else None
+
+
+def shown_units(after) -> list:
+    """画面が件数の直後に出す単位の語の候補を返す。after は件数の式(X.length})の直後の行の残り。
+    直後が日本語の語ならその語、直後が式の穴で文字列リテラルを持つなら(リテラル + 穴の直後の語)ごとに1つずつ。
+    例: `店だけ` → ["店だけ"]、`${group === "shop" ? "店舗" : "レジ"}分` → ["店舗分", "レジ分"]。読めなければ [] を返し、照合しない。
+    WHY: transform が件数の単位をどう書くかは、画面が実際に出す字面(PosReport.tsx:308 の「N店舗分」「Nレジ分」)と合わせる約束のため。
+    呼出元: count_displays(下書きの事実)・_vs_example.check_count_mapping。"""
+    word = _unit_word(after)
+    if word:
+        return [word]
+    m = _UNIT_HOLE.match(after)
+    if not m:
+        return []
+    # WHY: 三項演算子の条件の文字列("shop" と比べる側)は画面に出ない。出るのは ? より後ろ(結果の2つ)のリテラルだけ
+    expr = m.group(1).split("?", 1)[1] if "?" in m.group(1) else m.group(1)
+    lits = [x for x in _QUOTED.findall(expr) if x]
+    tail = _unit_word(after[m.end():])
+    return [x + (tail or "") for x in lits]
+
+
+def is_count_map(m, resp_key) -> bool:
+    """写し m が、応答 resp_key の件数の写しか。api_field_path が resp_key・resp_key[]・resp_key.length・resp_key[].length のどれか、
+    または transform に件数の語があり根が resp_key のもの。resp_key が None のときは根を問わない。
+    呼出元: _vs_example(_count_mapping_ok・check_count_mapping)・_compose_mapping(件数の写しの足し)。"""
+    path = str(m.get("api_field_path") or "").strip()
+    shape = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\])?(?:\.length)?", path)
+    root = re.split(r"[\[.]", path)[0]
+    if shape and (resp_key is None or shape.group(1) == resp_key):
+        return True
+    return bool(COUNT_WORDS.search(str(m.get("transform") or "")) and (resp_key is None or root == resp_key))
+
+
+def _shown_conds(text, pos) -> list:
+    """位置 pos の式を囲む JSX の表示条件(&& の左・三項の条件)を、外側から内側の順に文字列で返す。三項の else 側は「!(条件)」と書く。
+    部品の呼出元の鎖(component)・map は条件でないので入れない。WHY: 件数の写しに「どんなとき出るか」を書くため(合成 _compose_mapping が読む)。"""
+    from _jsx_chain import chain_at
+    out = []
+    for el in chain_at(text, pos):
+        kind, cond = el.get("kind"), str(el.get("cond") or "").strip()
+        if not cond:
+            continue
+        if kind in ("and", "ternary_then"):
+            out.append(cond)
+        elif kind == "ternary_else":
+            out.append(f"!({cond})")
+    return out
+
+
+def count_displays(sources):
+    """画面(TSX・JSX)が配列の件数({shops.length}店だけ・${rows.length}レジ分)を表示する所を
+    {"count_displays": [{state, units, visible_if, src}]} で返す(第20回)。
+
+    呼出元: extract_react_draft.main()。意味合い: 件数は応答の1項目でなく配列の長さなので field_usage に載らず、S2 が写しを書き漏らす
+    (run15・16・17 で毎回 [件数の写し] の WARN)。検査で戻す前に、合成(_compose_mapping)が response_to_screen_mapping へ機械で足せるよう、
+    表示している式・単位・表示条件を下書きの事実にする。
+    state は件数を取る配列の名前(応答のキーへは failure_effects[].on_success_from で結ぶ。合成が行う)。units は shown_units が読んだ単位の語
+    (読めなければ空)。visible_if は式を囲む表示条件(無ければ空)。src は式のある1行。
+    ponytail: 条件に使う .length({rows.length > 1 && …})は拾わない(COUNT_SHOWN が表示の形だけを拾う)。"""
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        offset = 0
+        for ln, line in enumerate(text.split("\n"), 1):
+            for m in COUNT_SHOWN.finditer(line):
+                out.append({
+                    "state": m.group(1),
+                    "units": shown_units(line[m.end():]) if m.group(0).endswith("}") else [],
+                    "visible_if": _shown_conds(text, offset + m.start()),
+                    "src": [{"file": str(p), "line_start": ln, "line_end": ln}]})
+            offset += len(line) + 1
+    return {"count_displays": out}
+
+
+def selftest_count_displays():
+    """件数の表示の事実: 表示の式(JSX の {X.length}・テンプレートの ${X.length})だけを拾い、条件の .length は拾わない。
+    単位(直後の語・式の穴のリテラル)と表示条件(&& の左)を読む。shown_units・is_count_map の形も確かめる。"""
+    tsx = (
+        "{rows.length > 1 && (\n"                                          # 1 条件の .length → 拾わない
+        "  <Card\n"                                                         # 2
+        "    subtitle={`${applied.from} / ${rows.length}${group === \"shop\" ? \"店舗\" : \"レジ\"}分`}\n"   # 3 拾う
+        "  />\n"
+        ")}\n"
+        "<button disabled={!rows.length}>CSV</button>\n"                    # 6 拾わない
+        "<div>POSがあるのは\n"
+        "  {shops.length}店だけ\n"                                           # 8 拾う
+        "</div>\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "C.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            (Path(d) / "api.ts").write_text("const n = {a.length};\n", encoding="utf-8")
+            got = count_displays([p, Path(d) / "api.ts"])["count_displays"]
+        assert [(g["state"], g["src"][0]["line_start"]) for g in got] == [("rows", 3), ("shops", 8)], got
+        assert got[0]["units"] == ["店舗分", "レジ分"] and got[1]["units"] == ["店だけ"], got
+        assert got[0]["visible_if"] == ["rows.length > 1"], got[0]
+        assert shown_units("}件") == [] and shown_units("") == []
+        # 語の後ろに文が続くとき(run17 の IT64: 店だけなのでその店だけを出している)は、助詞・接続の手前までを単位にする。「店舗分」「レジ分」は切らない
+        assert shown_units("店だけなのでその店だけを出している。") == ["店だけ"], shown_units("店だけなのでその店だけを出している。")
+        assert shown_units("レジ分") == ["レジ分"] and shown_units("店舗分、") == ["店舗分"]
+        assert is_count_map({"api_field_path": "rows.length"}, "rows") and is_count_map({"api_field_path": "rows[]"}, "rows")
+        assert not is_count_map({"api_field_path": "rows[].id"}, "rows")
+        assert not is_count_map({"api_field_path": "items.length"}, "rows")
+        assert is_count_map({"api_field_path": "rows[].id", "transform": "件数を出す"}, "rows")
+        assert is_count_map({"api_field_path": "x", "transform": "行数を出す"}, None)
+    except AssertionError as e:
+        print(f"[selftest NG] count_displays {e}")
+        return 1
+    print("[selftest OK] _react_facts.count_displays")
+    return 0
+
+
 def selftest_logic_candidates():
     """画面側の共通関数の候補: 2か所以上から使う非 JSX の関数だけを拾い、コンポーネント・1か所だけ・handler・JSX を返す関数は拾わない。"""
     # fallback-ok: 次の TSX は試験の入力(文字列)。num の `?? 0` は検査対象のソースの字面で、このスクリプトの既定値ではない
@@ -1868,6 +2005,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain() or selftest_logic_candidates())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain() or selftest_logic_candidates() or selftest_count_displays())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
