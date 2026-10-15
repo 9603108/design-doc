@@ -1294,6 +1294,11 @@ def _has_brace_hole(path: str, s: str) -> bool:
 # 2026-10-13: 画面項目の例示値は、実行時に決まる値(金額・件数・日付など)を {金額} 円 のように書式の例として書く(S1 手順書)。
 # 具体的な値はソースに無く verify_vs_source が止めるため。この道筋の {名前} は未展開の穴とみなさない
 EXAMPLE_PATH_RE = re.compile(r"^screen_layout\.items\[\d+\]\.example$")
+# WHY(2026-10-15 run15 差6): messages の可変部は {項目名} で書くのがスキーマの形(15_中間JSONスキーマ.md の例「{項目名}は必須項目です。」)で、
+#   ソースが `（HTTP ${r2.status}）` のようにテンプレートリテラルで組む文面の ${x} に対応する。これを未展開の穴として ERROR にすると、
+#   H4 が正しく書いた「（HTTP {status}）」を語(「HTTP ステータスコード」)に置き換え、画面に出る形と区別できない文面になった。
+#   対象は画面のメッセージ(messages[].message)だけ。messages_backend は下書きの text_expanded(展開済み)を一字一句写す欄なので {名前} を許さない
+MESSAGE_PATH_RE = re.compile(r"^messages\[\d+\]\.message$")
 # 例示値に残った {名前} は、書式の例として書かれるべき値が穴のまま残った状態。ERROR にせず WARN で S1 へ差し戻す。
 # 理由: verify_partials.py の _EX_HOLE(0402803)と同じ判定にそろえ、2つの検査で同じ穴を別の重さで扱わないため。
 # 空白を含む {…} も穴として拾う(BRACE_HOLE_RE は例示値には使わない)
@@ -1328,7 +1333,8 @@ def check_intermediate_strict(merged: dict) -> list:
       (1) common_logic の要素で processing_steps も expression も空 → ERROR
       (2) 全文字列に 'db_op_' が残る → ERROR
       (3) 全文字列に '〈' または波括弧の穴 '{名前}' が残る → ERROR
-          （例外: screen_layout.items[].example の {…} の穴だけは WARN で S1 へ差し戻す）
+          （例外: screen_layout.items[].example の {…} の穴だけは WARN で S1 へ差し戻す。
+            messages[].message の {名前} は可変部の正しい書き方(ソースの ${x} に対応)なので穴にしない)
       (4) messages の ID が ^MS[EWI]\\d{5}$ に合わない → ERROR / 同じ ID に別の文面が付く → ERROR
       (5) db_operations の要素に日本語キー（結合・抽出条件・条件・集計・並び順）の値があり、
           対応する英語キー（joins / where / group_by / order_by）が空 → ERROR
@@ -1346,7 +1352,8 @@ def check_intermediate_strict(merged: dict) -> list:
             issues.append(("ERROR", f"{path}: 物理名 'db_op_' が文字列に残存: '{s[:80]}'"))
         # 画面項目の例示値(screen_layout.items[].example)の {名前} は下の elif で WARN にする(〈 は従来どおり ERROR)。
         # 理由: 例示値は書式の例として実値で書くのが正(S1 手順書)。穴は S1 へ戻して実値に直させる
-        if "〈" in s or (_has_brace_hole(path, s) and not EXAMPLE_PATH_RE.match(path)):
+        # messages[].message の {名前} は、ソースのテンプレートリテラルの ${x} に対応する可変部の正しい書き方なので穴にしない(MESSAGE_PATH_RE の WHY)
+        if "〈" in s or (_has_brace_hole(path, s) and not EXAMPLE_PATH_RE.match(path) and not MESSAGE_PATH_RE.match(path)):
             issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
         # 例示値の {名前} は WARN に留める(最終段で残れば S1 へ差し戻す)。ERROR にすると docx 生成前に止まり、S1 の手戻りを機械的に強制しすぎるため
         elif EXAMPLE_PATH_RE.match(path) and EXAMPLE_HOLE_RE.search(s):
@@ -1849,6 +1856,17 @@ def _selftest() -> int:
     bare = {"api_spec": [{"response_pattern": "成功時 {件数} 件を返す"}]}
     if not any("未展開の穴" in m for _, m in check_intermediate_strict(bare)):
         print("[selftest NG] 応答の形の中の素の {名前} の穴を見逃した")
+        return 1
+    # run15 差6: messages[].message の可変部 {status} は未展開の穴にしない。messages_backend の {名前}・他の欄の素の {名前} は穴のまま
+    msg_var = {"messages": [{"message_id": "MSE00005", "message": "大きい応答の受け取りに失敗しました（HTTP {status}）。もう一度操作してください"},
+                            {"message_id": "MSE00007", "message": "{code}: {message}"}]}
+    if any("未展開の穴" in m for _, m in check_intermediate_strict(msg_var)):
+        print("[selftest NG] messages の可変部 {名前} を未展開の穴にした")
+        return 1
+    msg_back = {"messages_backend": [{"message_id": "MSE00001", "message": "{key} は正の整数で指定してください"}],
+                "api_spec": [{"description": "{件数} 件を返す"}]}
+    if sum("未展開の穴" in m for _, m in check_intermediate_strict(msg_back)) != 2:
+        print("[selftest NG] messages_backend・他の欄の {名前} を穴として見逃した")
         return 1
     if not check_event_action({"events": [{"no": "EV1", "action": ""}]}):
         print("[selftest NG] 動作語の空が出ない")

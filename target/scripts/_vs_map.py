@@ -11,7 +11,10 @@ d(_vs_common.load の戻り)の読み方は _vs_common の docstring。
 【検査の足し方】
   1. check(d) -> list[str] の関数を書く。指摘が無ければ []。必要な JSON が d に無いときも [] を返す(何も言わない)。
   2. 行は _vs_common.warn(tag, where, msg) で作る(新しい検査は [WARN]。終了コードに影響しない)。
-     例外: check_csv_column_name([CSV列名])は、依頼で ERROR とされたため、このファイルの _error で [ERROR] の行を作る(終了コード 1)。
+     例外: check_csv_column_name([CSV列名])・check_common_logic_dropped([共通ロジック漏れ]の sql_condition)・check_docstring_count_example([例示値の実数])・
+     check_jsx_text_gap([JSXの空白])は、依頼で ERROR とされたため、このファイルの _error で [ERROR] の行を作る(終了コード 1)。
+     check_common_logic_dropped の sql_fragment(部品の定数)は WARN。
+     行の書式は「[ERROR] [タグ] 場所: 内容 → 差し戻し先 S1」(差し戻し先は msg の末尾)。
   3. 関数を CHECKS に足す。
   4. 検査の正例・負例を、引数なしで bool を返す selftest 用の関数に書き、SELFTESTS に足す(selftest() が全部呼ぶ)。
 
@@ -446,12 +449,284 @@ def _selftest_response_display_name() -> bool:
     return check_response_display_name(d_with("売上訂正金額")) == [] and len(check_response_display_name(d_with("返品金額"))) == 1
 
 
+# ---- 差4: サーバー・DB 側の共通ロジックの候補の漏れ ----------------------------------------------------------
+# WHY(run15): backend の SQL が使う定数(取込欠損の条件 _WARN_COND・有効な行 LIVE・集計単位 _GROUPS)は、S1 が common_logic に起こす
+# 決まりだが、run15 は CL1〜CL5 が全部ブラウザの処理になり、3件とも丸ごと消えた(run14 までは有った)。下書きの logic_candidates と
+# 最終の common_logic を照合しないと、候補の落ちは他の検査で見えない(BE2 の備考・RI12 には文として残るので、残ったように見える)。
+# 日本語の語(かな・漢字・カタカナの連なり)。_jp_grams が部分文字列に切る
+_JP_RUN = re.compile(r"[぀-ゟァ-ヺー㐀-鿿]+")
+
+
+def _jp_grams(text) -> set:
+    """日本語の語の部分文字列のうち、語として照合に足るものの集合。4字で漢字・カタカナが3字以上、または5字で2字以上。
+    WHY: 候補のコメントと common_logic の文を共通の語でつなぐ。ひらがなだけの連なり(「している」)や、漢字1字を含むだけの連なり
+    (「現行に無い」「置き換え」)は別の文にも出るので拾わない。run11・run15 の実データで、4字で漢字2字の連なりまで拾うと
+    ブラウザの処理の文(「0に置き換えて」)が候補のコメントに一致した。呼出元: _cl_covers。"""
+    out = set()
+    for run in _JP_RUN.findall(str(text or "")):
+        for n, need in ((4, 3), (5, 2)):
+            for i in range(len(run) - n + 1):
+                g = run[i:i + n]
+                if sum(1 for c in g if not "぀" <= c <= "ゟ") >= need:
+                    out.add(g)
+    return out
+
+
+def _src_overlap(a, b) -> bool:
+    """出典(src の並び)a と b に、同じファイルで行の範囲が重なるものがあるか。行が欠けた出典は重ならないものとして扱う。"""
+    for x in a or []:
+        for y in b or []:
+            lo1, hi1, lo2, hi2 = x.get("line_start"), x.get("line_end"), y.get("line_start"), y.get("line_end")
+            if x.get("file") == y.get("file") and None not in (lo1, hi1, lo2, hi2) and lo1 <= hi2 and lo2 <= hi1:
+                return True
+    return False
+
+
+def _cl_covers(cand, cl) -> bool:
+    """共通ロジック cl が、backend の候補 cand を拾っているか。次のどれかで拾っているとみなす。
+    (1) 出典(src)の行が重なる。(2) 候補の実装の名前(_WARN_COND など)・SQL の列名(seisan_cnt・superseded_by_import_id のように _ を含み8字以上のもの)が
+    cl の文に出る。(3) 候補に付けたコメント(下書きの comment)と cl の文に、共通の語(_jp_grams)がある。
+    WHY: common_logic の src は空のことがある(run11・run12)ので、行の重なりだけでは拾った候補を落ちと誤る。コメントは業務の語で
+    書かれ、S1 が common_logic の名前・説明に使う語と重なる(run8〜13 で確かめた)。cl の文は used_in・used_by_processes を含めない
+    (「集計単位の切替」のように、別の処理の名前が候補の語に一致するため)。呼出元: check_common_logic_dropped。"""
+    if _src_overlap(cand.get("src"), cl.get("src")):
+        return True
+    body = " ".join(str(x) for x in [cl.get("name"), cl.get("description"), cl.get("expression"), cl.get("null_handling"),
+                                     cl.get("zero_division"), cl.get("remarks")]
+                    + [s.get("description") for s in cl.get("processing_steps") or []] if x)
+    ids = {cand.get("name")} | {t for t in re.findall(r"[A-Za-z]+(?:_[A-Za-z0-9]+)+", str(cand.get("text") or "")) if len(t) >= 8}
+    if any(t and len(t) >= 4 and t in body for t in ids):
+        return True
+    return bool(_jp_grams(cand.get("comment")) & _jp_grams(body))
+
+
+def check_common_logic_dropped(d) -> list:
+    """backend の下書きの logic_candidates(SQL に入る共通の条件・列の表)のうち、この画面の API が使うものが、common_logic に
+    拾われていない(_cl_covers が真になる項目が1つも無い)ものを指摘する(kind が sql_condition なら ERROR、
+    sql_fragment(表名の対応・列の並びなどの部品の定数)なら WARN。差し戻し先は S1)。
+    この画面の API = main の api_spec の action。候補の使い手は下書きの used_by(API の辿った関数が名前を使う action)で決め、
+    used_by が無い古い下書きは、候補のファイルが画面の API のファイルかで決める。
+    WHY: 取込欠損の判定・有効な会計行・集計単位のようなサーバー・DB 側の規則が common_logic から丸ごと消えても、他の検査は何も言わない(run15 の差4)。
+    main か backend_draft か、この画面の API(下書きの apis に出典のあるもの)が無ければ何も言わない。
+    呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    bd, main = d.get("backend_draft"), d.get("main")
+    if not bd or not main:
+        return []
+    actions = {a.get("action") for a in main.get("api_spec") or [] if a.get("action")}
+    apis = bd.get("apis") or {}
+    files = {s.get("file") for a in actions for s in (apis.get(a) or {}).get("src") or []}
+    if not actions or not files:
+        return []
+    cls = main.get("common_logic") or []
+    out = []
+    for cand in bd.get("logic_candidates") or []:
+        srcs = cand.get("src") or [{}]
+        if cand.get("used_by") is not None:
+            if not set(cand["used_by"]) & actions:
+                continue
+        elif srcs[0].get("file") not in files:
+            continue
+        if any(_cl_covers(cand, cl) for cl in cls):
+            continue
+        s = srcs[0]
+        where = f"logic_candidates[{cand.get('name')}] ({Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})"
+        cm = str(cand.get("comment") or "")
+        msg = (f"この画面の API({', '.join(sorted(set(cand.get('used_by') or []) & actions or actions))})が使う共通の規則 {cand.get('name')}"
+               f"({str(cand.get('text') or '')[:50]})が、common_logic のどの項目にも対応していない"
+               f"(src の行が重ならず、名前・コメントの語{('「' + cm[:30] + '…」') if cm else ''}も common_logic の文に出ない)。"
+               f"サーバー・DB 側の規則を common_logic に足す(runs_on はデータベース) → 差し戻し先 S1")
+        # WHY: sql_condition は SQL の条件・集計の事実(取込欠損の判定など)で、落ちると仕様が事実と食い違うので ERROR。
+        # それ以外(sql_fragment: 表名の対応・列の並びなど部品の定数)は、common_logic の1項目に立てるか文に織り込むかが設計の判断で、
+        # 無いこと自体は誤りと言い切れないので WARN に下げる(終了コードに影響しない)。
+        out.append(_error("共通ロジック漏れ", where, msg) if cand.get("kind") == "sql_condition"
+                   else _vs_common.warn("共通ロジック漏れ", where, msg))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_common_logic_dropped() -> bool:
+    """check_common_logic_dropped の正例・負例。合成 d で、候補が common_logic の src・コメントの語に拾われていれば指摘なし、
+    拾われていなければ ERROR、この画面の API が使わない候補は対象外、used_by の無い古い下書きは候補のファイルで決める。
+    WHY: 誤検出を実データの前に合成で確かめる。呼出元: selftest。"""
+    f = "/x/queries_pos.py"
+
+    def cand(name, line, comment, used_by):
+        c = {"name": name, "kind": "sql_condition", "text": "p.seisan_cnt = 0", "src": [{"file": f, "line_start": line, "line_end": line}],
+             "comment": comment}
+        if used_by is not None:
+            c["used_by"] = used_by
+        return c
+
+    def d_with(cls, used_by=("list",), extra=()):
+        return {"main": {"api_spec": [{"action": "list"}], "common_logic": cls},
+                "backend_draft": {"apis": {"list": {"src": [{"file": f, "line_start": 1, "line_end": 2}]}},
+                                  "logic_candidates": [cand("_WARN", 79, "取込欠損の疑いがある日の判定条件", list(used_by)),
+                                                       cand("LIVE", 85, "取り直しで置き換えた古い行には印が立つ", list(used_by))] + list(extra)}}
+    by_src = {"name": "疑い日の判定", "src": [{"file": f, "line_start": 66, "line_end": 79}]}
+    by_word = {"name": "有効な会計行", "description": "取り直しで置き換えた古い行は数えない", "src": []}
+    browser = {"name": "全行の合算", "description": "表示中の全行の数値項目を置き換える", "src": [{"file": "/x/Screen.tsx", "line_start": 5, "line_end": 9}]}
+    ok = check_common_logic_dropped(d_with([by_src, by_word, browser])) == []
+    one = check_common_logic_dropped(d_with([by_src, browser]))
+    none_ = check_common_logic_dropped(d_with([browser]))
+    # 他の API だけが使う候補・used_by が空の候補は、この画面では求めない
+    other = check_common_logic_dropped(d_with([by_src, by_word], used_by=("other",)))
+    # used_by が無い古い下書き: 候補のファイルが画面の API のファイルなら求め、別のファイルなら求めない
+    old = d_with([browser], extra=())
+    for c in old["backend_draft"]["logic_candidates"]:
+        c.pop("used_by")
+    old_hits = len(check_common_logic_dropped(old))
+    old["backend_draft"]["logic_candidates"][0]["src"][0]["file"] = "/x/other.py"
+    old["backend_draft"]["logic_candidates"][1]["src"][0]["file"] = "/x/other.py"
+    old_other = check_common_logic_dropped(old)
+    # SQL の列名(seisan_cnt)が common_logic の文に出れば拾っているとみなす
+    by_id = {"name": "判定", "description": "seisan_cnt が0の日", "src": []}
+    by_ident = check_common_logic_dropped(d_with([by_id, by_word]))
+    nodata = check_common_logic_dropped({"main": {"api_spec": [{"action": "list"}]}}) == []
+    # 部品の定数(sql_fragment: 表名の対応・列の並び)は、拾われていなくても WARN に留まる。sql_condition は ERROR のまま
+    frag = cand("_COLS", 90, "列の並び", ["list"])
+    frag["kind"] = "sql_fragment"
+    frag["text"] = '["a", "b"]'
+    mixed = check_common_logic_dropped(d_with([by_src, by_word, browser], extra=(frag,)))
+    frag_warn = len(mixed) == 1 and mixed[0].startswith("[WARN] [共通ロジック漏れ]") and "_COLS" in mixed[0]
+    cond_err = check_common_logic_dropped(d_with([by_src, browser], extra=(frag,)))
+    cond_err_ok = (len([x for x in cond_err if x.startswith("[ERROR]")]) == 1 and len([x for x in cond_err if x.startswith("[WARN]")]) == 1)
+    return (ok and len(one) == 1 and "LIVE" in one[0] and one[0].startswith("[ERROR] [共通ロジック漏れ]") and "差し戻し先 S1" in one[0]
+            and len(none_) == 2 and other == [] and old_hits == 2 and old_other == [] and by_ident == [] and nodata
+            and frag_warn and cond_err_ok)
+
+
+# ---- 差5: 実行時の値を含む文言の例示値(店数など)の照合 ----------------------------------------------------------
+def _item_texts(main):
+    """画面項目の example と、initialization の initial_value の文字列を (場所, 種別, 文字列) で返す。呼出元: 差5 の2つの検査。"""
+    out = []
+    for it in (main.get("screen_layout") or {}).get("items") or []:
+        out.append((f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "example", str(it.get("example") or "")))
+    for it in (main.get("initialization") or {}).get("items") or []:
+        out.append((f"initialization.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "initial_value", str(it.get("initial_value") or "")))
+    return out
+
+
+def check_docstring_count_example(d) -> list:
+    """画面項目の例示値(example)に書かれた数が、ソース(docstring・コメント)の実数と食い違うものを指摘する(ERROR・差し戻し先 S1)。
+    実数は下書き(backend_draft)の docstring_counts({lead=数の直前の語, count, unit})。例示値に「<lead の末尾>(空白)<数><単位>」の形があり、
+    数が count と違えば食い違い。lead が4字未満の実数は手掛かりにならないので見ない。
+    WHY(run15 の差5): IT65 注記3 の例示値「POSがあるのは 10店」は、docstring「実際にPOSがあるのは11店」と食い違った。S1 の手順書は
+    「実行時の値を含む文言の例示値は、ソースのコメントに実数があればそれを使う」「docstring の店数と食い違う値を避ける」と決めている。
+    initialization の initial_value は、取得前の状態(店数 0)の画面の値で実数とは別なので見ない。
+    呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    bd, main = d.get("backend_draft"), d.get("main")
+    if not bd or not main:
+        return []
+    out = []
+    for f in bd.get("docstring_counts") or []:
+        lead = str(f.get("lead") or "")
+        if len(lead) < 4 or not f.get("unit"):
+            continue
+        rx = re.compile(re.escape(lead[-8:]) + r"\s*([0-9]+)\s*" + re.escape(str(f["unit"])))
+        s = (f.get("src") or [{}])[0]
+        for where, kind, text in _item_texts(main):
+            if kind != "example":
+                continue
+            for m in rx.finditer(text):
+                if int(m.group(1)) == f.get("count"):
+                    continue
+                out.append(_error(
+                    "例示値の実数", where,
+                    f"例示値「…{m.group(0)}」の数 {m.group(1)} が、ソースの {f.get('kind')} の実数「{f.get('text')}」"
+                    f"({Path(str(s.get('file') or '')).name}:{s.get('line_start')})の {f.get('count')} と食い違う。"
+                    f"実行時の値を含む文言の例示値は、ソースのコメント・docstring の実数を使う → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_docstring_count_example() -> bool:
+    """check_docstring_count_example の正例・負例。合成 d で、例示値の数が docstring の実数と同じなら指摘なし、違えば1件。
+    initial_value の数(0)は見ない。lead が短い実数は見ない。WHY: 誤検出を実データの前に合成で確かめる。呼出元: selftest。"""
+    fact = {"lead": "実際にPOSがあるのは", "count": 11, "unit": "店", "text": "実際にPOSがあるのは11店", "kind": "docstring",
+            "src": [{"file": "/x/queries_pos.py", "line_start": 154, "line_end": 154}]}
+    short = {"lead": "約", "count": 3, "unit": "店", "text": "約3店", "kind": "comment", "src": []}
+
+    def d_with(example, initial="…POSがあるのは0店だけ"):
+        return {"main": {"screen_layout": {"items": [{"no": "IT65", "item_name": "注記3", "example": example}]},
+                         "initialization": {"items": [{"no": "65", "item_name": "注記3", "initial_value": initial}]}},
+                "backend_draft": {"docstring_counts": [fact, short]}}
+    same = check_docstring_count_example(d_with("現行は…、POSがあるのは11店だけなので"))
+    diff = check_docstring_count_example(d_with("現行は…、POSがあるのは 10店だけなので"))
+    # 空白の有無は数の食い違いとは別(JSX の空白の検査が見る)。数が同じなら空白があっても指摘なし
+    gap_same = check_docstring_count_example(d_with("POSがあるのは 11店だけ"))
+    unrelated = check_docstring_count_example(d_with("レジが3店ある"))
+    return (same == [] and gap_same == [] and unrelated == [] and len(diff) == 1 and diff[0].startswith("[ERROR] [例示値の実数] screen_layout.items[IT65]")
+            and "10" in diff[0] and "11" in diff[0] and "差し戻し先 S1" in diff[0] and "queries_pos.py:154" in diff[0]
+            and check_docstring_count_example({"main": {}}) == [])
+
+
+def check_jsx_text_gap(d) -> list:
+    """実行時の値を含む文言(JSX の {式} とその前後の地の文)の例示値・初期値で、地の文と値の間の空白が、JSX の変換規則の字面と
+    食い違うものを指摘する(ERROR・差し戻し先 S1)。字面は下書き(react_draft)の jsx_text_joins({before, after, gap_before, gap_after})。
+    例示値・初期値に「<before の末尾の語>(空白)<値>」の形があり、空白の有無が gap_before と違えば食い違い。after 側も同じ。
+    WHY(run15 の差5): JSX は改行を挟んだ {式} の前後に空白を入れない(「POSがあるのは(改行){shops.length}店」は画面で「POSがあるのは10店」)のに、
+    例示値は「POSがあるのは 10店」と空白を足した。固定文言の Label には合成が JSX から字面を付け直しているが、実行時の値を含む文言には当たっていない。
+    対象は screen_layout.items[].example と initialization.items[].initial_value。語が3字未満の前後は手掛かりにならないので見ない。
+    呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    rd, main = d.get("react_draft"), d.get("main")
+    if not rd or not main:
+        return []
+    out = []
+    for jx in rd.get("jsx_text_joins") or []:
+        tail = str(jx.get("before") or "").rstrip()[-6:]
+        head = str(jx.get("after") or "").lstrip()[:6]
+        pats = []
+        if len(tail) >= 3:
+            pats.append(("前", re.compile(re.escape(tail) + r"(\s*)\S"), bool(jx.get("gap_before"))))
+        if len(head) >= 3:
+            pats.append(("後", re.compile(r"\S(\s*)" + re.escape(head)), bool(jx.get("gap_after"))))
+        for where, kind, text in _item_texts(main):
+            for side, rx, gap in pats:
+                for m in rx.finditer(text):
+                    if bool(m.group(1)) == gap:
+                        continue
+                    seen = "空白が入る" if m.group(1) else "空白が入らない"
+                    want = "空白が入る" if gap else "空白が入らない"
+                    s = (jx.get("src") or [{}])[0]
+                    out.append(_error(
+                        "JSXの空白", f"{where} {kind}",
+                        f"{{{jx.get('expr')}}} の{side}の空白: {kind}「…{text[m.start():m.end() + 4]}…」は{seen}が、JSX の規則("
+                        f"{Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})では{want}"
+                        f"(改行の前後の空白は画面に出ない)。字面を JSX に合わせる → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_jsx_text_gap() -> bool:
+    """check_jsx_text_gap の正例・負例。合成 d で、JSX が空白を入れない式の前後に空白があれば ERROR、無ければ指摘なし。
+    同じ行の空白を JSX が残す式(gap_before が真)では、空白が無い例示値を指摘する。WHY: 誤検出を実データの前に合成で確かめる。呼出元: selftest。"""
+    src = [{"file": "/x/PosReport.tsx", "line_start": 337, "line_end": 338}]
+    tight = {"expr": "shops.length", "before": "全店舗を出すが、POSがあるのは", "after": "店だけなのでその店だけを出している。",
+             "gap_before": False, "gap_after": False, "src": src}
+    loose = {"expr": "n", "before": "ありました ", "after": " 件です", "gap_before": True, "gap_after": True, "src": src}
+
+    def d_with(example, initial="", joins=(tight, loose)):
+        return {"main": {"screen_layout": {"items": [{"no": "IT65", "item_name": "注記3", "example": example}]},
+                         "initialization": {"items": [{"no": "65", "item_name": "注記3", "initial_value": initial}]}},
+                "react_draft": {"jsx_text_joins": list(joins)}}
+    good = check_jsx_text_gap(d_with("全店舗を出すが、POSがあるのは11店だけなのでその店だけを出している。"))
+    bad = check_jsx_text_gap(d_with("全店舗を出すが、POSがあるのは 10店だけなのでその店だけを出している。"))
+    both = check_jsx_text_gap(d_with("全店舗を出すが、POSがあるのは 10店だけなので", "全店舗を出すが、POSがあるのは 0店だけなので"))
+    # 地の文と値が同じ行にあり、JSX が空白を残す式: 空白が無い例示値は食い違い
+    keep_bad = check_jsx_text_gap(d_with("ありました3 件です", joins=(loose,)))
+    keep_ok = check_jsx_text_gap(d_with("ありました 3 件です", joins=(loose,)))
+    # 前後の語が3字未満・例示値に前の語が無いときは何も言わない
+    short = dict(tight, before="は", after="店")
+    nothing = check_jsx_text_gap(d_with("POSがあるのは 10店だけ", joins=(short,))) == [] and check_jsx_text_gap(d_with("関係の無い文", joins=(tight,))) == []
+    return (good == [] and len(bad) == 1 and bad[0].startswith("[ERROR] [JSXの空白] screen_layout.items[IT65]") and "差し戻し先 S1" in bad[0]
+            and len(both) == 2 and "initialization.items[65]" in both[1] and len(keep_bad) >= 1 and keep_ok == [] and nothing
+            and check_jsx_text_gap({"main": {}}) == [])
+
+
 # 検査の本体(check(d) -> list[str])。後で1検査ずつ足す
 CHECKS: list = [check_mapping_target, check_mapping_missing, check_transform_zero_fill, check_response_display_name,
-                check_csv_column_name]
+                check_csv_column_name, check_common_logic_dropped, check_docstring_count_example, check_jsx_text_gap]
 # 検査の自己テスト(引数なし・bool を返す)
 SELFTESTS: list = [_selftest_mapping_target, _selftest_mapping_missing, _selftest_transform_zero_fill,
-                   _selftest_response_display_name, _selftest_csv_column_name]
+                   _selftest_response_display_name, _selftest_csv_column_name, _selftest_common_logic_dropped,
+                   _selftest_docstring_count_example, _selftest_jsx_text_gap]
 
 
 def run(inter_dir, feature) -> list:

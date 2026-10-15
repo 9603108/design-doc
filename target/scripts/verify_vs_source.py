@@ -208,9 +208,91 @@ def _wholly_runtime(src):
     return False
 
 
+# WHY(2026-10-15 run15 差7): 画面の文面が「"A" + " — B"」「(x ?? "A") + " — B"」のように文字列の + 連結で組まれていると、
+#   リテラルを1つずつ集めただけでは連結後の全文(画面に出る文面)がどの文字列にも当たらず、正しい文言を「ソースに無い」と誤検出した。
+#   連結(+)でつながるリテラル・テンプレートは、つないだ全文でも持つ。間に挟まる変数(" + res.status + ")は穴として扱う。
+#   取りすぎる方(取りこぼしでなく余分に持つ)は見逃しにしか働かず、作り話の誤検出は増やさない(上の【意味合い】のとおり)
+_CONCAT_GAP = re.compile(r"^[\s)]*\+\s*(?:([^\s+;,{}\"'`]+)\s*\+\s*)?[\s(]*$")
+_CONCAT_GAP_MAX = 80
+
+
+def _unescape_quoted(s):
+    """引用符の文字列の \\" \\' \\\\ \\n などを実際の字にする。呼出元: _concat_strings。"""
+    return re.sub(r"\\(.)", lambda m: {"n": " ", "t": " "}.get(m.group(1), m.group(1)), s)
+
+
+def _concat_strings(text):
+    """TSX/TS の文字列リテラル・テンプレートが + でつながる並びを、つないだ全文として返す(穴の無いものは norm 済みの str、
+    間に式・${…} を挟むものは _Pat)。呼出元: collect_source_strings。
+    つながりの判定: 直前のリテラルの終わりと次のリテラルの始まりの間が「閉じ括弧・空白 + (式 +)? 空白・開き括弧」だけであること。"""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            end = _skip_quoted(text, i)
+            if end - 1 > i and text[end - 1] == c:
+                toks.append((i, end, [_unescape_quoted(text[i + 1:end - 1])]))
+                i = end
+            else:
+                i += 1  # 閉じない引用符(JSX の文言の撇号・コメント)は文字列ではない
+        elif c == "`":
+            body, end = _read_template(text, i)
+            toks.append((i, end, _split(body, True)))
+            i = end
+        else:
+            i += 1
+    chains, cur, prev_end = [], [], None
+    for s, e, parts in toks:
+        gap = _CONCAT_GAP.match(text[prev_end:s]) if prev_end is not None and s - prev_end <= _CONCAT_GAP_MAX else None
+        if gap is not None and cur:
+            if gap.group(1):
+                cur.append(None)  # 間の式は穴
+            cur.append(parts)
+        else:
+            if len(cur) > 1:
+                chains.append(cur)
+            cur = [parts]
+        prev_end = e
+    if len(cur) > 1:
+        chains.append(cur)
+    out = []
+    for chain in chains:
+        merged, hole_pending = [""], False
+        for piece in chain:
+            if piece is None:
+                hole_pending = True
+                continue
+            if hole_pending:
+                merged.append("")
+                hole_pending = False
+            merged[-1] += piece[0]
+            for p in piece[1:]:  # テンプレートの ${…} は穴
+                merged.append(p)
+        if len(merged) == 1:
+            out.append(norm(merged[0]))
+        else:
+            pat = _make_pat("{_}".join(merged), merged)
+            if pat is not None:
+                out.append(pat)
+    return out
+
+
+def _py_fold_concat(node):
+    """Python の「"A" + "B"」(BinOp の Add)を1つの文字列にする。文字列でない項があれば None。呼出元: collect_source_strings。
+    WHY: ast の Constant は + でつながった全文を持たないため(TSX の _concat_strings と同じ事情)。f-string の穴は {_}。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else "{_}" for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        a, b = _py_fold_concat(node.left), _py_fold_concat(node.right)
+        return None if a is None or b is None else a + b
+    return None
+
+
 def collect_source_strings(files):
     """files(Path の列)の文字列を正規化して返す(set)。読めない・構文が壊れたファイルは飛ばす。
-    Python は ast の Constant(str)と JoinedStr の定数部、TSX/TS は引用符・テンプレートの定数部・JSX の文言。"""
+    Python は ast の Constant(str)と JoinedStr の定数部と + の連結、TSX/TS は引用符・テンプレートの定数部・JSX の文言と + の連結。"""
     out = set()
     for f in files:
         try:
@@ -225,6 +307,10 @@ def collect_source_strings(files):
                     elif isinstance(n, ast.JoinedStr):
                         # f-string は穴を {_} にした型文も入れる(呼出の実引数で展開した文言が、この型文に当てはまるかを _in_source が見る)
                         out.add(norm("".join(v.value if isinstance(v, ast.Constant) else "{_}" for v in n.values)))
+                    elif isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+                        folded = _py_fold_concat(n)
+                        if folded is not None:
+                            out.add(norm(folded))
             except SyntaxError:
                 continue
         else:
@@ -239,6 +325,8 @@ def collect_source_strings(files):
             out.update(norm(m.group(1)) for m in _JSX_TEXT.finditer(_jsx_faithful(text)))
             # WHY: テンプレートと式の並びは、字面を穴で割った断片に加えて、穴を任意の値とみなす正規表現(_Pat)としても持つ
             out.update(_patterns(_INLINE_TAG.sub("", text)))
+            # WHY(run15 差7): + で連結した文字列の全文も持つ(画面に出る文面は連結後)。タグを外す前の素の本文から取る(引用符の位置が変わらないように)
+            out.update(_concat_strings(text))
     out.discard("")
     return out
 
@@ -1438,6 +1526,24 @@ def selftest():
         assert _example_in_source("取込欠損の疑い：この期間に、上書きされた疑いのある日があります。", ss), ss
         assert _example_in_source("POSがあるのは10店だけなので", ss), ss
         assert not _example_in_source("作り話の文は10店だけなので", ss)
+    # run15 差7: + で連結した文字列は、つないだ全文でも照合する(api.ts の「(x ?? "A") + " — B"」と、間に変数を挟む連結)
+    with tempfile.TemporaryDirectory() as d:
+        cts, cpy = Path(d, "api.ts"), Path(d, "m.py")
+        # fallback-ok: 下の ?? は検査の入力にするソース(TSX)の字面で、このスクリプトの既定値への切り替えではない
+        cts.write_text('throw new Error((body?.error?.message ?? "ログインの有効期限が切れています") + " — 画面を再読込してください");\n'
+                       'throw new Error("取得に失敗しました（HTTP " + res.status + "）。もう一度操作してください");\n'
+                       'const t = `${a}件` + "の" + "合計";\n'
+                       'const x = "別の文" , y = "離れた文";\n', encoding="utf-8")
+        cpy.write_text('raise ValueError("開始日は" + "必須です")\n', encoding="utf-8")
+        cs = collect_source_strings([cts, cpy])
+        cat = {"messages": [{"message_id": "MSE00006", "message": "ログインの有効期限が切れています — 画面を再読込してください"},
+                            {"message_id": "MSE00005", "message": "取得に失敗しました（HTTP {status}）。もう一度操作してください"},
+                            {"message_id": "MSE00009", "message": "開始日は必須です"}]}
+        assert check_messages(cat, cs) == [], check_messages(cat, cs)
+        # 連結でない並び(カンマ・離れた文)は全文にしない。連結後に無い文言は従来どおり WARN
+        cat_bad = {"messages": [{"message_id": "M1", "message": "別の文離れた文"},
+                                {"message_id": "M2", "message": "ログインの有効期限が切れています — 作り話を足した"}]}
+        assert len(check_messages(cat_bad, cs)) == 2, check_messages(cat_bad, cs)
     # B15 a: DB 名(物理列の空・句の物理名・結合の別名・論理表の(推定)・「と」の論理名)
     apis_db = {"act": {"db_operations": [{"columns": [{"alias_name": "first_date", "source_columns": ["pos.kai_date"]},
                                                      {"alias_name": "shop_name", "source_columns": ["shops.name", "pos.mise_no"]}]}]}}

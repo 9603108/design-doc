@@ -27,6 +27,8 @@ Phase 1 の backend 節は LLM の読解で列・キー・エラーを書いて�
         論理名の候補には project_root 配下の *.sql(DDL)と source_files の .tsx/.jsx(定数配列)・.ts/.tsx(型)を読む
   出力: --out <JSON>。キーは { apis: {action: {dataset, response_items, error_patterns, joins, where, group_by, order_by, aliases, db_operations}}, unresolved, auth }
   auth は入口が表を引く前に呼ぶ認証(identify 等)と、その 401/403 の文面。error_patterns の id は MSE + 5 桁の機械採番
+  logic_candidates[] は SQL に入る定数(used_by=使う API の action、comment=定数に付けた # コメント)。docstring_counts[] は docstring・コメントの実数
+  {lead, count, unit, text, kind, where, src}(「POSがあるのは11店」。中間 JSON の例示値との照合用)
   終了コード: 0=未解決なし / 1=unresolved が1件以上(下書きは書く) / 2=入力不正
   backend_files に無いモジュールを指す action は対象外(出力に入れず、unresolved にも出さない)
 
@@ -1192,10 +1194,41 @@ def _errors(fn, env, mod):
 _SQLISH = re.compile(r"\b(AND|OR|IS|NOT|NULL|CASE|WHEN|SUM|COUNT|MIN|MAX|BETWEEN)\b|[=<>]|\w\.\w", re.IGNORECASE)
 
 
-def _logic_candidates(mods):
+def _comment_for(path, line, text):
+    """定数(path の line 行目から始まる代入。text はその中身の文字列)に付けた # コメントの文を返す。無ければ空文字。
+    直上に連続する # の行があればそれ全部。無ければ、10 行上までの # の行のうち、定数の語(辞書のキー・列名など英字 4 字以上)に触れる行だけ。
+    WHY(run15 の差4): common_logic が backend の候補を拾ったかを、verify_vs_source の _vs_map.check_common_logic_dropped が
+    「候補のコメントの語が common_logic の文に出るか」で照合する。common_logic の src は空のことがあり(run11・run12)、
+    行の重なりだけでは照合できない。コメントは業務の語で書かれるので、日本語の共通語でつなぐ。
+    ponytail: 定数の直上でなく、別の定数を挟んで離れたコメント(_GROUPS の上の「集計単位…」)は、定数の語に触れる行だけを取る。
+    語を含まない離れたコメントは取らない。呼出元: _logic_candidates。"""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+    def of(i):  # lines[i] が # の行ならその文(# と前後の空白を除く)。違えば None
+        s = lines[i].strip()
+        return s.lstrip("#").strip() if s.startswith("#") else None
+
+    i, block = line - 2, []
+    while i >= 0 and of(i) is not None:
+        block.append(of(i))
+        i -= 1
+    if block:
+        return " ".join(x for x in reversed(block) if x)
+    toks = set(re.findall(r"[A-Za-z_]{4,}", text))
+    near = [of(j) for j in range(max(0, line - 11), line - 1)]
+    return " ".join(c for c in near if c and any(re.search(r"\b" + re.escape(t) + r"\b", c) for t in toks))
+
+
+def _logic_candidates(mods, uses=None):
     """SQL に埋め込まれるモジュール定数(条件・列の並び・グループ表など)を共通ロジックの候補として返す(F4)。
     意味合い: 業務の規則(例: 取込欠損の条件)が SQL の中にあることを、S1 が runs_on(動作場所)を決める手掛かりとして見えるようにする。
-    呼出元: extract(下書きの最上位 logic_candidates)。{name, kind(sql_condition=文字列 / sql_fragment=列・辞書), text, runs_on, src}。
+    呼出元: extract(下書きの最上位 logic_candidates)。{name, kind(sql_condition=文字列 / sql_fragment=列・辞書), text, runs_on, src, used_by, comment}。
+    used_by: その定数を関数の中で使う API の action(uses = {(ファイル, 名前): [action…]}。extract が API の辿った関数から集める)。
+    WHY: 下書きには backend_files の全定数が入り、他の画面の API だけが使う定数も混ざる。画面ごとの「落としてはならない候補」を
+    verify_vs_source._vs_map.check_common_logic_dropped が選ぶ手掛かりにする。comment: 定数に付けた # コメント(_comment_for。common_logic との照合の語)。
     ponytail: 「関数の中で名前が使われる定数で、中身が SQL らしい(AND・IS・= ・t.col など)」ものを拾う。実際に SQL へ入ったかは見ない。"""
     out = []
     for mod in mods:
@@ -1210,7 +1243,52 @@ def _logic_candidates(mods):
             text = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=lambda o: sorted(o, key=str) if isinstance(o, (set, frozenset)) else str(o)) if isinstance(val, (list, dict)) else ""
             if text and _SQLISH.search(text):
                 out.append({"name": name, "kind": "sql_condition" if isinstance(val, str) else "sql_fragment", "text": text,
-                            "runs_on": "データベース", "src": [_src(mod, n)]})
+                            "runs_on": "データベース", "src": [_src(mod, n)],
+                            "used_by": list((uses or {}).get((str(mod.path), name), [])),
+                            "comment": _comment_for(mod.path, n.lineno, text)})
+    return out
+
+
+# 数 + 数える単位(店・レジ・台・件…)。docstring・コメントの「実際にPOSがあるのは11店」のような実数を拾う
+_COUNT_UNITS = "店舗|店|レジ|台|件|日|行|人|か月|ヶ月|種類|枚|個|項目|列"
+_COUNT_RE = re.compile(r"(?<![0-9０-９.:/\-])([0-9０-９]+)(" + _COUNT_UNITS + r")")
+
+
+def _docstring_counts(mods):
+    """docstring と # コメントに書かれた実数(「POSがあるのは11店」など)を {lead, count, unit, text, kind, where, src} で返す(差5)。
+    lead は数の直前の語(読点・句点・括弧までの 12 字以内。空白を除く)。lead が 3 字未満のものは照合の手掛かりにならないので出さない。
+    WHY: S1 の手順書は「実行時の値を含む文言の例示値は、ソースのコメントに実数があればそれを使う」と決めている。数は下書きに事実として
+    持たせ、中間 JSON の例示値(IT の example)と食い違えば verify_vs_source._vs_map.check_docstring_count_example が S1 へ差し戻す。
+    where は docstring なら囲む関数・クラス・モジュールの名前、コメントなら \"(コメント)\"。src は数の行(1始まり)。
+    呼出元: extract(下書きの最上位 docstring_counts)。ponytail: 単位は _COUNT_UNITS の固定の表。表に無い単位(社・軒など)は拾わない。"""
+    out, seen = [], set()
+
+    def scan(kind, where, text, line0, mod):
+        for m in _COUNT_RE.finditer(text):
+            head = re.sub(r"\s+", "", text[max(0, m.start() - 30):m.start()])
+            lead = re.split(r"[、。．，,（）()「」：:;；]", head)[-1][-12:]
+            if len(lead) < 3:
+                continue
+            count, unit = int(m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789"))), m.group(2)
+            if (lead, count, unit) in seen:
+                continue
+            seen.add((lead, count, unit))
+            ln = line0 + text[:m.start()].count("\n")
+            out.append({"lead": lead, "count": count, "unit": unit, "text": f"{lead}{m.group(1)}{unit}", "kind": kind, "where": where,
+                        "src": [{"file": str(mod.path), "line_start": ln, "line_end": ln}]})
+
+    for mod in mods:
+        for n in ast.walk(mod.tree):
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body \
+                    and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant) and isinstance(n.body[0].value.value, str):
+                v = n.body[0].value
+                scan("docstring", getattr(n, "name", "(module)"), v.value, v.lineno, mod)
+        try:
+            for tok in tokenize.generate_tokens(io.StringIO(mod.path.read_text(encoding="utf-8")).readline):
+                if tok.type == tokenize.COMMENT:
+                    scan("comment", "(コメント)", tok.string.lstrip("#"), tok.start[0], mod)
+        except (OSError, tokenize.TokenError, UnicodeDecodeError):
+            continue
     return out
 
 
@@ -1234,6 +1312,8 @@ def extract(files, hints=None):
                     csv.setdefault(k, v)
     hints = {**hints, "csv": csv, "doc": _doc_hints(files)}
     apis, unresolved, tables = {}, [], set()
+    # (ファイル, 名前) → その名前を関数の中で使う API の action。logic_candidates の used_by になる(画面ごとの共通ロジックの候補の絞り込みに使う)
+    uses = {}
     for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
         for n in mod.tree.body:
             if not (isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and n.value.keys):
@@ -1256,6 +1336,9 @@ def extract(files, hints=None):
                 clauses = {k: [] for k in _CLAUSE_KEYS}
                 clo = _closure(tm, fn, mods)
                 for m2, f2 in clo:
+                    for x in ast.walk(f2):
+                        if isinstance(x, ast.Name) and action not in uses.setdefault((str(m2.path), x.id), []):
+                            uses[(str(m2.path), x.id)].append(action)
                     lists = _local_lists(f2, m2.env())  # 条件付きの append は断片ごとの when を持つ(B1)
                     cond_map = _cond_map(lists)
                     scens = _scenarios(f2, {**m2.env(), **{k: [t for t, _ in v] for k, v in lists.items()}})
@@ -1327,7 +1410,9 @@ def extract(files, hints=None):
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
         e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
-    return {"apis": apis, "unresolved": unresolved, "auth": auth, "logic_candidates": _logic_candidates([x for x in mods.values() if x is not None]),
+    return {"apis": apis, "unresolved": unresolved, "auth": auth, "logic_candidates": _logic_candidates([x for x in mods.values() if x is not None], uses),
+            # 差5: docstring・コメントの実数(「POSがあるのは11店」など)。中間 JSON の例示値との食い違いを verify_vs_source が見る
+            "docstring_counts": _docstring_counts([x for x in mods.values() if x is not None]),
             "common_errors": _error_origins(_common_errors([x for x in mods.values() if x is not None], tables)),
             # P17: 列名ごとの「語(列名)」の対。論理名の候補とは別の材料として持つ
             "docstring_terms": _docstring_terms([x for x in mods.values() if x is not None])}
@@ -1340,9 +1425,10 @@ def selftest():
          'def _entry(p):\n    identify(p)\n    return A[p]\n')
     qs = (
         'from common import _req\n'  # backend_files に無い同じフォルダの補助モジュールの raise も拾う
-        'COLS = ["a", "b"]\nCOND = "t.b IS NULL"\n'
+        'COLS = ["a", "b"]\n# 欠けた行の条件\nCOND = "t.b IS NULL"\n'
         'def _sel():\n    return ", ".join(f"SUM(t.{c}) AS {c}" for c in COLS)\n'
         'def get_x(p):\n'
+        '    """店舗数: 実際にPOSがあるのは11店（うち稼働10店）だけ"""\n'
         '    if not p:\n        raise ValidationError("必須です")\n'
         '    _req(p)\n'
         '    w = ["t.a = %(a)s"]\n    w.append(COND)\n    shop = p.get("shop")\n    if shop:\n        w.append("t.c = %(shop)s")\n'  # CTE の中で組む WHERE も where に出す(局所の並び・モジュール定数を展開)
@@ -1387,6 +1473,19 @@ def selftest():
     assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
     # F4: SQL に入る定数(COND)は共通ロジックの候補。中身が SQL らしくない定数(COLS)は出さない
     assert [(c["name"], c["kind"], c["text"], c["runs_on"]) for c in r["logic_candidates"]] == [("COND", "sql_condition", "t.b IS NULL", "データベース")], r["logic_candidates"]
+    # 差4: 候補は、使う API の action(used_by)と、直上の # コメントを持つ。使う API が無い定数は used_by が空
+    lc0 = r["logic_candidates"][0]
+    assert lc0["used_by"] == ["get_x"] and lc0["comment"] == "欠けた行の条件", lc0
+    # 差4: 直上にコメントが無い定数は、10 行上までの # のうち定数の語(辞書のキー)に触れる行だけを取る。語に触れない行は取らない
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "c.py").write_text("# 集計単位。register は店ごと\n# shop は合算\n# 別の説明\nX = 1\n\nG = {\"register\": 1, \"shop\": 2}\n", encoding="utf-8")
+        assert _comment_for(Path(d) / "c.py", 6, '{"register": 1, "shop": 2}') == "集計単位。register は店ごと shop は合算", "離れたコメントは語に触れる行だけ"
+        assert _comment_for(Path(d) / "c.py", 4, "1") == "集計単位。register は店ごと shop は合算 別の説明", "直上の連続コメントは全部"
+    # 差5: docstring の実数は lead(数の直前の語)・count・unit で拾う。括弧の後の数(うち稼働10店)も別に拾う。数の無い語は出さない
+    dcs = {(c["lead"], c["count"], c["unit"], c["kind"], c["where"]) for c in r["docstring_counts"]}
+    assert ("実際にPOSがあるのは", 11, "店", "docstring", "get_x") in dcs and ("うち稼働", 10, "店", "docstring", "get_x") in dcs, dcs
+    dline = [c["src"][0]["line_start"] for c in r["docstring_counts"] if c["count"] == 11]
+    assert dline == [next(i for i, t in enumerate(qs.split("\n"), 1) if "実際にPOS" in t)], dline
     # B3 SQL の型: DDL の型と NOT NULL、::型・NULL::型・COUNT の手掛かり、取れない式(無印の SUM)は None
     dt = hints["ddl_types"]
     assert dt["real_tbl"]["id"] == ("integer", False) and dt["real_tbl"]["b"] == ("integer", False), dt

@@ -389,11 +389,31 @@ _CLICK_WORDS = ("クリック", "押下")
 _TYPE_VERB = {"checkbox": ("チェック", "チェックボックス"), "radio": ("選択",)}
 
 
+def _trigger_verdict(typ, want, text):
+    """trigger の文 text が、要素の種類 typ の型で書かれているかを見る。外れていれば理由の文、合っていれば None。
+    型: checkbox は「{項目名}をチェック、または未チェック。」(手順書 02_イベント一覧.md の change(チェックボックス) の行)。
+    radio は「選択」を含む。それ以外の onChange だけの要素は「クリック」「押下」を含まない。
+    WHY: action の語だけ直っても、trigger の文が「…をチェックする。」のままだと、外す操作でも走ることが読めない(run15 の EV7・TR6)。呼出元: check_event_verb。"""
+    if not text:
+        return None
+    if typ == "checkbox":
+        if "チェック、または未チェック" not in text:
+            return f"checkbox の onChange なのに trigger が「{text}」(型は「{{項目名}}をチェック、または未チェック。」)"
+    elif want:
+        if not any(w in text for w in want):
+            return f"{typ} の onChange なのに trigger が「{text}」(型の語は「{want[0]}」)"
+    elif any(w in text for w in _CLICK_WORDS):
+        return f"onChange だけの要素なのに trigger が「{text}」(型の語は「変更」「選択」など)"
+    return None
+
+
 def check_event_verb(d) -> list[str]:
     """main の events[] を、src が重なる react_draft の jsx_elements(要素の種類 type・tag と、イベント属性 on)と照らし、
-    アクション語が要素の種類と食い違う行を指摘する。同じ location の trigger_groups の trigger も同じ語なので、EV と TR を1行にまとめる。
+    アクション語と trigger の文が要素の種類と食い違う行を指摘する。同じ location の trigger_groups の trigger(action と description)も同じ語なので、EV と TR を1行にまとめる。
     食い違い: (1) checkbox・radio が手順書の型の語(チェック・選択)で無い。(2) onChange だけの要素(select・input)が「クリック」「押下」。
-    WHY: 要素の種類と属性は画面ソースで決まる事実で、アクション語はその型の語で書く約束のため。onClick を持つ要素(button・label 等)は対象外。
+    (3) trigger の文が型どおりでない(checkbox は「{項目名}をチェック、または未チェック。」。_trigger_verdict)。(1)(2) は action、(3) は trigger の文を見る。
+    WHY: 要素の種類と属性は画面ソースで決まる事実で、アクション語と trigger の文はその型で書く約束のため。onClick を持つ要素(button・label 等)は対象外。
+    action が「チェック」に直っても trigger の文が「…をチェックする。」のままだった run15 の見逃しを、trigger の文も見て止める。
     呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] の events・trigger_groups と d["react_draft"] の jsx_elements。"""
     main = d.get("main")
     rd = d.get("react_draft")
@@ -405,12 +425,14 @@ def check_event_verb(d) -> list[str]:
         act = ev.get("action") or ""
         spans = _src_list(ev.get("src"))
         verdict = None
+        found = None
         for j, js in jsx:
             if not any(_overlap(a, b) for a in spans for b in js):
                 continue
             ons = j.get("on") or []
             if "onClick" in ons or "onChange" not in ons:
                 continue
+            found = found or j
             typ = (j.get("type") or "").lower()
             want = _TYPE_VERB.get(typ)
             if want and not any(w in act for w in want):
@@ -419,16 +441,23 @@ def check_event_verb(d) -> list[str]:
                 verdict = f"{j.get('tag') or typ} の onChange だけの要素なのにアクション語が「{act}」(型の語は「変更」「選択」など)"
             if verdict:
                 break
-        if not verdict:
+        if not found:
             continue
         loc = ev.get("location")
         trs = []
         for g in main.get("trigger_groups", []):
             for t in g.get("triggers", []):
                 if loc and t.get("location") == loc and (t.get("action") or "") == act:
-                    trs.append(t.get("trigger_no") or "")
-        where = "/".join([ev.get("no") or ""] + [t for t in trs if t])
-        out.append(_vs_common.warn("イベントの語", where, verdict))
+                    trs.append((t.get("trigger_no") or "", t.get("description") or ""))
+        if verdict:
+            where = "/".join([ev.get("no") or ""] + [n for n, _ in trs if n])
+            out.append(_vs_common.warn("イベントの語", where, f"{verdict} → 差し戻し先 H1"))
+        # WHY: trigger の文は EV の trigger と TR の description の2か所にある。型を外した側だけを where に出す(1行にまとめる)
+        typ = (found.get("type") or "").lower()
+        checks = [(ev.get("no") or "", ev.get("trigger") or "")] + trs
+        bad = [(n, v) for n, v in ((n, _trigger_verdict(typ, _TYPE_VERB.get(typ), text)) for n, text in checks) if v]
+        if bad:
+            out.append(_vs_common.warn("イベントの語", "/".join(n for n, _ in bad if n), f"{bad[0][1]} → 差し戻し先 H1"))
     return out
 
 
@@ -442,10 +471,25 @@ def selftest_event_verb() -> bool:
             "react_draft": {"jsx_elements": [{"id": "JX1", "tag": "input", "type": typ, "on": on, "src": src}]},
         }
     hit = check_event_verb(make("クリック", "checkbox", ["onChange"]))
+
+    def with_trigger(typ: str, action: str, text: str) -> list:
+        """trigger の文(EV の trigger と TR の description)を text にして、同じ d で見る。"""
+        d = make(action, typ, ["onChange"])
+        d["main"]["events"][0]["trigger"] = text
+        d["main"]["trigger_groups"][0]["triggers"][0]["description"] = text
+        return check_event_verb(d)
+    # WHY(run15 の EV7・TR6): action が「チェック」でも、trigger の文が「…をチェックする。」のままなら型(チェック、または未チェック。)を外れている。
+    #      EV と TR は1行にまとまり、型どおりなら0件。radio は「選択」、onChange だけの text の trigger に「クリック」は当たり
+    trig = with_trigger("checkbox", "チェック", "POS会計レポート画面の検索条件エリアの空欄項目も表示をチェックする。")
+    trig_ok = with_trigger("checkbox", "チェック", "POS会計レポート画面の検索条件エリアの空欄項目も表示をチェック、または未チェック。")
     return (len(hit) == 1 and "TR1" in hit[0]
             and check_event_verb(make("チェック", "checkbox", ["onChange"])) == []
             and check_event_verb(make("クリック", "button", ["onClick"])) == []
-            and len(check_event_verb(make("クリック", "text", ["onChange"]))) == 1)
+            and len(check_event_verb(make("クリック", "text", ["onChange"]))) == 1
+            and len(trig) == 1 and "EV1/TR1" in trig[0] and trig[0].endswith("→ 差し戻し先 H1") and trig_ok == []
+            and len(with_trigger("radio", "選択", "画面のAの項目をクリックする。")) == 1
+            and with_trigger("radio", "選択", "画面のAの項目を選択する。") == []
+            and len(with_trigger("text", "変更", "画面のAの項目をクリックする。")) == 1)
 
 
 CHECKS.append(check_event_verb)
@@ -491,13 +535,88 @@ def _in_event_handler(lines, line_no):
     return False
 
 
+# 画面のコンポーネント関数の定義行(先頭の桁にある function Card( か const Card = )。呼出元: _enclosing_component
+_TOP_COMPONENT_RE = re.compile(r"(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Z][\w$]*)|(?:export\s+)?const\s+([A-Z][\w$]*)\s*=")
+# 先頭の桁で始まる宣言(コンポーネントでないもの)。ここを越えて上へ探さない。呼出元: _enclosing_component
+_TOP_DECL_RE = re.compile(r"(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|let|class|type|interface)\b")
+
+
+def _enclosing_component(lines, line_no):
+    """line_no(1始まり)の行を囲むコンポーネント関数(先頭の桁の function Card( か const Card =)の名前を返す。囲まれていなければ None。
+    WHY: CL の関数が Card の描画の中で呼ばれるとき、Card に渡す値(rows から作る agg)が変われば、その呼出も走り直す。
+    その「呼出を囲むコンポーネント」を、呼出行から上へ先頭の桁の宣言を探して決める。
+    コンポーネントでない宣言(function toAgg など)に先に当たったとき・関数を閉じる行(}・};)に当たったときは、囲まれていないとして None を返す
+    (越えて探すと、無関係なコンポーネントに結んでしまう)。引数の型の続き(}: { や }) {)は宣言の途中なので越える。呼出元: check_cl_rerender。"""
+    for k in range(min(line_no, len(lines)) - 2, -1, -1):
+        ln = lines[k]
+        if not ln.strip() or ln[:1].isspace():
+            continue
+        m = _TOP_COMPONENT_RE.match(ln)
+        if m:
+            return m.group(1) or m.group(2)
+        if _TOP_DECL_RE.match(ln) or ln.rstrip() in ("}", "};", ")", ");"):
+            return None
+    return None
+
+
+def _word_rx(names):
+    """names のどれかを、別の語の一部(d.rows の rows・setRows の rows)に当たらない形で探す正規表現。names が空なら何にも当たらない。"""
+    if not names:
+        return re.compile(r"(?!)")
+    return re.compile(r"(?<![\w$.])(?:" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")(?![\w$])")
+
+
+def _derived_names(lines, seeds) -> set:
+    """seeds(state 名)から、const X = ... の右辺に seeds か派生済みの名前が出る X を、増えなくなるまで足して返す(rows → aggs → total など)。
+    WHY: 描画で使う値(Card に渡す agg)は state そのものでなく、state から useMemo などで作った値なので、名前を辿って「state の変化で変わる値」を集める。
+    右辺が関数の本体の始まり(行末が {・(・=>・[)の宣言は、値でなく関数の定義なので見ない。複数行の右辺は、次の ; までの最大5行を足す。呼出元: check_cl_rerender。"""
+    names = set(seeds)
+    decls = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"\s*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=(.*)$", ln)
+        if not m or re.search(r"(?:\{|\(|=>|\[)\s*$", m.group(2)):
+            continue
+        rhs = m.group(2)
+        k = i
+        while not rhs.rstrip().endswith(";") and k + 1 < len(lines) and k - i < 5:
+            k += 1
+            rhs += " " + lines[k].strip()
+        decls.append((m.group(1), rhs))
+    changed = True
+    while changed:
+        changed = False
+        rx = _word_rx(names)
+        for x, rhs in decls:
+            if x not in names and rx.search(rhs):
+                names.add(x)
+                changed = True
+    return names
+
+
+def _fed_components(lines, names) -> set:
+    """names のどれかを渡している JSX の要素(<Card ... />)のコンポーネント名の集合。要素は、<Name の行から最初の /> までの最大15行を見る。
+    WHY: Card の描画の中の呼出は、Card に渡す値が変わると走り直すので、「どのコンポーネントが state の変化で描き直されるか」を要素の渡し方から決める。呼出元: check_cl_rerender。"""
+    rx = _word_rx(names)
+    out = set()
+    for i, ln in enumerate(lines):
+        for m in re.finditer(r"<([A-Z][\w$]*)\b", ln):
+            block = " ".join(lines[i:i + 15])
+            end = block.find("/>")
+            if rx.search(block if end < 0 else block[:end]):
+                out.add(m.group(1))
+    return out
+
+
 def check_cl_rerender(d) -> list[str]:
     """画面側(frontend)の common_logic の関数が、state の変化による再描画で走るのに、その state を変える FR が used_by_processes_ids に無いものを指摘する。
-    state を変える FR: react_draft の events の source.handler に setter(setShowDead(...) 等)があり、event の src が FR の src と重なるもの。
-    走る条件: CL の関数(CL の src の行で const/function に定義される名前)の呼出行が、その state の参照行(宣言と setter を除く)の
-    直後 8 行以内にある(フィルタ条件の state の下で関数を呼ぶ形)。ソースのテキストを読む近似なので WARN のみ。
-    WHY: 表示の切替だけの FR でも、切替で行が増えれば CL の関数が初めて走る。呼出元の列に挙げないと、CL の使われ方が仕様から抜ける。
-    呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] の common_logic・front_processes と d["react_draft"] の events・state_initials。"""
+    state を変える FR: (a) react_draft の events の source.handler に setter(setShowDead(...) 等)があり、event の src が FR の src と重なるもの。
+    (b) react_draft の failure_effects の on_success の state(取得結果 rows など)を持つ event の src が FR の src と重なるもの(取得し直して rows を置き換える FR)。
+    走る条件(どちらか): (1) CL の関数の呼出行が、その state の参照行(宣言と setter を除く)の直後 8 行以内にある(フィルタ条件の state の下で関数を呼ぶ形)。
+    (2) 呼出を囲むコンポーネント(Card の描画の中の num()・fmt())が、その state から作った値(rows → aggs → total)を渡されて描かれる。
+    または呼出行が、その state から作った値を直接使う(sumAggs(aggs))。ソースのテキストを読む近似なので WARN のみ。
+    WHY: 表示の切替だけの FR でも、切替で行が増えれば CL の関数が初めて走る。取得し直しの FR(店舗の絞り込み・集計単位の切替)も、rows が置き換わるたびに
+    Card の描画で CL の関数が行ごとに走る。呼出元の列に挙げないと、CL の使われ方が仕様から抜ける(run15: CL3・CL4 に FR3・FR6 が無かった)。
+    呼出元: run(_vs_checks_ext.run_all 経由)。読むのは d["main"] の common_logic・front_processes と d["react_draft"] の events・state_initials・failure_effects。"""
     main = d.get("main")
     rd = d.get("react_draft")
     if not main or not rd:
@@ -505,16 +624,30 @@ def check_cl_rerender(d) -> list[str]:
     inits = rd.get("state_initials", [])
     setter_of = {s.get("setter"): s.get("state") for s in inits if s.get("setter") and s.get("state")}
     decl_lines = {(sp[0], sp[1]) for s in inits for sp in _src_list(s.get("src"))}
-    # FR ごとに変える state(event の handler に setter が出るもの)
+    ev_src = {e.get("event_code"): _src_list(e.get("src")) for e in rd.get("events", [])}
+    # FR ごとに変える state(event の handler に setter が出るもの)。fetched は、そのうち取得結果の置き換え((b))で変えるもの
     fr_states = {}
+    fetched = {}
+
+    def add_states(spans, states, from_fetch):
+        for fp in main.get("front_processes", []):
+            if any(_overlap(a, b) for a in spans for b in _src_list(fp.get("src"))):
+                fr_states.setdefault(fp.get("process_id"), set()).update(states)
+                if from_fetch:
+                    fetched.setdefault(fp.get("process_id"), set()).update(states)
+
     for e in rd.get("events", []):
         h = (e.get("source") or {}).get("handler") or ""
         states = {st for setter, st in setter_of.items() if re.search(r"\b" + re.escape(setter) + r"\s*\(", h)}
-        if not states:
-            continue
-        for fp in main.get("front_processes", []):
-            if any(_overlap(a, b) for a in _src_list(e.get("src")) for b in _src_list(fp.get("src"))):
-                fr_states.setdefault(fp.get("process_id"), set()).update(states)
+        if states:
+            add_states(_src_list(e.get("src")), states, False)
+    # WHY: 取得し直す FR は、handler では setShopId・setGroup を呼ぶだけで、rows を置き換えるのは useCallback の依存で走る取得。
+    #      その rows は failure_effects の on_success に出るので、event の src が重なる FR の「変える state」に足す
+    declared = {s.get("state") for s in inits if s.get("state")}
+    for fe in rd.get("failure_effects", []):
+        states = {s for s in _as_list(fe.get("on_success")) if s in declared}
+        if states and ev_src.get(fe.get("event")):
+            add_states(ev_src[fe.get("event")], states, True)
     if not fr_states:
         return []
     cache = {}
@@ -538,17 +671,33 @@ def check_cl_rerender(d) -> list[str]:
         # WHY: handler(クリックで走る関数)の中の呼出は、state の変化による再描画では走らない。除く(_in_event_handler の WHY)
         calls = [i + 1 for i, ln in enumerate(lines) if re.search(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", ln) and (i + 1) != sp[1]
                  and not _in_event_handler(lines, i + 1)]
+        if not calls:
+            continue
+        derived_cache = {}
         for pid, states in sorted(fr_states.items()):
             if pid in used:
                 continue
-            for st in sorted(states):
+            # WHY: 取得結果の state を先に見る。同じ FR が group と rows の両方で当たるとき、行を置き換える rows を理由に書く
+            for st in sorted(states, key=lambda s: (s not in fetched.get(pid, set()), s)):
                 setter = next((k for k, v in setter_of.items() if v == st), "")
                 refs = [i + 1 for i, ln in enumerate(lines)
                         if re.search(r"(?<![\w$.])" + re.escape(st) + r"(?![\w$])", ln)
                         and (sp[0], i + 1) not in decl_lines
                         and not (setter and re.search(r"\b" + re.escape(setter) + r"\b", ln))]
-                if any(r <= c <= r + 8 for r in refs for c in calls):
-                    out.append(_vs_common.warn("CL呼出元の再描画", cl.get("no") or "", f"「{cl.get('name')}」の関数 {name}() は state {st} の変化による再描画でも走るが、{st} を変える {pid} が呼出元に無い"))
+                hit = any(r <= c <= r + 8 for r in refs for c in calls)
+                if not hit:
+                    if st not in derived_cache:
+                        names = _derived_names(lines, {st})
+                        # WHY: 呼出行の直接の使用には、state 自身を数えない。state 自身(宣言行 useState(todayJst()) など)は上の「参照行の直後」の見方で
+                        #      宣言と setter を除いて見ており、ここで数えると宣言の行の呼出(CL1 の todayJst())を取り違える(run15 で実測した誤検出)
+                        derived_cache[st] = (_word_rx(names - {st}), _fed_components(lines, names))
+                    rx, fed = derived_cache[st]
+                    hit = any(_enclosing_component(lines, c) in fed or rx.search(" ".join(lines[c - 1:c + 2])) for c in calls)
+                if hit:
+                    kind = "取得結果の state " if st in fetched.get(pid, set()) else "state "
+                    out.append(_vs_common.warn("CL呼出元の再描画", cl.get("no") or "", f"「{cl.get('name')}」の関数 {name}() は {kind}{st} の変化による再描画でも走るが、{st} を変える {pid} が呼出元に無い → 差し戻し先 S1"))
+                    # WHY: 同じ FR が別の state(shopId と rows など)でも当たるときは、1つの FR につき1行にする
+                    break
     return out
 
 
@@ -600,7 +749,55 @@ def selftest_cl_rerender() -> bool:
         }
         in_handler = _in_event_handler(Path(g).read_text(encoding="utf-8").splitlines(), 7)
         in_render = _in_event_handler(Path(f).read_text(encoding="utf-8").splitlines(), 4)
-        return ok and check_cl_rerender(h) == [] and in_handler and not in_render
+        # WHY(run15 の見逃しの再現): 店舗の絞り込み(FR2)は handler で setShopId を呼ぶだけで、rows を置き換えるのは useCallback の取得。
+        # CL の関数 num() は Card の描画の中で行ごとに呼ばれ、Card は rows から作った aggs を渡されて描かれる。
+        # FR2 が呼出元に無ければ「取得結果の state rows」の再描画として1件、有れば0件。Card を介さない非コンポーネント(toAgg)の呼出は数えない
+        p = os.path.join(tmp, "p.tsx")
+        Path(p).write_text(
+            "const num = (v: unknown) => Number(v);\n"
+            "function toAgg(r: Row): Agg {\n"
+            "  return { k: num(r.k) };\n"
+            "}\n"
+            "function Card({ agg }: { agg: Agg }) {\n"
+            "  const kin = num(agg.k);\n"
+            "  return <td>{kin}</td>;\n"
+            "}\n"
+            "export default function Page() {\n"
+            "  const [rows, setRows] = useState<Row[]>([]);\n"
+            "  const [shopId, setShopId] = useState(0);\n"
+            "  const aggs = useMemo(() => rows.map(toAgg), [rows]);\n"
+            "  const load = useCallback(() => {\n"
+            "    fetchRows(shopId).then((d) => setRows(d.rows));\n"
+            "  }, [shopId]);\n"
+            "  return (\n"
+            "    <main>\n"
+            "      <select onChange={(e) => setShopId(Number(e.target.value))} />\n"
+            "      {rows.map((r, i) => (\n"
+            "        <Card key={i}\n"
+            "          agg={aggs[i]}\n"
+            "        />\n"
+            "      ))}\n"
+            "    </main>\n"
+            "  );\n"
+            "}\n", encoding="utf-8")
+
+        def fetch_make(used: list) -> dict:
+            return {
+                "main": {"front_processes": [{"process_id": "FR2", "src": [{"file": p, "line_start": 18, "line_end": 18}]}],
+                         "common_logic": [{"no": "CL3", "name": "数値化", "used_by_processes_ids": used,
+                                           "src": [{"file": p, "line_start": 1, "line_end": 1}]}]},
+                "react_draft": {"state_initials": [{"state": "rows", "setter": "setRows", "src": [{"file": p, "line_start": 10, "line_end": 10}]},
+                                                   {"state": "shopId", "setter": "setShopId", "src": [{"file": p, "line_start": 11, "line_end": 11}]}],
+                                "events": [{"event_code": "EV2", "source": {"file": p, "line": 18, "handler": "(e) => setShopId(Number(e.target.value))"},
+                                            "src": [{"file": p, "line_start": 18, "line_end": 18}]}],
+                                "failure_effects": [{"event": "EV2", "call": "fetchRows", "on_success": ["rows"], "on_failure": ["error"]}]},
+            }
+        fetched = check_cl_rerender(fetch_make(["FR1"]))
+        p_lines = Path(p).read_text(encoding="utf-8").splitlines()
+        fetch_ok = (len(fetched) == 1 and "取得結果の state rows" in fetched[0] and "FR2" in fetched[0] and fetched[0].endswith("→ 差し戻し先 S1")
+                    and check_cl_rerender(fetch_make(["FR1", "FR2"])) == []
+                    and _enclosing_component(p_lines, 3) is None and _enclosing_component(p_lines, 6) == "Card")
+        return ok and check_cl_rerender(h) == [] and in_handler and not in_render and fetch_ok
 
 
 CHECKS.append(check_cl_rerender)

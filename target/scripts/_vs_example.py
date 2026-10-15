@@ -458,21 +458,61 @@ _COUNT_SHOWN = re.compile(r"(?:\$\{|\{)\s*([A-Za-z_]\w*)\.length\s*(?:\}|[+\-*/]
 _COUNT_WORDS = re.compile(r"length|件数|行数|店数|レジ数|台数|個数|の数|数を|何件|件の")
 
 
+def _is_count_map(m, resp_key) -> bool:
+    """写し m が、応答 resp_key の件数の写しか。api_field_path が resp_key・resp_key[]・resp_key.length・resp_key[].length のどれか、
+    または transform に件数の語があり根が resp_key のもの。resp_key が None のときは根を問わない。呼出元: _count_mapping_ok・check_count_mapping。"""
+    path = str(m.get("api_field_path") or "").strip()
+    shape = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\])?(?:\.length)?", path)
+    root = re.split(r"[\[.]", path)[0]
+    if shape and (resp_key is None or shape.group(1) == resp_key):
+        return True
+    return bool(_COUNT_WORDS.search(str(m.get("transform") or "")) and (resp_key is None or root == resp_key))
+
+
 def _count_mapping_ok(maps, item_name, resp_key) -> bool:
-    """item_name への写しに、応答 resp_key の件数の写しがあるか。api_field_path が resp_key・resp_key[]・resp_key.length・resp_key[].length
-    のどれか、または transform に件数の語があるもの(根は resp_key)。呼出元: check_count_mapping。
+    """item_name への写しに、応答 resp_key の件数の写しがあるか(_is_count_map)。呼出元: check_count_mapping。
     resp_key が None のとき(下書きが応答のキーを持たない古い版)は、根を問わず同じ形・語で見る。"""
-    for m in maps:
-        if m.get("screen_item_name") != item_name:
-            continue
-        path = str(m.get("api_field_path") or "").strip()
-        shape = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\])?(?:\.length)?", path)
-        root = re.split(r"[\[.]", path)[0]
-        if shape and (resp_key is None or shape.group(1) == resp_key):
-            return True
-        if _COUNT_WORDS.search(str(m.get("transform") or "")) and (resp_key is None or root == resp_key):
-            return True
-    return False
+    return any(m.get("screen_item_name") == item_name and _is_count_map(m, resp_key) for m in maps)
+
+
+# 件数の直後の字面(単位)を取る正規表現。JSX の {X.length}店だけ と テンプレートの ${X.length}${cond ? "店舗" : "レジ"}分 の
+# 「件数の式の後ろ」から、式(穴 ${…} か {…})の文字列リテラルと、その直後の日本語の語を拾う。呼出元: _shown_units
+_UNIT_HOLE = re.compile(r"^\s*\$?\{([^{}]*)\}")
+_UNIT_WORD = re.compile(r"^\s*([぀-ヿ一-鿿]+)")
+_QUOTED = re.compile(r"[\"'`]([^\"'`]*)[\"'`]")
+
+
+def _shown_units(after) -> list:
+    """画面が件数の直後に出す単位の語の候補を返す。after は件数の式(X.length})の直後の行の残り。
+    直後が日本語の語ならその語、直後が式の穴で文字列リテラルを持つなら(リテラル + 穴の直後の語)ごとに1つずつ。
+    例: `店だけ` → ["店だけ"]、`${group === "shop" ? "店舗" : "レジ"}分` → ["店舗分", "レジ分"]。読めなければ [] を返し、照合しない。
+    WHY: transform が件数の単位をどう書くかは、画面が実際に出す字面(PosReport.tsx:308 の「N店舗分」「Nレジ分」)と合わせる約束のため。呼出元: check_count_mapping。"""
+    m = _UNIT_WORD.match(after)
+    if m:
+        return [m.group(1)]
+    m = _UNIT_HOLE.match(after)
+    if not m:
+        return []
+    # WHY: 三項演算子の条件の文字列("shop" と比べる側)は画面に出ない。出るのは ? より後ろ(結果の2つ)のリテラルだけ
+    expr = m.group(1).split("?", 1)[1] if "?" in m.group(1) else m.group(1)
+    lits = [x for x in _QUOTED.findall(expr) if x]
+    tail = _UNIT_WORD.match(after[m.end():])
+    return [x + (tail.group(1) if tail else "") for x in lits]
+
+
+# transform が件数の形を書く部分「N件」「N 店」の N の直後の日本語の語。呼出元: _unit_mismatch
+_N_FORM = re.compile(r"(?<![A-Za-z])N\s*([぀-ヿ一-鿿]{1,6})")
+
+
+def _unit_mismatch(transform, units):
+    """transform の「N○○」の形の単位 ○○ が、画面の単位(units)のどれとも前方一致しないとき、その ○○ の並びを返す。合う・書いていない・units が無いときは None。
+    前方一致で見るのは、「店舗分または」のように transform の語が単位の後ろへ続いても、単位から始まっていれば合うとするため(「N件」は「店舗分」「レジ分」と合わない)。"""
+    forms = _N_FORM.findall(str(transform or ""))
+    if not forms or not units:
+        return None
+    if any(u.startswith(f) or f.startswith(u) for f in forms for u in units):
+        return None
+    return forms
 
 
 def check_count_mapping(d) -> list:
@@ -482,6 +522,8 @@ def check_count_mapping(d) -> list:
     WHY: 件数は応答の1項目でなく配列の長さなので、field_usage(rows[].xxx の使用)に載らず、[写しの漏れ] が拾えない。件数がどの応答から来るかが
     写しに無いと、設計書だけでは数の出所が分からない(run14: IT14 の「N レジ分」・IT64 の「N 店だけ」)。
     1つの式を複数の項目の src が囲むとき(Card の見出しと副題など)は、いちばん狭い範囲の項目だけを持ち主とする(囲む側を誤検出しない)。
+    写しがあるときも、件数の式の直後の字面(`{X.length}店だけ`・`${X.length}${cond ? "店舗" : "レジ"}分`)から画面の単位を取り、transform が「N件」の形で
+    別の単位を書いていれば指摘する(run15 の IT15: 画面は「N店舗分/Nレジ分」、transform は「N件」)。transform に N の形が無い・単位が読めないときは照合しない。
     Where: 呼出元は run(_vs_checks_ext.run_all 経由で verify_vs_source.main)。
     読むキー: main.screen_layout.items[].item_name・no・src、main.api_spec[].response_to_screen_mapping、react_draft.failure_effects。
     必要な JSON が d に無いときは [] を返す。"""
@@ -531,12 +573,24 @@ def check_count_mapping(d) -> list:
                 owners = list({id(it): it for w, it in cover if w == narrow}.values())
                 # WHY: 同じ範囲の項目が複数あるとき(Card の見出しと副題が同じ行範囲を持つ run11 の IT13・IT14)は、どれが件数を出すか src で決められない。
                 #      どれかに件数の写しがあれば足り、1件も無いときだけ、候補を並べて1件で指摘する(同じ式で項目の数だけ指摘して重ねない)
-                if any(_count_mapping_ok(maps, o.get("item_name"), arr_of[state]) for o in owners):
-                    continue
                 key = arr_of[state]  # None は古い下書き(応答のキー不明)
                 names = "・".join(f"「{o.get('item_name')}」" for o in owners) + ("のどれか" if len(owners) > 1 else "")
                 nos = "・".join(str(o.get("no") or o.get("item_name")) for o in owners)
                 where = f"screen_layout.items[{nos}] ({Path(f).name}:{ln})"
+                if any(_count_mapping_ok(maps, o.get("item_name"), key) for o in owners):
+                    # WHY: 件数の写しがあっても、transform が件数の単位を画面の字面と違う語(「N件」)で書くと、読み手は画面に「N件」と出ると読む
+                    #      (run15 の IT15: ソースは「N店舗分/Nレジ分」、transform は「N件」。JSX の中では合っていて、transform だけが食い違った)。
+                    #      画面の単位は件数の式の直後の字面から取り、読めない(式の直後が日本語でも式の穴でもない)ときは照合しない
+                    units = _shown_units(text[m.end():]) if m.group(0).endswith("}") else []
+                    names_set = {o.get("item_name") for o in owners}
+                    for mm in maps:
+                        forms = _unit_mismatch(mm.get("transform"), units) if mm.get("screen_item_name") in names_set and _is_count_map(mm, key) else None
+                        if forms:
+                            shown = "/".join(f"N{u}" for u in units)
+                            out.append(_vs_common.warn("件数の写し", where, f"写しの transform が件数を「N{forms[0]}」と書いているが、画面は「{shown}」と出す"
+                                                       f"({Path(f).name}:{ln})。transform の件数の表し方を画面の字面に合わせる → 差し戻し先 S2"))
+                            break
+                    continue
                 msg = (f"画面は {state}.length({'応答 ' + key if key else '応答の配列'} の件数)を表示しているが、response_to_screen_mapping に{names}への"
                        f"件数の写しが無い。api_field_path を {key or '<配列名>'}.length にし、transform に件数を何として出すかを書く → 差し戻し先 S2")
                 out.append(_vs_common.warn("件数の写し", where, msg))
@@ -609,11 +663,38 @@ def _selftest_count_mapping_tie_old() -> bool:
             and [o for o in ok if "IT14" in o] == [] and len(old_hit) == 2 and old_ok == [])
 
 
+def _count_unit_out(transform) -> list:
+    """selftest 用: run15 の PosReport.tsx:308 と同じ形の1行(${rows.length}${group === "shop" ? "店舗" : "レジ"}分)を持つ一時の TSX と、
+    その副題への件数の写し(transform を指定)に check_count_mapping を掛けた結果を返す。"""
+    with tempfile.TemporaryDirectory() as td:
+        tsx = Path(td, "U.tsx")
+        tsx.write_text("subtitle={`${applied.from} / ${rows.length}${group === \"shop\" ? \"店舗\" : \"レジ\"}分`}\n", encoding="utf-8")
+        d = {
+            "main": {"screen_layout": {"items": [{"no": "IT15", "item_name": "合計カードの副題", "src": [{"file": str(tsx), "line_start": 1, "line_end": 1}]}]},
+                     "api_spec": [{"response_to_screen_mapping": [{"api_field_path": "rows", "screen_item_name": "合計カードの副題", "transform": transform}]}]},
+            "react_draft": {"failure_effects": [{"call": "fetchRows", "on_success_from": {"rows": "rows"}}]},
+        }
+        return check_count_mapping(d)
+
+
+def _selftest_count_mapping_unit() -> bool:
+    """check_count_mapping の単位の照合(run15 の差2)。transform が「N件」なのに画面が「N店舗分/Nレジ分」なら1件(差し戻し先 S2)、
+    画面の字面どおり(「N店舗分」「Nレジ分」)・N の形を書かない transform は0件。_shown_units は直後の語・式の穴のリテラルから単位を取る。"""
+    hit = _count_unit_out("応答 rows の件数を、合計カードの副題に「N件」の形で出す")
+    return (len(hit) == 1 and "「N件」" in hit[0] and "N店舗分/Nレジ分" in hit[0] and hit[0].endswith("→ 差し戻し先 S2")
+            and _count_unit_out("応答 rows の件数を、集計単位がレジ別なら「Nレジ分」、店舗別なら「N店舗分」の形で出す") == []
+            and _count_unit_out("応答 rows の件数を、合計カードの副題に出す") == []
+            and _shown_units("店だけ</div>") == ["店だけ"]
+            and _shown_units('${group === "shop" ? "店舗" : "レジ"}分`}') == ["店舗分", "レジ分"]
+            and _shown_units("}件") == [])
+
+
 # 件数の写しの検査を CHECKS と SELFTESTS に登録する(run と selftest が呼ぶ)
 CHECKS.append(check_count_mapping)
 SELFTESTS.append(_selftest_count_mapping_hit)
 SELFTESTS.append(_selftest_count_mapping_miss)
 SELFTESTS.append(_selftest_count_mapping_tie_old)
+SELFTESTS.append(_selftest_count_mapping_unit)
 
 
 def run(inter_dir, feature) -> list:

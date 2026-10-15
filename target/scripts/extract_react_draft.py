@@ -691,10 +691,12 @@ def _csv_seq_facts(c, names, display_rows, aliases=None):
                       "match": _CSV_SEQ_MATCH[seq], "src": src})
 
     # 1 見出し行: 固定列の後に、展開元の項目(表示行の全項目。dead も含む。点数があれば2列)
-    items, dead = [], False
+    items, dead, calc_items = [], False, []
     for spec in _csv_items(c, display_rows, aliases):
         nm = spec.get("csv") or spec.get("label")
         dead = dead or bool(spec.get("dead"))
+        if spec.get("has_calc"):
+            calc_items.append(nm)  # WHY(差9): 合計行の文で、合算でなく計算になる項目を名指しする(下の total_call)
         items += [nm + "(点数)", nm + "(金額)"] if spec.get("cnt") else [nm]
     if fixed or items:
         text = "見出し行: " + "、".join(fixed + items) + "の順に並べる"
@@ -755,7 +757,17 @@ def _csv_seq_facts(c, names, display_rows, aliases=None):
             if kind == "spread":
                 agg = ((c.get("row_builder") or {}).get("total_call") or {}).get("agg_expr")
                 if agg:
-                    vals.append("続く各項目は全行の合算" if "sum" in agg.lower() else f"続く各項目は{agg}で求めた値")
+                    if "sum" not in agg.lower():
+                        vals.append(f"続く各項目は{agg}で求めた値")
+                    elif calc_items or has_calc:
+                        # WHY(差9): 合計行の各項目は全行の合算とは限らない。計算のある項目(平均単価・客単価など)は、合算した値に calc を当てる
+                        #   (`s.calc ? s.calc(agg) : num(agg[s.kin])` の agg が合計)。行ごとの計算結果を足した値ではない。
+                        #   「続く各項目は全行の合算」と書くと、計算のある項目も足し合わせた値と読める(run15 の FR8 step4)。
+                        #   項目の名前は表示行の spec(has_calc)から出す。取れなければ名前なしで、計算のある項目の扱いだけを書く
+                        who = "(" + "・".join(calc_items) + ")" if calc_items else ""
+                        vals.append(f"続く各項目は、計算のある項目{who}は全行を合算した値から計算した値、それ以外の項目は全行の合算")
+                    else:
+                        vals.append("続く各項目は全行の合算")
                 continue
             if kind != "ternary":
                 continue
@@ -1063,6 +1075,9 @@ def _display_rows(sources):
                 #   欄(cell_format)全体では枝が決まらず null_as_zero が null になるので、spec ごとに決めて spec に付ける
                 for s in r["specs"]:
                     s["null_as_zero"] = _spec_null_as_zero(s, evals, sources) if cf else None
+                    # WHY(差9): spec が calc(関数プロパティ)を持つかを事実で残す。CSV の合計行は、calc を持つ項目だけ「合算した値に calc を当てる」
+                    #   (平均単価・客単価は 合算の税込小計 ÷ 合算の点数・客数 であって、行の値の合算ではない)。_csv_seq_facts が合計行の文を書き分けるのに読む
+                    s["has_calc"] = s.get("_calc") is not None
                     s.pop("_calc", None)
     return rows
 
@@ -1352,6 +1367,71 @@ def _client_error_templates(used, funcs):
     return [r for _p, _l, r in sorted(out, key=lambda x: (x[0], x[1]))]
 
 
+def _jsx_text(raw):
+    """JSX の地の文(タグ・{式} の間の文字 raw)を、JSX の変換規則で画面に出る文字列にする。
+
+    規則(Babel・TypeScript とも同じ): 行ごとに、最初の行以外は先頭の空白を、最後の行以外は末尾の空白を落とす。
+    空になった行は捨て、残った行は、最後の空でない行を除いて末尾に空白1つを足して連結する。
+    WHY(差5): JSX で {式} の前後に改行を挟んだ文は、画面では空白が入らない(「POSがあるのは(改行){shops.length}店」は「POSがあるのは10店」)。
+    中間 JSON の例示値に空白を入れると画面と食い違うので、画面の規則そのままの字面を事実として下書きに持たせる。"""
+    lines = re.split(r"\r\n|\n|\r", raw)
+    last = max((i for i, s in enumerate(lines) if s.strip(" \t")), default=-1)
+    out = ""
+    for i, line in enumerate(lines):
+        s = line.replace("\t", " ")
+        if i != 0:
+            s = s.lstrip(" ")
+        if i != len(lines) - 1:
+            s = s.rstrip(" ")
+        if s:
+            out += s + (" " if i != last else "")
+    return out
+
+
+def _jsx_text_joins(sources):
+    """JSX の {式} とその前後の地の文を、画面に出る字面で {expr, before, after, gap_before, gap_after, src} にして返す。
+
+    before は式の直前の地の文の末尾 40 字、after は直後の地の文の先頭 40 字(いずれも _jsx_text の結果。空白は規則どおり)。
+    gap_before・gap_after は、式と地の文の間に空白が入るか(before が空白で終わる・after が空白で始まる)。
+    WHY(差5): 実行時の値を含む文言(「POSがあるのは{shops.length}店だけ」)の例示値を、画面の字面と照合するための事実。
+    verify_vs_source._vs_map.check_jsx_text_gap が、例示値の数の前後の空白を gap と照合する。
+    呼出元: main()(draft["jsx_text_joins"])。
+    ponytail: JSX かどうかを構文で見ず、{ の直前が > か } の直後の地の文だけを拾う(式の中身に ; を含む・前後の地の文が ( ) = を含むものは捨てる)。
+    JSX の地の文の ' や正規表現リテラルは _walk が文字列と取り違えうる。誤った行が出ても、地の文が例示値に一致しなければ検査は何も言わない。"""
+    out = []
+    for p in sources:
+        if p.suffix not in (".tsx", ".jsx"):
+            continue
+        t = p.read_text(encoding="utf-8")
+        for m in re.finditer(r"\{", t):
+            s = m.start()
+            if s > 0 and t[s - 1] == "$":
+                continue
+            e = _close(t, s)
+            expr = " ".join(t[s + 1:e].split())
+            i = s - 1
+            while i >= 0 and t[i] not in "<>{};":
+                i -= 1
+            if i < 0 or t[i] not in ">}" or (t[i] == ">" and t[i - 1:i] == "="):
+                continue
+            j = e + 1
+            while j < len(t) and t[j] not in "<>{};":
+                j += 1
+            raw_b, raw_a = t[i + 1:s], t[e + 1:j]
+            if not expr or ";" in expr or any(re.search(r"[=()$`]|&&", x) for x in (raw_b, raw_a)):
+                continue
+            before, after = _jsx_text(raw_b), _jsx_text(raw_a)
+            if not re.search(r"[A-Za-z0-9぀-ヿ㐀-鿿]", before + after):
+                continue
+            # 出典の行は、地の文の前後の空白・改行を除いた範囲(前のタグの行末・次のタグの行頭を含めない)
+            a0 = i + 1 + len(raw_b) - len(raw_b.lstrip())
+            a1 = j - (len(raw_a) - len(raw_a.rstrip()))
+            out.append({"expr": expr[:80], "before": before[-40:], "after": after[:40],
+                        "gap_before": bool(before) and before[-1].isspace(), "gap_after": bool(after) and after[0].isspace(),
+                        "src": [_span(p, t, a0, a1)]})
+    return out
+
+
 def _continuous_ops(links, sources=()):
     """データ取得を起こす操作(イベント属性・要素を問わず)ごとに、読込中の無効化・判定・取消処理の有無を判定する。
 
@@ -1470,6 +1550,9 @@ def main(argv=None):
     #   backend の error_patterns と組んで、取得エラーの表示の例示値を作る。display_rows[].cell_format・specs[].unit は _display_rows で付く(_compose_mapping(W6)が読む)
     draft["client_error_templates"] = _client_error_templates(api_info.get("used", set()), api_info.get("funcs", {}))
     draft["continuous_operation"] = _continuous_ops(links, sources)
+    # 目的(差5): JSX の {式} とその前後の地の文を、画面に出る字面(改行の前後の空白は入らない)で足す。接続: verify_vs_source._vs_map.check_jsx_text_gap が
+    #   実行時の値を含む文言の例示値(「POSがあるのは 10店」)の数の前後の空白を照合する
+    draft["jsx_text_joins"] = _jsx_text_joins(sources)
     # 目的: CSV と連続操作の事実の行を、trigger の event_processes[].fact_lines に入れる(案 B5 b・c)
     # 目的: CSV の処理順(seq 1〜6)を、表示行の全項目(dead を含む)とファイル名の式の画面項目名で組む。接続: _csv_fact_map
     # 目的: 見出しの展開元(別名の配列 CSV_SPECS は元の LEFT・RIGHT に解く)を header.spread[].source に出し、事実の行の項目にも使う。接続: _spread_arrays / _alias_arrays
@@ -1722,6 +1805,18 @@ def _selftest_v5():
         cv["row_builder"]["total_call"]["agg_expr"] = "tally(rows)"
         got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
         assert "続く各項目はtally(rows)で求めた値" in got[3]["text"], got[3]["text"]
+        # 差9: 計算のある項目(spec の has_calc)があれば、合計行の各項目を「全行の合算」と一括りにせず、計算のある項目を名指しして書き分ける
+        cv["row_builder"]["total_call"]["agg_expr"] = "sumAggs(rows)"
+        drc = [{"array": "LEFT", "labels": ["売上", "平均単価"], "src": [], "specs": [
+            {"label": "売上", "csv": None, "kin": "u", "cnt": None, "has_calc": False},
+            {"label": "平均単価", "csv": None, "kin": None, "cnt": None, "has_calc": True}]}]
+        got = {x["seq"]: x for x in _csv_fact_map([cv], drc, names)["EV08"]}
+        assert "続く各項目は、計算のある項目(平均単価)は全行を合算した値から計算した値、それ以外の項目は全行の合算" in got[3]["text"], got[3]["text"]
+        # 表示行から項目の名前が取れなくても、展開の式が calc を通すなら、計算のある項目の扱いだけを書く
+        cv["row_builder"]["columns"][2]["expr"] = "...CSV.flatMap((s) => { const kin = s.calc ? s.calc(agg) : num(agg[s.kin]); return [kin]; })"
+        got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
+        assert "続く各項目は、計算のある項目は全行を合算した値から計算した値、それ以外の項目は全行の合算" in got[3]["text"], got[3]["text"]
+        cv["row_builder"]["columns"][2]["expr"] = "..."
         cv["formats_numbers"] = False
         got = {x["seq"]: x for x in _csv_fact_map([cv], [], names)["EV08"]}
         assert got[2]["text"].endswith("。数値は桁区切りにせず、そのまま出す"), got[2]["text"]
@@ -1861,6 +1956,9 @@ def _selftest_w7():
             assert nz == {"売上": {"cnt": True, "kin": True}, "点数": {"single": True}, "金額": {"single": True},
                           "差": {"single": None}, "安全": {"single": True}}, nz
             assert rows_c[0]["cell_format"]["kin"]["null_as_zero"] is None, "欄全体は calc の枝が決まらないので null のまま"
+            # 差9: spec が calc を持つかは has_calc で出る(_calc の式そのものは出ない)
+            hc = {s["label"]: s["has_calc"] for r in rows_c for s in r["specs"]}
+            assert hc == {"売上": False, "点数": False, "金額": False, "差": True, "安全": True}, hc
             # 条件が X.calc の三項: spec を限ると通る枝が決まる(calc 無し→num の枝=True、calc あり→その spec の式)。限らなければ従来どおり
             ctx = "const kin = s.calc ? s.calc(agg) : num(agg[s.kin!]);\n"
             tsx2.write_text(num_def, encoding="utf-8")
@@ -1897,6 +1995,50 @@ def _selftest_w7():
         return 1
     except Exception as e:
         print(f"[selftest NG] W7 例外: {e!r}")
+        return 1
+    return 0
+
+
+def _selftest_jsx_join():
+    """JSX の {式} の前後の地の文が、JSX の変換規則の字面で出ることを assert する(差5)。
+
+    呼出元: selftest()。意味合い: 改行を挟んだ {式} は空白が入らず、同じ行に書いた空白は残る。JS のコード(アロー関数の本体・テンプレート文字列)は拾わない。
+    終了コード 0=OK / 1=NG。"""
+    import tempfile
+    try:
+        assert _jsx_text("\n   a\n   b\n  ") == "a b" and _jsx_text("ありました ") == "ありました " and _jsx_text("\n  あるのは\n  ") == "あるのは"
+        tsx = (
+            'export default function S() {\n'
+            '  const f = () => {\n    return `${a}x`;\n  };\n'
+            '  return (\n'
+            '    <div>\n'
+            '      <br />\n'
+            '      現行との差: POSがあるのは\n'
+            '      {shops.length}店だけなので\n'
+            '      その店だけを出す。\n'
+            '      <span>x</span>\n'
+            '      ありました {n} 件です\n'
+            '    </div>\n'
+            '  );\n'
+            '}\n'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / "S.tsx"
+            tp.write_text(tsx, encoding="utf-8")
+            got = _jsx_text_joins([tp])
+        by = {g["expr"]: g for g in got}
+        assert set(by) == {"shops.length", "n"}, [g["expr"] for g in got]
+        s = by["shops.length"]
+        assert s["before"].endswith("POSがあるのは") and s["gap_before"] is False, s
+        assert s["after"] == "店だけなので その店だけを出す。" and s["gap_after"] is False, s
+        assert s["src"][0]["line_start"] == 8 and s["src"][0]["line_end"] == 10, s["src"]
+        n = by["n"]
+        assert n["before"].endswith("ありました ") and n["gap_before"] is True and n["after"] == " 件です" and n["gap_after"] is True, n
+    except AssertionError as e:
+        print(f"[selftest NG] jsx_join {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] jsx_join 例外: {e!r}")
         return 1
     return 0
 
@@ -1976,6 +2118,8 @@ def selftest():
     if _selftest_v5():
         return 1
     if _selftest_w7():
+        return 1
+    if _selftest_jsx_join():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0

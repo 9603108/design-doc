@@ -13,6 +13,7 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
   b) の補足(round13 W6): 使用行に当たった項目が入れ子のときは内側の項目だけを候補にする(入れ物は外す)。
 表示行の spec の葉は、display_rows[].cell_format・specs[].unit(react 下書き)から transform を事実の文で上書きする(cell_format が null なら触らない)。
 入れ替え: モデルの行の項目が候補に無ければ、候補の1番目へ入れ替える(transform はそのまま。log に書く)。
+  ただし、その項目が「応答の項目を被演算子にする計算(calc_candidates)の出力先」(calc の label = 画面項目名)なら入れ替えない(run15 差1)。
   候補のうち行が無いものは行を足す。候補が空の欄は触らない。冪等(2回目は何も変えない)。
 """
 import json
@@ -293,12 +294,24 @@ def _place(row, items, i):
         row.pop("screen_item_nth", None)
 
 
-def _write_rows(api, path, cands, items, log):
-    """path の行を候補に合わせる。モデルの行の項目が候補に無ければ候補の1番目へ入れ替え、候補で行が無いものは足す。"""
+def _calc_targets(drafts, items, leaf):
+    """応答の項目 leaf を被演算子に持つ計算(calc_candidates)の出力先の画面項目名の集合。決まらなければ空。
+    WHY(run15 差1): 計算の結果が出る画面項目(支払科目に無い額・現金過不足・平均単価・客単価)は、field_usage にも表示行の spec(kin/cnt)にも
+    使用として現れないので、候補(_candidates)に入らない。S2 が正しく結んだ「leaf から計算した結果を出す項目」への行まで、候補の1番目
+    (入力側の項目)へ付け替えて壊していた。出力先は calc の label と画面項目の item_name の字面が一致するものだけを採る
+    (_vs_example と同じ結び方。推測しない)。接続先: _write_rows の keep(この名前の行は付け替えない)。"""
+    names = {it.get("item_name") for it in items}
+    return {c["label"] for d in drafts for c in d.get("calc_candidates") or []
+            if isinstance(c, dict) and c.get("label") in names and leaf in (c.get("operands") or [])}
+
+
+def _write_rows(api, path, cands, items, log, keep=frozenset()):
+    """path の行を候補に合わせる。モデルの行の項目が候補にも keep(計算の出力先)にも無ければ候補の1番目へ入れ替え、候補で行が無いものは足す。
+    keep の項目への行は S2 が結んだ計算の出力先なので触らない。keep への行は足さない(出力先ごとの文は S2 が書く事実で、機械の定型文では作れない)。"""
     maps = api["response_to_screen_mapping"]
     action = api.get("action")
     rows = [m for m in maps if isinstance(m, dict) and m.get("api_field_path") == path]
-    cand_names = {items[i].get("item_name") for i, _ in cands}
+    cand_names = {items[i].get("item_name") for i, _ in cands} | set(keep)
     for m in rows:
         if m.get("screen_item_name") in cand_names:
             continue
@@ -353,7 +366,7 @@ def fill(out, log):
                 continue
             cands = _candidates(states, leaf, drafts, usage, items, derived, cache)
             if cands:
-                _write_rows(api, path, cands, items, log)
+                _write_rows(api, path, cands, items, log, _calc_targets(drafts, items, leaf))
             elif _key_only(usage, states, leaf):
                 # WHY: 使用が key だけで候補が無い項目は、モデルが書いた写しの行も消す(V6)
                 _drop_rows(api, path, log)
@@ -529,11 +542,33 @@ def _selftest_w6():
     print("[selftest OK] _compose_mapping W6 (入れ物の候補外し・spec の transform)")
 
 
+def _selftest_calc_target():
+    """run15 差1: 被演算子 leaf から計算した結果を出す項目(calc の label)への行は、候補に無くても付け替えない。
+    出力先でない項目への行は従来どおり候補の1番目へ入れ替える。"""
+    items = [{"item_name": "小計", "screen_no": "3"}, {"item_name": "差引", "screen_no": "3"}, {"item_name": "別", "screen_no": "3"}]
+    drafts = [{"calc_candidates": [{"id": "CC01", "label": "差引", "expr": "r.a - r.b", "operands": ["a", "b"]},
+                                   {"id": "CC02", "label": "存在しない項目", "expr": "r.a", "operands": ["a"]}]}]
+    assert _calc_targets(drafts, items, "a") == {"差引"}, _calc_targets(drafts, items, "a")
+    assert _calc_targets(drafts, items, "z") == set()
+    api = {"action": "x", "response_to_screen_mapping": [
+        {"api_field_path": "rows[].a", "screen_item_name": "小計", "transform": "T1"},
+        {"api_field_path": "rows[].a", "screen_item_name": "差引", "transform": "引いて表示"},
+        {"api_field_path": "rows[].a", "screen_item_name": "別", "transform": "T3"}]}
+    log = []
+    _write_rows(api, "rows[].a", [(0, None)], items, log, _calc_targets(drafts, items, "a"))
+    got = [(m["screen_item_name"], m["transform"]) for m in api["response_to_screen_mapping"]]
+    # 差引は残り、候補に無い別だけ小計へ入れ替わる(その結果、小計の行が2つになる)
+    assert got == [("小計", "T1"), ("差引", "引いて表示"), ("小計", "T3")], got
+    assert len(log) == 1, log
+    print("[selftest OK] _compose_mapping calc 出力先の保護(run15 差1)")
+
+
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv:
         _selftest()
         _selftest_w6()
+        _selftest_calc_target()
     else:
         print("usage: _compose_mapping.py --selftest (fill は _units.compose から呼ばれる)")
         sys.exit(2)

@@ -948,6 +948,20 @@ SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` 
 
 `used_by_processes_ids`（v55 で新設）: 各要素の、この共通ロジックを呼ぶ処理の ID 配列（FR1・BE2 の形）。`used_by_processes`（名前の配列）から `fill_common_logic_callers.py` が、IDs 確定後（`migrate_v48_to_v49.py` の後）に入れる。結べなかった語は `used_by_processes` に残り、標準エラーに WARN が出る。空だと `verify_intermediate.py` が ERROR にする。
 
+### 下書きJSON の追加キー（第18回。中間JSON本体には無い）
+
+下書き（`extract_backend_draft.py` の `{機能名}_backend_draft.json`、`extract_react_draft.py` の `{機能名}_react_draft.json`）にだけあるキー。S1 と検査 `verify_vs_source.py` が事実として読む。中間JSON本体には書かない。
+
+| キー | 出力元 | 中身 | 読み手 |
+|:---|:---|:---|:---|
+| `logic_candidates[].used_by` | backend 下書き | その候補（SQL に入る定数）の名前を使う API の action の配列。API の辿った関数が名前を使うものを入れる | S1（画面の API が使う候補を common_logic に拾う）、`_vs_map.check_common_logic_dropped`（used_by が画面の API の action と交わる候補だけ求める。無い古い下書きは候補のファイルで決める） |
+| `logic_candidates[].comment` | backend 下書き | 定数に付けた `#` コメント（直上の連続コメント、または定数の語に触れる行）。業務の語で書かれている | `_vs_map._cl_covers`（コメントと common_logic の文に共通の語があれば拾っているとみなす） |
+| `docstring_counts[]` | backend 下書き（最上位） | docstring・`#` コメントに書かれた実数。`{lead(数の直前の語。3字未満は出さない), count, unit, text, kind(`docstring` / `comment`), where, src}`。例「POSがあるのは11店」。単位は固定の表にあるものだけ | S1（例示値の数に使う）、`_vs_map.check_docstring_count_example`（例示値の数が count と違えば ERROR） |
+| `jsx_text_joins[]` | react 下書き（最上位） | JSX の `{式}` とその前後の地の文を、画面に出る字面で。`{expr, before(直前の地の文の末尾40字), after(直後の先頭40字), gap_before, gap_after(式と地の文の間に空白が入るか), src}`。JSX は改行を挟んだ前後に空白を入れない | S1（例示値の空白を字面に合わせる）、`_vs_map.check_jsx_text_gap`（空白の有無が違えば ERROR） |
+| `display_rows[].specs[].has_calc` | react 下書き | その spec が `calc`（関数プロパティ）を持つか（bool。式そのものは出ない）。CSV の合計行は、calc を持つ項目だけ「合算した値に calc を当てる」（平均単価・客単価など） | `extract_react_draft._csv_fact_map`（合計行の文を、計算のある項目を名指しして書き分ける） |
+
+`logic_candidates[].kind` は `sql_condition`（SQL の条件・集計の事実）と `sql_fragment`（表名の対応・列の並びなど部品の定数）。`check_common_logic_dropped` は、common_logic に拾われていない候補が sql_condition なら ERROR、sql_fragment なら WARN にする。
+
 ### diagrams（任意、構成図を載せるときのみ）
 
 図は `target/scripts/` の Python スクリプトが作る（diagram-design スキルは任意の代替。無くても作れる）。詳細仕様は 17_構成図生成.md。docx 埋め込みは 16_docx出力ハンドオフ.md「23. 図ガバナンス」を参照。

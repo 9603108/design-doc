@@ -389,6 +389,34 @@ def _gate_names(lines, flags, chain_lines, blocks):
     return out
 
 
+def _jsx_use_names(lines, n, comp):
+    """コンポーネント comp を描く行 n(1始まり。`<comp` を含む行)で、描く値の元になる識別子を返す(重複なし)。
+    1. 要素の属性(`<comp` の行から `/>` か閉じの `>` の行まで。30行を上限)に現れる識別子(agg={total} の total など)
+    2. その要素を囲む JS の式の行(`{rows.map((r, i) => (` / `{rows.length > 1 && (` のように、要素の手前で閉じていない括弧を開く行)の識別子
+    WHY(run15 差3): num()・fmt() を呼ぶのは Card の描画の中で、Card は rows.map で行ごとに描かれる。rows は取得・再取得の FR(店舗の絞り込み・
+    集計単位の切替)で置き換わるが、useMemo の依存にも CSV にも現れないため、鎖が Card で止まり FR3・FR6 が呼出元から抜けた。
+    識別子が何の state かは呼出側が resolve_state(派生配列・useMemo を辿る)で決める。ここでは名前を拾うだけで、画面名は決め打ちしない。"""
+    names = []
+
+    def take(text):
+        for t in _RE_JS_IDENT.findall(text):
+            if t not in names:
+                names.append(t)
+
+    for k in range(n - 1, min(n + 30, len(lines))):
+        take(lines[k])
+        if "/>" in lines[k] or re.search(r"(?<![=-])>\s*$", lines[k]):
+            break
+    depth = 0
+    for k in range(n - 2, max(n - 12, -1), -1):
+        ln = lines[k]
+        depth += (ln.count("}") + ln.count(")")) - (ln.count("{") + ln.count("("))
+        if depth < 0:
+            take(ln)
+            depth = 0
+    return names
+
+
 def _front_callers(cl, data, react_draft, idx, cache=None):
     """ブラウザで動く CL の呼出元の FR の ID を返す(新しく足せるものだけでなく、辿れた全部。重複の除去は呼出側)。
     1. CL の src の行にあるモジュール直下の宣言(function / const)と useMemo の変数を defs にする
@@ -413,18 +441,20 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
 
     dep_states = set()
 
-    def resolve_state(name, memos, seen):
-        """依存の名前を state に引き直す。派生配列は source へ、別の useMemo はその依存へ辿る。"""
+    render_states = set()  # 描画の中で走る関数(コンポーネント)に渡る state。取得・再取得で変わるものだけ、下の 4. で依存に足す
+
+    def resolve_state(name, memos, seen, into=None):
+        """依存の名前を state に引き直す。派生配列は source へ、別の useMemo はその依存へ辿る。into が無ければ dep_states へ足す。"""
         if name in seen:
             return
         seen.add(name)
         if name in states:
-            dep_states.add(name)
+            (dep_states if into is None else into).add(name)
         elif name in derived:
-            resolve_state(derived[name], memos, seen)
+            resolve_state(derived[name], memos, seen, into)
         elif name in memos:
             for d in memos[name]["deps"]:
-                resolve_state(d, memos, seen)
+                resolve_state(d, memos, seen, into)
 
     for s in cl.get("src") or []:
         f = s.get("file") or ""  # fallback-ok: file が無い出典は読めないので飛ばす
@@ -482,6 +512,13 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                 if not _word_in(name, ln) or any(a <= n <= b for a, b in own):
                     continue
                 chain_lines.append(n)
+                # WHY(run15 差3): name がコンポーネントで、この行が `<name` で描いているなら、描く値の元の state を集める。
+                # 描画の中で走る関数(num・fmt など)は、その state が変わるたびに走る。useMemo の依存にも CSV にも出ない経路なので、
+                # ここで拾わないと鎖が止まる。集めた state のうち取得・再取得で変わるものだけを、下の 4. で依存に足す
+                # (入力欄の state まで足すと、旗の無い項目の呼出元が増える。round14 R3 の「旗が無い項目には何も足さない」を保つ)。
+                if re.search(r"<\s*" + re.escape(name) + r"(?![A-Za-z0-9_$])", ln):
+                    for t in _jsx_use_names(lines, n, name):
+                        resolve_state(t, memos, set(), render_states)
                 for a, b, code in ev_ranges:
                     if a <= n <= b:
                         add_ev(code)
@@ -503,6 +540,10 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
         for g in _gate_names(lines, _spec_flags(lines, ls, le), chain_lines, blocks):
             resolve_state(g, memos, set())
     # 4. 依存の state を変えるイベント
+    # WHY(run15 差3): 描画に渡る state のうち、API の取得・再取得の成功で置き換わるもの(failure_effects の on_success)は依存に入れる。
+    # 取得を起こす FR(最初の取得・再取得)が呼出元になる。
+    fetched = {st for fe in react_draft.get("failure_effects") or [] for st in fe.get("on_success") or []}  # fallback-ok: 欄が無ければ足さない
+    dep_states |= render_states & fetched
     for fe in react_draft.get("failure_effects") or []:  # fallback-ok: 欄が無ければ足さない
         if any(st in (fe.get("on_success") or []) for st in dep_states):
             add_ev(fe.get("event"))
@@ -800,6 +841,76 @@ def _selftest_front_gate():
         fill(data3, pn, [], {}, rd)
         assert {c["name"]: c["used_by_processes_ids"] for c in data3["common_logic"]}["DEAD"] == [], data3["common_logic"]
     print("[selftest OK] fill_common_logic_callers front gate")
+    _selftest_front_render()
+
+
+def _selftest_front_render():
+    """run15 差3: 描画の中で走る関数(num)は、Card を描く rows(派生の aggs 経由)を取得・再取得する FR も呼出元にする。
+    入力欄の state(show)だけを変える FR と、描かれない関数(他の宣言から呼ばれない)は足さない。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "Page.tsx"
+        tsx.write_text("\n".join([
+            "const num = (v: unknown) => Number(v);",                             # 1
+            "const unused = (v: unknown) => v;",                                  # 2
+            "",                                                                   # 3
+            "function Card({ agg, showDead }: Props) {",                          # 4
+            "  return <td>{num(agg.x)}</td>;",                                    # 5
+            "}",                                                                  # 6
+            "",                                                                   # 7
+            "export default function Page() {",                                   # 8
+            "  const [rows, setRows] = useState([]);",                            # 9
+            "  const [show, setShow] = useState(false);",                         # 10
+            "  const aggs = useMemo(() => rows.map(toAgg), [rows]);",             # 11
+            "  return (",                                                         # 12
+            "    <div>",                                                          # 13
+            "      {rows.map((r, i) => (",                                        # 14
+            "        <Card",                                                      # 15
+            "          key={i}",                                                  # 16
+            "          agg={aggs[i]}",                                            # 17
+            "          showDead={show}",                                          # 18
+            "        />",                                                         # 19
+            "      ))}",                                                          # 20
+            "    </div>",                                                         # 21
+            "  );",                                                               # 22
+            "}",                                                                  # 23
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+        rd = {
+            "state_initials": [{"state": "rows", "setter": "setRows"}, {"state": "show", "setter": "setShow"}],
+            "derived_arrays": [{"name": "aggs", "source": "rows"}],
+            "events": [
+                {"event_code": "EV00", "source": {"handler": "useEffect"}, "src": [{"file": f, "line_start": 30, "line_end": 30}]},
+                {"event_code": "EV02", "source": {"handler": "(e) => setGroup(e.target.value)"}, "src": [{"file": f, "line_start": 31, "line_end": 31}]},
+                {"event_code": "EV06", "source": {"handler": "(e) => setShow(e.target.checked)"}, "src": [{"file": f, "line_start": 32, "line_end": 32}]},
+            ],
+            # 取得・再取得は rows を置き換える。EV02(集計単位の切替)は handler に setRows が無く、再取得(load)経由で rows を変える
+            "failure_effects": [
+                {"event": "EV00", "call": "fetchX", "on_success": ["rows"]},
+                {"event": "EV02", "call": "fetchX", "on_success": ["rows"]}],
+        }
+        data = {
+            "events": [{"no": c, "event_code": c} for c in ("EV00", "EV02", "EV06")],
+            "front_processes": [{"process_id": "FR1", "name": "初期", "steps": []},
+                                {"process_id": "FR2", "name": "切替", "steps": []},
+                                {"process_id": "FR3", "name": "表示切替", "steps": []}],
+            "backend_processes": [],
+            "common_logic": [
+                {"name": "NUM", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 1, "line_end": 1}]},
+                {"name": "UNUSED", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 2, "line_end": 2}]},
+            ],
+        }
+        pn = {"EV00": "初期", "EV02": "切替", "EV06": "表示切替"}
+        fill(data, pn, [], {}, rd)
+        cl = {c["name"]: c for c in data["common_logic"]}
+        # rows を取得する EV00・EV02 は入り、入力欄だけの EV06 は入らない
+        assert cl["NUM"]["used_by_processes_ids"] == ["FR1", "FR2"], cl["NUM"]
+        assert cl["UNUSED"]["used_by_processes_ids"] == [], cl["UNUSED"]
+        # 冪等
+        before = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        fill(data, pn, [], {}, rd)
+        assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before
+    print("[selftest OK] fill_common_logic_callers front render")
 
 
 def main():
