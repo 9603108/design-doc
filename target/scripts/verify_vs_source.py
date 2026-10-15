@@ -1060,18 +1060,35 @@ def check_item_remarks_units(data, apis, react=None, strings=None):
     used = _react_uses(react)
     problems, seen, flagged = [], set(), {}
 
-    def remark(it, u, leaf):
+    def remark(it, us, leaf):
+        """us は同じ別名の count の単位の全部(通りごとに group_by が変わるとき when 付きで複数ある)。"""
         if (it.get("item_name"), leaf) in seen:
             return
-        others = [g for g in u.get("group_by") or [] if not _is_date_col(g)]
         # WHY: 例示値(「（14日）」など)はソースの表示を写すので対象外。単位を説明する remarks だけを見る
         # WHY: 日付そのものを数える count(counts_dates)は、GROUP BY が店・レジでも日数なので指摘しない(check_backend_facts (3) と同じ基準)
-        if not others or u.get("counts_dates") or not _day_unit_claim(it.get("remarks"), strings):
+        # WHY(2026-10-16 run19 差3): 集計キーが条件で変わる(レジ別は店番号・レジ番、店舗別は店番号だけ)ときに先頭の通りの列だけを「単位」にすると、
+        #      別の通りで成り立たない文(店舗別に「レジ番ごと」)を S1 に書かせた。通りごと(when 付き)の単位を全部集め、条件ごとに書き分けさせる。
+        per = []  # (when, 単位の語)。同じ組は1回
+        for u in us:
+            others = [g for g in u.get("group_by") or [] if not _is_date_col(g)]
+            if not others or u.get("counts_dates"):
+                continue
+            pair = (u.get("when") or "", "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others))
+            if pair not in per:
+                per.append(pair)
+        if not per or not _day_unit_claim(it.get("remarks"), strings):
             return
         seen.add((it.get("item_name"), leaf))
-        unit = "・".join(logical.get(_split_col(g)[1], _split_col(g)[1]) for g in others)
-        flagged[it.get("item_name")] = unit
-        problems.append(f"[数え方] screen_layout.items[{it.get('item_name')}]: 「日数」「N日」と書くが、件数の単位は {unit} を含み日数ではない。「{unit}の行数」と書く → 差し戻し先 S1")
+        if len(per) == 1 and not per[0][0]:
+            unit = per[0][1]
+            phrase = f"{unit}の行数"
+        else:
+            # 条件のある単位が1つでも残るときは、条件ごとの文にする(条件の無い通りは「それ以外」)
+            unit = "、".join(f"{w or 'それ以外'} のときは {x}" for w, x in per)
+            phrase = "、".join(f"{w or 'それ以外'} のとき {x}の行数" for w, x in per)
+        flagged[it.get("item_name")] = (unit, phrase)
+        problems.append(f"[数え方] screen_layout.items[{it.get('item_name')}]: 「日数」「N日」と書くが、件数の単位は {unit} を含み日数ではない。「{phrase}」と書く"
+                        f"{'(集計キーは条件で変わる。条件ごとに単位を書き分ける。1つの条件の列を全部の条件に当てはめない)' if len(per) > 1 or per[0][0] else ''} → 差し戻し先 S1")
 
     for a in data.get("api_spec") or []:
         draft = [u for d in ((apis or {}).get(a.get("action")) or {}).get("db_operations") or [] for u in _units_with_date_count(d)]
@@ -1081,18 +1098,18 @@ def check_item_remarks_units(data, apis, react=None, strings=None):
             leaf = _split_col(str(m.get("api_field_path") or "").replace("[]", ""))[1]
             us = [u for u in counts if u.get("alias") == leaf]
             if it is not None and us:
-                remark(it, us[0], leaf)
+                remark(it, us, leaf)
         for u in counts:
             for it in items.values():
                 if _overlap(it.get("src"), used.get(u.get("alias")) or []):
-                    remark(it, u, u.get("alias"))
+                    remark(it, [x for x in counts if x.get("alias") == u.get("alias")], u.get("alias"))
     for node in [data.get("front_processes"), data.get("event_processes")]:
         for s in _strings_in(node or []):
             if "日数" not in s or "行数" in s or "見出し" in s or "CSV" in s:
                 continue
-            for name, unit in flagged.items():
+            for name, (unit, phrase) in flagged.items():
                 if name and name in s:
-                    problems.append(f"[ERROR] [数え方] 手順「{s}」が項目「{name}」の日数を書く。件数の単位は {unit} で、「{unit}の行数」と書く → 差し戻し先 S3")
+                    problems.append(f"[ERROR] [数え方] 手順「{s}」が項目「{name}」の日数を書く。件数の単位は {unit} で、「{phrase}」と書く → 差し戻し先 S3")
     return problems
 
 
@@ -1665,6 +1682,13 @@ def selftest():
     assert len(got) == 1 and got[0].startswith("[数え方]") and "店舗ID・レジ番号の行数" in got[0] and "差し戻し先 S1" in got[0], got
     apis_r["act"]["db_operations"][0]["aggregate_units"][0]["group_by"] = ["pos.kai_date"]
     assert check_item_remarks_units(dr, apis_r) == [], "日付だけの単位は日数でよい"
+    # run19 差3: 集計キーが条件で変わる(レジ別は店・レジ、店舗別は店だけ)ときは、条件ごとに単位を書き分けさせる(レジ番を全部の条件に当てはめない)
+    apis_r["act"]["db_operations"][0]["aggregate_units"] = [
+        {"func": "count", "arg": "*", "alias": "days", "scope": "main", "group_by": ["pos.mise_no", "pos.reji_no"], "when": "group = register"},
+        {"func": "count", "arg": "*", "alias": "days", "scope": "main", "group_by": ["pos.mise_no"], "when": "group = shop"}]
+    got = check_item_remarks_units(dr, apis_r)
+    assert len(got) == 1 and "group = register のとき 店舗ID・レジ番号の行数" in got[0] and "group = shop のとき 店舗IDの行数" in got[0] \
+        and "条件ごとに単位を書き分ける" in got[0] and got[0].endswith("差し戻し先 S1"), got
     # B15 c: 選択肢の一部だけを書いた説明(既定の語が無い)は ERROR。全部を書く・既定の語を添えるなら通す
     rd_e = {"jsx_elements": [{"tag": "select", "label": "集計単位", "options": [{"value": "register", "text": "レジ別（現行と同じ）"}, {"value": "shop", "text": "店舗別（レジ合算）"}]},
                              {"tag": "select", "label": "店舗", "options": [{"value": "", "text": "- 全店 -"}]}]}

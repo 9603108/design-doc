@@ -540,6 +540,9 @@ def check_s2_overview(composed, frags, directory):
 
 # 説明の要の語の判定に使う英数字の識別子(3字以上)。日本語は見ない(ソース内の表記が揺れるため)
 _KEY_TERM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+# WHY(2026-10-16 run19): 業務の言葉として説明に出る略語(「本日の日付(UTC+9時間基準)」の UTC)はソースの識別子ではなく、出典の本文(`+ 9 * 3600 * 1000`)に字面で無い。
+#      これだけが「要の語」になった行が、run17〜19 で毎回 WARN の誤検出になった。識別子として使われない略語は要の語に数えない。
+_GENERIC_ACRONYMS = {"UTC", "JST", "CSV", "API", "SQL", "URL", "HTTP", "HTTPS", "JSON", "XML", "HTML", "TSX", "UI", "DB", "ID", "PDF", "NULL", "OK", "NG"}
 # 例示値の穴 {名前}。実行時に決まる値の書き方なので、例示値に残ると例として読めない
 _EX_HOLE = re.compile(r"\{[^{}]+\}")
 _DATE_EX = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}")
@@ -565,18 +568,31 @@ def check_explanation_warn(frags):
             if r.get("event_code") == "EV00" or not r.get("src"):
                 continue
             text = " ".join(str(r.get(k) or "") for k in ("content", "description", "overview"))
-            terms = {t for t in _KEY_TERM.findall(text) if not re.fullmatch(r"[A-Z]+\d+", t)}
+            terms = {t for t in _KEY_TERM.findall(text) if not re.fullmatch(r"[A-Z]+\d+", t) and t.upper() not in _GENERIC_ACRONYMS}
             bodies = [_src_text(s) for s in r["src"] if isinstance(s, dict)]
             if not terms or not bodies or any(b is None for b in bodies):
                 continue
             body = "\n".join(bodies)
             if not any(t in body for t in terms):
-                found.append((unit, r.get("event_code") or r.get("action") or r.get("item_name") or r.get("message_id") or "?"))
+                # WHY(2026-10-16 run19): 行の名前を event_code・action・item_name・message_id だけで引くと、他の欄(calculations・validations・common_logic など)の行は
+                #      「?」になり、どの行・どの語か分からなかった(run17〜19 で毎回)。行の名前は _row_name で引き(無ければ最初の文字列の欄)、
+                #      語(説明の識別子)と出典(file:行)も並べる。
+                s0 = next((s for s in r["src"] if isinstance(s, dict)), {})
+                where = f"{Path(str(s0.get('file') or '')).name}:{s0.get('line_start')}-{s0.get('line_end')}"
+                found.append((unit, f"{_row_name(r)}(語 {', '.join(sorted(terms)[:4])} / 出典 {where})"))
     if not found:
         return []
     names = ", ".join(dict.fromkeys(n for _, n in found))
     units = ", ".join(sorted({u for u, _ in found}))
     return [f"[WARN] [根拠] 行 {len(found)} 件: 説明の要の語が出典の範囲に無い: {names} → 差し戻し先 {units}"]
+
+
+def _row_name(r):
+    """行の名前。よくある識別の欄を順に引き、どれも無ければ最初の文字列の欄の先頭30字(「?」で特定できなくならないようにする)。呼出元: check_explanation_warn。"""
+    for k in ("event_code", "action", "item_name", "name", "no", "field", "key", "message_id", "id", "process_id", "alias", "step_no"):
+        if r.get(k):
+            return str(r[k])
+    return next((str(v)[:30] for v in r.values() if isinstance(v, str) and v), "?")  # fallback-ok: 文字列の欄が1つも無い行だけ「?」
 
 
 def check_example_format(frags):
@@ -938,6 +954,15 @@ def selftest_warn():
                                  "src": [{"file": str(src), "line_start": 4, "line_end": 5}]}]}}
         out = check_explanation_warn(ng)
         assert len(out) == 1 and out[0].startswith("[WARN] [根拠]") and out[0].endswith("差し戻し先 H1"), out
+        # run19: 語と出典の場所が出る。event_code 等の無い行(validations の field・名前の欄すら無い行)でも「?」にならない
+        assert "delete_customer" in out[0] and "h.py:4-5" in out[0] and "EV01" in out[0], out
+        v_ng = {"H4": {"validations": [{"field": "エラーの表示", "description": "delete_customer を消す", "src": [{"file": str(src), "line_start": 4, "line_end": 5}]},
+                                       {"description": "delete_customer を消す", "src": [{"file": str(src), "line_start": 4, "line_end": 5}]}]}}
+        out_v = check_explanation_warn(v_ng)
+        assert len(out_v) == 1 and "?(" not in out_v[0] and "エラーの表示(語 delete_customer" in out_v[0], out_v
+        # 略語(UTC)だけが英数字の語の行は、出典の字面に無くても判定しない(誤検出)
+        acr = {"S1": {"common_logic": [{"name": "本日の日付(UTC+9時間基準)", "description": "UTC に9時間足した日付", "src": [{"file": str(src), "line_start": 4, "line_end": 5}]}]}}
+        assert check_explanation_warn(acr) == [], check_explanation_warn(acr)
         no_src = {"H1": {"events": [{"event_code": "EV01", "content": "save_order で保存する"}]}}
         assert check_explanation_warn(no_src) == [], "出典が無い行は判定しない(WARN は別の check_src_warn)"
     s1 = {"S1": {"screen_layout": {"items": [{"item_name": "総売上", "example": "{金額} 円", "item_type": "Label"},

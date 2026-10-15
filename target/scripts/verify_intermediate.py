@@ -1747,7 +1747,34 @@ def check_common_logic_callers(merged: dict) -> list:
             no = cl.get("no") or cl.get("logic_id") or "?"
             issues.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): used_by_processes_ids が空（呼出元の FR・BE を結ぶ）"))
     issues.extend(_check_cl_covers_be_callers(merged))
+    issues.extend(_check_cl_names_match_ids(merged))
     return issues
+
+
+def _check_cl_names_match_ids(merged: dict) -> list:
+    """run19 差4: CL の used_by_processes_ids に入る FR の name は、used_in と used_by_processes(名前の欄)にも出る。
+
+    WHY: 合成(fill_common_logic_callers)が ids だけ足し、名前の欄が取り残されると、同じ CL の中で ids(FR3 あり)と名前(店舗の絞り込みなし)が
+         食い違う(run19 の CL3)。fill が名前を ids から作り直すので、ここで出るのは別経路で ids だけが増えた JSON。
+         欄が無い(None)CL は見ない。差し戻し先は S1(名前の欄を書くのは S1。合成が足せない形のときだけ人が見る)。
+    接続情報: 入力 = merged['common_logic'] / ['front_processes'] / 出力 = [(level, message), ...] / 呼出元 = check_common_logic_callers"""
+    names = {}
+    for fp in merged.get("front_processes") or []:
+        fid = fp.get("process_id") or fp.get("no")
+        if fid and fp.get("name"):
+            names[fid] = fp["name"]
+    out = []
+    for cl in merged.get("common_logic") or []:
+        for key in ("used_in", "used_by_processes"):
+            lst = cl.get(key)
+            if not isinstance(lst, list):
+                continue
+            lack = [names[i] for i in cl.get("used_by_processes_ids") or [] if i in names and names[i] not in lst and i not in lst]
+            if lack:
+                no = cl.get("no") or cl.get("logic_id") or "?"
+                out.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): {key} に {'・'.join(lack)} が無い"
+                                     f"(used_by_processes_ids の FR。名前の欄と ids の集合を揃える) → 差し戻し先 S1"))
+    return out
 
 
 def _check_cl_covers_be_callers(merged: dict) -> list:
@@ -1781,6 +1808,77 @@ def _check_cl_covers_be_callers(merged: dict) -> list:
                 no = cl.get("no") or cl.get("logic_id") or "?"
                 out.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): 呼出元に {'・'.join(lack)} が無い"
                                      f"(使う {bid} の呼出元の FR。CL の呼出元の FR は BE の呼出元の FR を全部含む) → 差し戻し先 S1"))
+    return out
+
+
+# WHY(2026-10-16 run19 差1): 写し欄の説明(transform)が写し先と別の画面要素の名前(会計カードの「見出し」)を言うと、読み手は別の場所に出ると読む。
+#      写し先の項目名が持たない要素の語だけを拾うので、語は「画面の部品の呼び名」に限る(値の説明に出る一般語は入れない)。
+_ELEMENT_WORDS = ("見出し", "副題", "サブタイトル", "タイトル", "ラベル", "注記", "ボタン")
+
+
+def check_mapping_element_names(merged: dict) -> list:
+    """run19 差1: response_mapping / response_to_screen_mapping の transform に出る画面要素の語(見出し・副題など)は、写し先の項目名に含まれる。
+
+    WHY: 店舗名称(rows[].shop_name)の写しの transform が「会計カードの見出しに店舗名を表示する」だった(写し先は IT13 取込欠損の疑い日の一覧。
+         見出しは固定文言で、店舗名は副題と一覧に出る)。写し先は item_ref_no が正で、文は項目名と同じ要素を指す。
+         写し先の項目が引けない(item_ref_no も screen_item_name も items に無い)ときは見ない(別の検査が止める)。
+         語が写し先の項目名に無いだけで ERROR にする(言い換えの余地を許さない)ので、誤検出は run15〜19 の複製で確かめてある。
+         差し戻し先は S2(transform を書く単位。FR・AP2 へは合成が写す)。
+    接続情報: 入力 = merged['screen_layout'].items / ['front_processes'][].steps[].response_mapping.mappings / ['api_spec'][].response_to_screen_mapping /
+              出力 = [(level, message), ...] / 呼出元 = main"""
+    items = (merged.get("screen_layout") or {}).get("items") or []
+    by_no = {i.get("no"): i.get("item_name") or "" for i in items if i.get("no")}
+    names = {i.get("item_name") for i in items if i.get("item_name")}
+    sites = []
+    for fp in merged.get("front_processes") or []:
+        for s in fp.get("steps") or []:
+            for m in ((s.get("response_mapping") or {}) if isinstance(s, dict) else {}).get("mappings") or []:
+                sites.append((f"front_processes[{fp.get('process_id')}].steps[{s.get('step_no')}]", m))
+    for a in merged.get("api_spec") or []:
+        for m in a.get("response_to_screen_mapping") or []:
+            sites.append((f"api_spec[{a.get('action')}].response_to_screen_mapping", m))
+    found = {}  # (語, 写し元, 写し先, 文) → 出てくる場所の並び。同じ文が FR・API に5か所あっても1件にまとめる
+    for where, m in sites:
+        if not isinstance(m, dict):
+            continue
+        target = by_no.get(m.get("item_ref_no")) or (m.get("screen_item_name") if m.get("screen_item_name") in names else "")
+        text = str(m.get("transform") or "")
+        if not target or not text:
+            continue
+        for w in _ELEMENT_WORDS:
+            if w in text and w not in target:
+                found.setdefault((w, m.get("api_field_path"), target, m.get("item_ref_no") or "", text), []).append(where)
+    return [("ERROR", f"{'・'.join(wh)}: {path} の transform「{text}」が「{w}」を言うが、写し先の項目は「{target}」"
+                      f"({ref})で「{w}」ではない(写し先の項目の動きだけを書く) → 差し戻し先 S2")
+            for (w, path, target, ref, text), wh in found.items()]
+
+
+_FETCH_HEAD = re.compile(r"^(.*?)の?取得")
+_TOKEN_SPLIT = re.compile(r"[・、,/／]|または|および|及び|や(?=[^ぁ-ん])")
+
+
+def check_validation_fetch_operations(merged: dict) -> list:
+    """run19 差2: validations[].applied_when が「<操作>の取得が…」と言うとき、その操作の FR は API を呼ぶ(backend_call の step を持つ)。
+
+    WHY: VL9 エラーの表示の条件が「表示・CSV出力の取得が失敗したとき」だったが、CSV出力(FR8)は取得をしない(画面の行を書き出すだけ)。
+         「取得」の前の語を「・」「、」「または」などで分け、名前が語と一致・包含する FR を引く。引けた FR のどれも backend_call を持たない語だけ ERROR にする
+         (「表示」は初期表示・表示の FR が取得するので通る。語が FR に当たらないときは見ない)。差し戻し先は H4(画面ルールの条件を書く単位)。
+    接続情報: 入力 = merged['validations'] / ['front_processes'] / 出力 = [(level, message), ...] / 呼出元 = main"""
+    frs = [(fp.get("process_id"), str(fp.get("name") or ""),
+            any(isinstance(s, dict) and (s.get("kind") in ("backend_call", "api_call") or s.get("backend_call")) for s in fp.get("steps") or []))
+           for fp in merged.get("front_processes") or []]
+    out = []
+    for v in merged.get("validations") or []:
+        m = _FETCH_HEAD.match(str(v.get("applied_when") or ""))
+        if not m:
+            continue
+        for tok in (t.strip() for t in _TOKEN_SPLIT.split(m.group(1))):
+            if len(tok) < 2:
+                continue
+            hit = [(fid, nm, calls) for fid, nm, calls in frs if nm and (tok in nm or nm in tok)]
+            if hit and not any(calls for _, _, calls in hit):
+                out.append(("ERROR", f"validations[{v.get('no') or v.get('field')}].applied_when「{v.get('applied_when')}」が「{tok}」の取得を言うが、"
+                                     f"{'・'.join(f'{fid}({nm})' for fid, nm, _ in hit)} は API を呼ばない(backend_call の step が無い) → 差し戻し先 H4"))
     return out
 
 
@@ -1931,6 +2029,36 @@ def _selftest() -> int:
     cl_be["common_logic"].append({"no": "CL3", "runs_on": "データベース", "used_by_processes_ids": ["FR2"]})
     if check_common_logic_callers(cl_be):
         print(f"[selftest NG] 揃った呼出元・ブラウザの CL・BE を結ばない CL で ERROR が出た: {check_common_logic_callers(cl_be)}")
+        return 1
+    # run19 差4: ids の FR の name が used_in に無ければ ERROR(S1)。名前が揃えば出ない
+    nm = {"front_processes": [{"process_id": "FR1", "name": "初期表示"}, {"process_id": "FR3", "name": "店舗の絞り込み"}],
+          "common_logic": [{"no": "CL3", "used_in": ["初期表示"], "used_by_processes": ["初期表示"], "used_by_processes_ids": ["FR1", "FR3"]}]}
+    got_nm = [m for lv, m in check_common_logic_callers(nm) if lv == "ERROR"]
+    if len(got_nm) != 2 or "店舗の絞り込み" not in got_nm[0] or "S1" not in got_nm[0]:
+        print(f"[selftest NG] ids の FR の名前が名前の欄に無い ERROR が出ない: {got_nm}")
+        return 1
+    nm["common_logic"][0]["used_in"].append("店舗の絞り込み")
+    nm["common_logic"][0]["used_by_processes"].append("店舗の絞り込み")
+    if check_common_logic_callers(nm):
+        print(f"[selftest NG] 名前が揃った CL で ERROR が出た: {check_common_logic_callers(nm)}")
+        return 1
+    # run19 差1: transform の画面要素の語が写し先の項目名に無ければ ERROR(S2)。項目名に有る語は通す
+    mp = {"screen_layout": {"items": [{"no": "IT13", "item_name": "取込欠損の疑い日の一覧"}, {"no": "IT17", "item_name": "店舗・レジ別カードの副題"}]},
+          "api_spec": [{"action": "a", "response_to_screen_mapping": [
+              {"api_field_path": "rows[].shop_name", "item_ref_no": "IT13", "screen_item_name": "取込欠損の疑い日の一覧", "transform": "会計カードの見出しに店舗名を表示する"},
+              {"api_field_path": "rows[].shop_name", "item_ref_no": "IT17", "screen_item_name": "店舗・レジ別カードの副題", "transform": "副題に店舗名を出す"}]}]}
+    got_mp = check_mapping_element_names(mp)
+    if len(got_mp) != 1 or "見出し" not in got_mp[0][1] or "S2" not in got_mp[0][1]:
+        print(f"[selftest NG] 写し先に無い画面要素の語の ERROR が出ない/誤検出: {got_mp}")
+        return 1
+    # run19 差2: 「CSV出力の取得」の FR は backend_call が無いので ERROR(H4)。「表示」は取得する FR があるので通る
+    vf = {"front_processes": [{"process_id": "FR1", "name": "初期表示", "steps": [{"kind": "backend_call"}]},
+                              {"process_id": "FR8", "name": "CSV出力", "steps": [{"kind": "file_output"}]}],
+          "validations": [{"no": "VL9", "applied_when": "表示・CSV出力の取得が失敗したとき"}, {"no": "VL1", "applied_when": "表示の取得が失敗したとき"},
+                          {"no": "VL2", "applied_when": "CSV出力ボタンを押したとき"}]}
+    got_vf = check_validation_fetch_operations(vf)
+    if len(got_vf) != 1 or "VL9" not in got_vf[0][1] or "FR8" not in got_vf[0][1] or "H4" not in got_vf[0][1]:
+        print(f"[selftest NG] 取得しない FR の取得の条件の ERROR が出ない/誤検出: {got_vf}")
         return 1
     # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価する。
     # 記載が評価と違えば ERROR、評価が決まらない・TSX が無い項目は見ない（INFO のみ）
@@ -2157,6 +2285,9 @@ def main():
     all_issues.extend(check_event_action(merged))
     all_issues.extend(check_diagram_ids(merged))
     all_issues.extend(check_common_logic_callers(merged))
+    # run19 差1・差2: 写し欄の transform の画面要素の語と写し先の項目名・条件の「取得」と API を呼ぶ FR
+    all_issues.extend(check_mapping_element_names(merged))
+    all_issues.extend(check_validation_fetch_operations(merged))
     # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価して照合する
     all_issues.extend(check_initialization_eval(merged, sc, _load_react_drafts()))
     # B16 round12 V2: 初期値に別の項目の文言が重複して入るもの（出典の範囲が兄弟の文言まで取った）を止める

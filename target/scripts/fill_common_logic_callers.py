@@ -805,6 +805,19 @@ def fill(data, pnames, log, draft=None, react_draft=None):
         # WHY: used_by_processes に API 名(action)で書かれた語は、呼出元の表示を揃えるため BE の name に直す。
         if isinstance(cl.get("used_by_processes"), list):
             cl["used_by_processes"] = [_name_of_api(t, idx) for t in cl["used_by_processes"]]
+        # WHY(2026-10-16 run19 差4): ids へ機械で足した FR(店舗の絞り込みの FR3)の名前は、S1 の used_in・used_by_processes に無いまま
+        # 取り残され、同じ CL の中で ids と名前が食い違った。名前の欄は ids から機械で作り直す(S1 の語は消さず、足りない FR の名前だけを足す)。
+        # 足すのは FR だけ(BE は S1 が名前で書く語のままにする。CL1・CL2 の used_in に BE の名前を混ぜない)。冪等。
+        # 検査 verify_intermediate.check_cl_names_match_ids が、足し漏れ(別経路で ids だけ増えた場合)を ERROR で照合する。
+        for key in ("used_in", "used_by_processes"):
+            lst = cl.get(key)
+            if not isinstance(lst, list):
+                continue
+            for rid in ids:
+                fp = idx["fr_by_id"].get(rid)
+                nm = (fp or {}).get("name")
+                if nm and nm not in lst and rid not in lst:
+                    lst.append(nm)
 
 
 def selftest():
@@ -884,6 +897,8 @@ def selftest():
                 # run18 差2: 候補も used_in も無くても、出典の行が BE4(list_y)のソース範囲の中なら、BE4 と BE4 を呼ぶ FR3 が入る
                 {"name": "CL_I", "used_in": [], "runs_on": "データベース",
                  "src": [{"file": str(be3), "line_start": 5, "line_end": 5}]},
+                # run19 差4: ids に FR2 があるのに used_in・used_by_processes に「集計」が無い。名前を ids から足す(FR1 の語は残す)
+                {"name": "CL_K", "used_in": ["初期表示"], "used_by_processes": ["初期表示"], "used_by_processes_ids": ["FR2"]},
             ],
         }
         pn = {"EV00": "初期表示", "EV01": "集計"}
@@ -907,6 +922,10 @@ def selftest():
         assert cl["CL_G"]["used_by_processes_ids"] == ["FR1", "BE2", "FR2"], cl["CL_G"]
         assert cl["CL_I"]["used_by_processes_ids"] == ["BE4", "FR3"], cl["CL_I"]
         assert cl["CL_J"]["used_by_processes_ids"] == ["BE5", "BE6", "FR4", "FR5"], cl["CL_J"]
+        assert cl["CL_K"]["used_by_processes_ids"] == ["FR2", "FR1"], cl["CL_K"]
+        assert cl["CL_K"]["used_in"] == ["初期表示", "集計"] and cl["CL_K"]["used_by_processes"] == ["初期表示", "集計"], cl["CL_K"]
+        # FR の名前だけ足す。BE(BE5・BE6)の名前は used_in に混ぜない
+        assert cl["CL_J"]["used_in"] == ["一覧A", "一覧B"], cl["CL_J"]
         # WARN: C は結べない語(1件)。B・E は src が無く BE を足さない(各1件)。CL_D は候補と行が重ならず絞れない(1件)。
         # round(clwarn): ブラウザの CL で src が無い A・F は画面の呼出元を引けない WARN(各1件)。計6件
         assert len(log) == 6, log
@@ -976,6 +995,8 @@ def _selftest_front():
         # react 下書きが無いときは何も足さない
         data2 = json.loads(json.dumps(data))
         data2["common_logic"][0]["used_by_processes_ids"] = []
+        # 1回目の fill が ids から足した FR の名前(used_in)も戻す(残すと、2回目は名前から ids を結び直してしまう)
+        data2["common_logic"][0]["used_in"] = []
         fill(data2, pn, [], {}, None)
         assert data2["common_logic"][0]["used_by_processes_ids"] == [], data2["common_logic"][0]
     print("[selftest OK] fill_common_logic_callers front")
@@ -1036,6 +1057,7 @@ def _selftest_front_gate():
         data3 = json.loads(json.dumps(data))
         for c in data3["common_logic"]:
             c["used_by_processes_ids"] = []
+            c["used_in"] = []  # 1回目の fill が ids から足した FR の名前も戻す(残すと名前から ids を結び直す)
         fill(data3, pn, [], {}, rd)
         assert {c["name"]: c["used_by_processes_ids"] for c in data3["common_logic"]}["DEAD"] == [], data3["common_logic"]
     print("[selftest OK] fill_common_logic_callers front gate")
