@@ -398,6 +398,47 @@ def _unify_same_expression(out, drafts, log):
                         row["logical_column"] = new
 
 
+def _unify_column_logical_names(out, log):
+    """同じ physical_table+physical_column の logical_column を、db_operations の dataset 全体で1つにそろえる。
+    呼出元: _compose_db の最後。WHY: 同じ物理列の論理名が DB 操作ごとに違う(shops.name が DB1=店舗名称(推定)・DB2=名称(推定))と、
+         設計書の項目名が操作によって食い違う。モデルの揺れを残さず、決定的な規則で1つに決める。
+    選び方: (1)「(推定)」の付かない名前 (2)出現(dataset の行数)の多い名前 (3)長い名前 (4)最初に現れる DB 操作(並びの若い方)。
+    対象外: alias_name つきの行(集計・式の別名は列そのものの名前でない)。同じ操作の中で同じ列に2つ以上の名が付くもの
+         (MIN と MAX の使い分け)は、_vs_db.check_logical_name_consistency と同じく、その列を触らない。
+    冪等: そろった後は名前が1つなので、再実行しても何も変えない。logical_names の同じ列の行(別名なし・derived でない)も同じ名前にする。"""
+    seen = {}  # (物理表, 物理列) -> {名前: [出現数, 最初の操作の位置]}、操作ごとの名前の集合
+    per_op = {}
+    agg = {a.get("alias") for op in out.get("db_operations") or [] for a in op.get("aggregate") or [] if a.get("alias")}  # fallback-ok: 集計は任意
+    for pos, op in enumerate(out.get("db_operations") or []):  # fallback-ok: db_operations は任意
+        for row in op.get("dataset") or []:  # fallback-ok: dataset は任意
+            pt, pc, lc = row.get("physical_table"), row.get("physical_column"), row.get("logical_column")
+            # WHY: physical_column が空の別名の行と、集計(aggregate)の別名の行は、列そのものの名前でないので対象外
+            #      (_vs_db.check_logical_name_consistency と同じ範囲)。物理列が埋まった別名の行(shop_name 等)は対象にする
+            if not (pt and pc and lc) or row.get("alias_name") in agg:  # fallback-ok: 欄の空の行は対象外
+                continue
+            ent = seen.setdefault((pt, pc), {}).setdefault(lc, [0, pos])
+            ent[0] += 1
+            per_op.setdefault((pt, pc), {}).setdefault(pos, set()).add(lc)
+    pick = {}
+    for key, names in seen.items():
+        if len(names) < 2 or any(len(v) != 1 for v in per_op[key].values()):
+            continue
+        pick[key] = min(names, key=lambda n: (n.endswith(SUFFIX), -names[n][0], -len(n), names[n][1]))
+    if not pick:
+        return
+    for op in out.get("db_operations") or []:  # fallback-ok: db_operations は任意
+        for row in op.get("dataset") or []:  # fallback-ok: dataset は任意
+            k = (row.get("physical_table"), row.get("physical_column"))
+            if k in pick and row.get("alias_name") not in agg and row.get("logical_column") != pick[k]:
+                log.append(f"INFO _compose_db_facts: {k[0]}.{k[1]} の論理名 {row.get('logical_column')} を {pick[k]} へそろえる({op.get('id')})")
+                row["logical_column"] = pick[k]
+    # logical_names は、同じ列の行のうち、dataset で名前が付いていた(そろえる前の)名前の行だけ寄せる(集計の別名の行・他の名前の行は触らない)
+    for r in out.get("logical_names") or []:  # fallback-ok: logical_names は任意
+        k = (r.get("physical_table"), r.get("physical_column"))
+        if k in pick and r.get("alias_name") not in agg and r.get("logical_column") in seen[k]:
+            r["logical_column"] = pick[k]
+
+
 def _ws(s):
     """空白を1つに詰めて小文字にする(字面の比較専用)。"""
     return " ".join(str(s or "").split()).lower()  # fallback-ok: None は空文字として比べる(比較専用)
@@ -478,6 +519,7 @@ def _compose_db(out, drafts, log):
             _drop_subquery_aggs(op, api, log)
     for op, dop, _ in pairs:                        # d) 集計の別名
         _fill_agg(op, dop)
+    _unify_column_logical_names(out, log)           # f) 同じ物理列の論理名を操作どうしで1つに揃える
     return out
 
 
@@ -720,6 +762,35 @@ def selftest():
     w5_fact[0]["apis"]["a2"]["db_operations"][0]["columns"][0].update({"logical_name": "店名", "logical_name_source": "docstring"})
     _unify_same_expression(w5_out2, w5_fact, [])
     assert [r["logical_column"] for r in w5_out2["logical_names"]] == ["店名", "店名"], w5_out2
+    # X1: 同じ物理列の論理名を操作どうしで1つに揃える。(推定)なし優先 → 出現数 → 長さ → 操作の順。別名の行・同じ操作内の2名は触らない
+    x1_row = lambda lc, **kw: {"physical_table": "shops", "physical_column": "name", "logical_column": lc, **kw}
+    x1 = {"db_operations": [
+        {"id": "DB1", "dataset": [x1_row("店舗名称(推定)", alias_name="shop_name")]},  # 物理列が埋まった別名の行は対象
+        {"id": "DB2", "dataset": [x1_row("名称(推定)")]},
+        {"id": "DB3", "dataset": [x1_row("名称(推定)"), x1_row("別名の行", physical_column="", alias_name="a")]}],
+        "logical_names": [x1_row("店舗名称(推定)", alias_name="shop_name")]}
+    _unify_column_logical_names(x1, [])
+    assert x1["logical_names"][0]["logical_column"] == "名称(推定)", x1["logical_names"]
+    got = [r["logical_column"] for o in x1["db_operations"] for r in o["dataset"] if r.get("physical_column")]
+    assert got == ["名称(推定)"] * 3, got  # 出現2件の名称(推定)が勝つ
+    assert x1["db_operations"][2]["dataset"][1]["logical_column"] == "別名の行" and x1["logical_names"][0]["logical_column"] == "名称(推定)"
+    x1b = {"db_operations": [{"id": "DB1", "dataset": [x1_row("名称(推定)")]}, {"id": "DB2", "dataset": [x1_row("店舗名称")]}]}
+    _unify_column_logical_names(x1b, [])  # (推定)なしが優先
+    assert [o["dataset"][0]["logical_column"] for o in x1b["db_operations"]] == ["店舗名称"] * 2, x1b
+    x1c = {"db_operations": [{"id": "DB1", "dataset": [x1_row("名称")]}, {"id": "DB2", "dataset": [x1_row("店舗名称")]}]}
+    _unify_column_logical_names(x1c, [])  # 同数なら長い方
+    assert [o["dataset"][0]["logical_column"] for o in x1c["db_operations"]] == ["店舗名称"] * 2, x1c
+    x1d = {"db_operations": [{"id": "DB1", "dataset": [x1_row("あ名")]}, {"id": "DB2", "dataset": [x1_row("い名")]}]}
+    _unify_column_logical_names(x1d, [])  # 同数・同じ長さなら若い操作
+    assert [o["dataset"][0]["logical_column"] for o in x1d["db_operations"]] == ["あ名"] * 2, x1d
+    x1e = {"db_operations": [{"id": "DB1", "dataset": [x1_row("最初"), x1_row("最後")]}, {"id": "DB2", "dataset": [x1_row("最後")]}]}
+    x1e_snap = copy.deepcopy(x1e)
+    _unify_column_logical_names(x1e, [])  # 同じ操作内で2名(MIN/MAX)の列は触らない
+    assert x1e == x1e_snap
+    x1_snap = copy.deepcopy(x1)
+    _unify_column_logical_names(x1, [])
+    assert x1 == x1_snap, "X1 not idempotent"
+    print("[selftest OK] _compose_db_facts X1 (同じ物理列の論理名を操作どうしで1つに揃える)")
     print("[selftest OK] _compose_db_facts W5 (同じ式の列の論理名を揃える・式が違う列は変えない・決まらないときは WARN)")
     print("[selftest OK] _compose_db_facts V4 (別名の表が違う行は下書き列の表へ付け替える・論理表が無い・候補が割れるときは触らない)")
     print("[selftest OK] _compose_db_facts 番号振りの後の id でも同じ事実(legacy_id・action で結ぶ)")
