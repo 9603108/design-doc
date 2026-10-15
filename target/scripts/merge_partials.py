@@ -242,6 +242,86 @@ def _range_text(file: str, start: int, end: int, env: dict) -> str:
     return re.sub(r"\s+", " ", _TAG.sub("", s)).strip()
 
 
+# WHY(run17 差5・差6): _children_text が {式} を一旦「文字列リテラルの式」に置き換えるときの目印。私用領域の文字なので、画面の文言とは衝突しない
+_PH = chr(0xE000)
+
+
+def _children_text(file: str, start: int, end: int, env: dict):
+    """範囲が「要素の子の途中から始まる文」のとき、画面に出る字面を返す。決まらなければ None(呼出元が従来の取り方に戻る)。
+    対象: 範囲の先頭が開始タグでも {式} でもなく文字で、その位置が開始タグの属性の中でなく子の位置にある範囲
+    (例: 「<span>空</span>」= …(IT63)、現行画面との差: …{shops.length}店だけ…(IT64))。
+    WHY(run17 差5・差6): (1) 範囲の最初の要素だけを取る text_of_lines は IT63 の「空」1字だけを返した(全文は 333-335 に常に出る)。
+      (2) 範囲に要素が無い IT64 は「属性の行」とみなされて文言を取らず、Blank に落ちた(初期は shops=[] なので「…0店だけ…」が出る)。
+      どちらも、範囲を JSX の子の文として読み、JSX の空白の規則で字面を決め、{式} は初期の state(env)で評価した値にすれば決まる。
+    方法: 字面の組み立ては _compose_fixed_example.screen_text(固定文の例示値と同じ。空白の規則を二重に持たない)に任せる。
+      screen_text は範囲の先頭が開始タグでないと読まないので、先頭に空の断片 <> を足す。また {式} は式の評価を持たないので、
+      env で評価できる式は値を入れた文字列リテラルの式に置き換えて渡す(置き換えた値は最後に戻す)。評価できない式は {式} のまま残す(推測しない)。
+    None を返す条件: 先頭が文字でない・属性の行・範囲の外へ続く式・部品の要素を含む・範囲の終わりが文の途中(screen_text が決まらないとした)。
+    接続先: _src_fact(Label の文言)。"""
+    from _compose_fixed_example import screen_text, _consts, _expr
+    from _react_facts import _end, _tag_end
+    try:
+        text = Path(file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    lines = text.split("\n")
+    if not (1 <= start <= end <= len(lines)):
+        return None
+    offs = [0]
+    for ln in lines:
+        offs.append(offs[-1] + len(ln) + 1)
+    s, e = offs[start - 1], min(offs[end], len(text))
+    i = s
+    while i < e and text[i] in " \t\r\n":
+        i += 1
+    # 先頭が文字であること。開始タグ・式・閉じ括弧・属性の区切り等で始まる範囲は、従来の取り方(要素の文言・配列の行)に任せる
+    if i >= e or not re.match(r"[^\s<>{}()\[\];,=/&|?:]", text[i]):
+        return None
+    # WHY: 属性の行(title="…" など)は文言ではない。範囲の前の最後の開始タグが先頭より前に閉じていれば、先頭は子の位置にある
+    prev = None
+    for prev in re.finditer(r"<[A-Za-z]", text[:i]):
+        pass
+    if prev is None or _tag_end(text, prev.start()) >= i:
+        return None
+    consts = _consts(text)
+    out, subs, k = [], {}, i
+    while k < e:
+        c = text[k]
+        if c == "<":
+            te = _tag_end(text, k)
+            if te >= e:
+                out.append(text[k:e])  # 範囲の外へ続くタグは screen_text が読まない
+                break
+            out.append(text[k:te + 1])
+            k = te + 1
+        elif c == "{":
+            j = _end(text, k)
+            if j >= e:
+                return None
+            inner = text[k + 1:j].strip()
+            if _expr(inner, consts) is not None:
+                out.append(text[k:j + 1])  # 引用符の文字列・数値・const・コメントは screen_text が決める
+            else:
+                v = _text_value(inner, env)
+                tok = f"{_PH}{len(subs)}{_PH}"
+                subs[tok] = v if v is not None else "{" + inner + "}"
+                out.append('{"' + tok + '"}')
+            k = j + 1
+        else:
+            out.append(c)
+            k += 1
+    body = "<>" + "".join(out)
+    first = text.count("\n", 0, i) + 1
+    last = first + body.count("\n") - (1 if body.endswith("\n") else 0)
+    got = screen_text(text[:i] + body + text[e:], first, last)
+    if got is None or got[1] or not got[0]:
+        return None
+    t = got[0]
+    for tok, val in subs.items():
+        t = t.replace(tok, val)
+    return t
+
+
 def _is_array_use(r: dict) -> bool:
     """鎖が配列の使用箇所から来ているか（その行は配列の要素で、画面の文言ではない）。"""
     chain = r["visible_chain"]
@@ -268,7 +348,13 @@ def _src_fact(sl_item: dict, env: dict, elements: list):
     if not attr and kind in ("Button", "Link"):
         # WHY: ボタンの名前は画面に出る文言（JSX の label）。label が無いときは範囲の文言で取る
         text = next((str(el["label"]) for el in elements if el.get("label")), None)
-    if not attr and kind == "Label":
+    if kind == "Label" and not _is_array_use(r):
+        # WHY(run17 差5・差6): 範囲が要素の子の途中から始まる文(先頭が文字)は、範囲の最初の要素だけを読む下の取り方だと一部しか取れず
+        #   (IT63 は「空」1字)、範囲に要素が無いと属性の行とみなされて Blank になった(IT64)。範囲の文を JSX の空白の規則で読み、
+        #   {式} は初期の state で評価して全文を取る。常に出る固定文も、初期の state で決まる式の文も、事実から初期値を入れる。
+        #   attr(範囲に要素が無い)でも、子の位置の文なら取れる。属性の行・先頭が開始タグの範囲は _children_text が None を返して下の従来の取り方になる
+        text = _children_text(file, start, end, env)
+    if not attr and kind == "Label" and not text:
         # WHY(round14 R2): 固定文は、画面に出る字面(JSX の空白の規則)で取る。text_of_lines は改行の空白を空白1つにするので「こちらは POSが…」になり、
         #   画面と、合成が example に付ける字面(「こちらはPOSが…」)が1字違った。文字列リテラルだけで決まる文言だけここで取り、式を含む文言は下の評価器に任せる
         text = literal_screen_text(file, start, end)
@@ -724,6 +810,65 @@ def _selftest_initialization() -> int:
         cv = {i["item_name"]: i["initial_value"] for i in cut_got["items"]}
     if cv != {"前半で切る": "注記の前半", "要素全体": "注記の前半"}:
         print(f"[selftest NG] 範囲の後ろの行の文言が初期値に混ざる {cv}")
+        return 1
+    # 範囲が要素の子の途中の文から始まる形(先頭が文字)。常に出る固定文は全文、初期の state で決まる式を含む文は評価した文にする。
+    # WHY(run17 差5・差6): IT63「表の見方の注記」が範囲の最初の要素の「空」1字、IT64「現行画面との差の注記」が Blank になった。
+    #   JSX の空白の規則(式に接する改行の空白は無し)も確かめる(run14・15 は「あるのは 0店」と空白が入っていた)
+    mid_tsx = (
+        "export default function S() {\n"
+        "  const [shops, setShops] = useState([]);\n"
+        "  const [from, setFrom] = useState(todayJst());\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <div className=\"note\">\n"
+        "        <br />\n"
+        "        「<span className=\"tag-dead\">空</span>」= 非表示の項目。\n"
+        "        「<span className=\"tag-new\">新</span>」= 追加項目。\n"
+        "        マウスを乗せると出る。\n"
+        "        <br />\n"
+        "        現行との差: POSがあるのは\n"
+        "        {shops.length}店だけなので出す。{from}から。\n"
+        "      </div>\n"
+        "      <Card\n"
+        "        title=\"会計レポート\"\n"
+        "        subtitle=\"副題\"\n"
+        "      />\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n"
+    )
+    mid_drafts = [{"state_initials": [
+        {"state": "shops", "kind": "literal", "initial": "[]", "bound": []},
+        {"state": "from", "kind": "expression", "initial": "todayJst()", "bound": []},
+    ], "jsx_elements": [], "derived_arrays": []}]
+    with tempfile.TemporaryDirectory() as td:
+        mid_path = str(Path(td) / "M.tsx")
+        Path(mid_path).write_text(mid_tsx, encoding="utf-8")
+        ml = mid_tsx.split("\n")
+
+        def mrange(a: str, b: str) -> list:
+            sa = next(i for i, x in enumerate(ml, 1) if a in x)
+            sb = next(i for i, x in enumerate(ml, 1) if b in x and i >= sa)
+            return [{"file": mid_path, "line_start": sa, "line_end": sb}]
+
+        mid_screen = {"items": [
+            {"item_name": "表の見方", "item_type": "Label", "src": mrange("「<span className=\"tag-dead\">", "マウスを乗せると")},
+            {"item_name": "現行との差", "item_type": "Label", "src": mrange("現行との差:", "{shops.length}")},
+            # 範囲の終わりの次の行が {式} で続く(文の途中で切れた範囲)。字面が決まらないので Blank のまま(推測しない)
+            {"item_name": "文の途中", "item_type": "Label", "src": mrange("現行との差:", "現行との差:")},
+            # 属性の行は文言ではない。子の位置でないので従来どおり(属性の行は Blank)
+            {"item_name": "属性の行", "item_type": "Label", "src": mrange("title=\"会計レポート\"", "title=\"会計レポート\"")},
+        ]}
+        mid_got = build_initialization(events, mid_screen, [], mid_drafts)
+        mv = {i["item_name"]: i["initial_value"] for i in mid_got["items"]}
+    mid_want = {
+        "表の見方": "「空」= 非表示の項目。 「新」= 追加項目。 マウスを乗せると出る。",
+        "現行との差": "現行との差: POSがあるのは0店だけなので出す。{from}から。",  # shops.length は初期の [] で 0。todayJst() は決まらないので {from} のまま
+        "文の途中": "Blank",
+        "属性の行": "Blank",
+    }
+    if mv != mid_want:
+        print(f"[selftest NG] 子の途中から始まる文の初期値 {mv}")
         return 1
     print("[selftest OK] merge_partials.initialization")
     return 0

@@ -122,6 +122,33 @@ def _innermost(items, idxs, s):
     return out
 
 
+def _is_literal_item(it):
+    """画面項目 it の例示値が、出典 src の行範囲に書かれた文字列リテラルそのもの(title="会計レポート" の見出し・<h1>見出し</h1> など)なら True。
+    WHY(run17 差1): S1 が Card の見出し(IT15)と副題(IT16)に同じ src(Card 要素の全体 314-321)を付けたため、副題の使用行(318)が両方に当たり、
+    shop_name・reji_no・days が固定の見出し「会計レポート」(317)にも結ばれた。範囲は同じで入れ子にならず、_innermost では絞れない。
+    例示値が範囲内の文字列リテラルと一字一句同じ項目は、画面に出る字面が固定で応答の値を出さないので、写し先の候補から外す。
+    例示値が空・TSX でない出典・読めない出典は False(外さない。推測しない)。接続先: _candidates の b) 使用箇所の当たり。"""
+    ex = re.sub(r"\s+", " ", str(it.get("example") or "")).strip()
+    if not ex:
+        return False
+    quoted = re.compile(r"([\"'`])" + re.escape(ex) + r"\1")
+    in_text = re.compile(r">\s*" + re.escape(ex) + r"\s*<")
+    for r in it.get("src") or []:
+        if not isinstance(r, dict) or not r.get("file") or r.get("line_start") is None:
+            continue
+        if Path(r["file"]).suffix not in (".tsx", ".jsx"):
+            continue
+        try:
+            lines = Path(r["file"]).read_text(encoding="utf-8").split("\n")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # fallback-ok: 終了行が無い src は開始行だけの1行とみなす(行範囲は src が常に持つ想定)
+        body = "\n".join(lines[int(r["line_start"]) - 1:int(r.get("line_end") or r["line_start"])])
+        if quoted.search(body) or in_text.search(body):
+            return True
+    return False
+
+
 def _conds(chain):
     """表示条件の鎖から、条件の文字列を全部取る(caller_chains の中も)。"""
     for el in chain or []:
@@ -203,7 +230,10 @@ def _candidates(states, leaf, drafts, usage, items, derived, cache):
             for s in u.get("src") or []:
                 # WHY: 画面の見出し(format=固定文言)は応答の値を出さない。使用行が重なっても候補にしない
                 # (入れ物の判定の前に外す。見出しだけが内側のとき、入れ物まで候補から消えないようにする)
-                idxs = [i for i in _items_at(items, s) if items[i].get("format") != "固定文言"]
+                # WHY(run17 差1): format が固定文言でなくても、例示値が出典の範囲内の文字列リテラルそのものの項目(Card の title)は
+                # 固定文なので外す(_is_literal_item)。同じ範囲の副題の項目だけが残り、最も狭い一致(_innermost)で決まる
+                idxs = [i for i in _items_at(items, s)
+                        if items[i].get("format") != "固定文言" and not _is_literal_item(items[i])]
                 for i in _innermost(items, idxs, s):
                     hits.setdefault(i, None)
     for i in _spec_items(drafts, items, leaf):
@@ -774,6 +804,73 @@ def _selftest_calc_target():
     print("[selftest OK] _compose_mapping calc 出力先の保護(run15 差1)")
 
 
+def _selftest_fixed_title():
+    """run17 差1: 見出し(title="会計レポート")と副題(subtitle={…r.shop_name…})が同じ src(Card 要素の全体)を持つとき、
+    応答の欄(shop_name)の写し先は副題だけになる。(1) 候補が副題だけ・見出しへの行は足されない。(2) どちらも固定文でなければ、同じ範囲の両方が残る
+    (範囲が同じで決められないものは絞らない)。(3) 例示値が空・リテラルが範囲の外にあるときは固定文とみなさない。(4) 2回目は何も変えない。"""
+    import copy
+    import tempfile
+    src = ("export default function S() {\n"
+           "  return (\n"
+           "    <div>\n"
+           "      {rows.map((r, i) => (\n"
+           "        <Card\n"
+           "          key={r.shop_id}\n"
+           "          title=\"会計レポート\"\n"
+           "          subtitle={`${r.shop_name} / ${r.days}日`}\n"
+           "        />\n"
+           "      ))}\n"
+           "      <h2>別の見出し</h2>\n"
+           "    </div>\n"
+           "  );\n"
+           "}\n")
+    with tempfile.TemporaryDirectory() as td:
+        tsx = Path(td, "S.tsx")
+        tsx.write_text(src, encoding="utf-8")
+        f = str(tsx)
+        whole = [{"file": f, "line_start": 4, "line_end": 10}]
+        use = [{"file": f, "line_start": 8, "line_end": 8}]
+        title = {"item_name": "見出し", "screen_no": "3", "format": "-", "example": "会計レポート", "src": whole}
+        sub = {"item_name": "副題", "screen_no": "3", "format": "-", "example": "A店 / 15日", "src": copy.deepcopy(whole)}
+        assert _is_literal_item(title) and not _is_literal_item(sub)
+        assert not _is_literal_item(dict(title, example="")), "例示値が空なのに固定文とみなした"
+        assert not _is_literal_item(dict(title, example="別の見出し")), "リテラルが範囲の外なのに固定文とみなした"
+        assert _is_literal_item({"item_name": "h", "example": "別の見出し", "src": [{"file": f, "line_start": 11, "line_end": 11}]}), "<h2>…</h2> を固定文と認めない"
+        # (1) 見出し・副題の順(見出しが先)で、副題だけが候補
+        items = [title, sub]
+        got = _candidates({"rows"}, "shop_name", [], {"rows[].shop_name": [{"src": use}]}, items, [], {})
+        assert [i for i, _ in got] == [1], got
+        # (2) どちらも固定文でない同じ範囲は両方残る(例示値が字面のリテラルでないとき)
+        other = [dict(title, example="会計カード"), sub]
+        got = _candidates({"rows"}, "shop_name", [], {"rows[].shop_name": [{"src": use}]}, other, [], {})
+        assert [i for i, _ in got] == [0, 1], got
+        # fill の全体: モデルの行が無くても、副題だけに行が足される
+        draft = {"event_processes": [{"event_code": "EV1", "calls": [{"action": "get_rows"}]}],
+                 "failure_effects": [{"event": "EV1", "on_success": ["rows"], "on_success_from": {"rows": "rows"}}],
+                 "field_usage": [{"path": "rows[].shop_name", "uses": [{"element": "Card の subtitle", "src": use}]},
+                                 {"path": "rows[].days", "uses": [{"element": "Card の subtitle", "src": use}]}]}
+        Path(td, "S_react_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+        import _config_loader
+        orig = _config_loader.INTERMEDIATE_DIR
+        out = {"screen_layout": {"items": copy.deepcopy(items)},
+               "api_spec": [{"action": "get_rows", "response_to_screen_mapping": [
+                   {"api_field_path": "rows[].shop_name", "screen_item_name": "副題", "transform": "T1", "screen_no": "3"}],
+                   "response_items": [{"key": "rows[].shop_name"}, {"key": "rows[].days"}]}]}
+        try:
+            _config_loader.INTERMEDIATE_DIR = Path(td)
+            log = []
+            fill(out, log)
+            once = json.dumps(out, ensure_ascii=False, sort_keys=True)
+            log2 = []
+            fill(out, log2)
+            assert json.dumps(out, ensure_ascii=False, sort_keys=True) == once and log2 == [], log2
+        finally:
+            _config_loader.INTERMEDIATE_DIR = orig
+    got = [(m["api_field_path"], m["screen_item_name"]) for m in out["api_spec"][0]["response_to_screen_mapping"]]
+    assert got == [("rows[].shop_name", "副題"), ("rows[].days", "副題")], got
+    print("[selftest OK] _compose_mapping 固定の見出しを写し先にしない(run17 差1)")
+
+
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv:
@@ -781,6 +878,7 @@ if __name__ == "__main__":
         _selftest_w6()
         _selftest_calc_target()
         _selftest_count_rows()
+        _selftest_fixed_title()
     else:
         print("usage: _compose_mapping.py --selftest (fill は _units.compose から呼ばれる)")
         sys.exit(2)

@@ -13,6 +13,8 @@ d(_vs_common.load の戻り)の読み方は _vs_common の docstring。
   2. 行は _vs_common.warn(tag, where, msg) で作る(新しい検査は [WARN]。終了コードに影響しない)。
      例外: check_csv_column_name([CSV列名])・check_common_logic_dropped([共通ロジック漏れ]の sql_condition)・check_docstring_count_example([例示値の実数])・
      check_jsx_text_gap([JSXの空白])は、依頼で ERROR とされたため、このファイルの _error で [ERROR] の行を作る(終了コード 1)。
+     check_row_note_in_remarks([注記])も ERROR(合成 _compose_item_notes が足すので、合成の後に出るのは決められなかった項目だけ)。
+     check_total_composition([合計の構成])・check_same_src_items([src重複])は WARN(言い換え・同じ範囲が正しい場合があるため)。
      check_common_logic_dropped の sql_fragment(部品の定数)は WARN。
      行の書式は「[ERROR] [タグ] 場所: 内容 → 差し戻し先 S1」(差し戻し先は msg の末尾)。
   3. 関数を CHECKS に足す。
@@ -25,6 +27,9 @@ import re
 from pathlib import Path
 
 import _vs_common
+# WHY: 表の行の注記・属する行の決め方は合成(_compose_item_notes)と同じ関数を使う。合成と検査で決め方が食い違うと、合成が直した項目を検査が差し戻す
+import _compose_item_notes as _notes
+
 
 def _innermost_item(items, file, line):
     """行 line(file の中)を含む画面項目のうち、範囲が最も狭いものを返す。含むものが無ければ None。
@@ -789,13 +794,208 @@ def _selftest_jsx_text_gap() -> bool:
             and check_jsx_text_gap({"main": {}}) == [])
 
 
+# ---- run17 差1〜4: 表の行の注記・合計の構成・同じ src の画面項目 --------------------------------------------------
+def _src_text(sp) -> str:
+    """spec の出典(src の先頭)を「ファイル名:開始行-終了行」にする。指摘の文に載せる。呼出元: check_row_note_in_remarks。"""
+    s = (sp.get("src") or [{}])[0]
+    a, b = s.get("line_start"), s.get("line_end") or s.get("line_start")
+    return f"{Path(str(s.get('file') or '')).name}:{a}-{b}"
+
+
+def check_row_note_in_remarks(d) -> list:
+    """表の行(display_rows の spec)が持つ注記 note の字面が、その行に属する画面項目の備考に含まれるかを見る(ERROR・差し戻し先 S1)。
+    属する行の決め方と字面の比べ方は _compose_item_notes(合成が同じ関数で足す)。
+    WHY(run17 差2・差3): 注記は title 属性でマウスを乗せると出る文で、利用者が画面で読む字面。備考に書くかどうかを S1 に任せると毎回揺れ、
+    run17 は 8 行のうち 4 行(IT35・IT50・IT53・IT57)で原文が消えるか言い換えられた。言い換えは「この画面で括弧付きで出る」のように
+    意味が変わることがある(IT35。この画面は括弧を付けずに出す)。合成(_compose_item_notes)が注記の原文を備考へ足すので、
+    合成の後にこの行が出るのは、合成が決められなかった項目か、合成の後の処理が注記の字を変えたときだけ。
+    react 下書きに display_rows が無い・注記を持つ行が無いときは何も言わない。呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    rd, main = d.get("react_draft"), d.get("main")
+    if not rd or not main:
+        return []
+    items = [i for i in (main.get("screen_layout") or {}).get("items") or [] if isinstance(i, dict)]
+    out = []
+    for it, sp, note in _notes.noted_items(items, _notes.all_specs([rd])):
+        if _notes.contains(it.get("remarks"), note):
+            continue
+        out.append(_error(
+            "注記", f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})",
+            f"表の行「{sp.get('label')}」の注記「{note}」({_src_text(sp)}。マウスを乗せると出る文)の字面が備考に無い。"
+            f"言い換えず、備考に「注記: {note}」と書く → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_row_note_in_remarks() -> bool:
+    """check_row_note_in_remarks の正例・負例。合成 d で、備考に注記の字面があれば(記号の揺れがあっても)指摘なし、
+    無い・言い換えならば ERROR 1件ずつ。注記の無い行・行が決まらない項目・下書きの無い画面は何も言わない。呼出元: selftest。"""
+    f = "/x/Screen.tsx"
+    n_tax = "画面上は括弧付きの参考値だが、実データでは 小計（税込）= 小計（税抜）+ この額 が全行で成立する"
+
+    def d_with(rem_tax, rem_sum, rem_none="備考"):
+        return {
+            "main": {"screen_layout": {"items": [
+                {"no": "IT35", "item_name": "内税額", "remarks": rem_tax, "src": [{"file": f, "line_start": 57, "line_end": 58}]},
+                {"no": "IT50", "item_name": "支払科目に無い額", "remarks": rem_sum, "src": [{"file": f, "line_start": 76, "line_end": 77}]},
+                {"no": "IT23", "item_name": "小計", "remarks": rem_none, "src": [{"file": f, "line_start": 44, "line_end": 44}]},
+                {"no": "IT99", "item_name": "ふたつの行", "remarks": rem_none, "src": [{"file": f, "line_start": 57, "line_end": 77}]}]}},
+            "react_draft": {"display_rows": [{"array": "LEFT", "specs": [
+                {"label": "内税額", "note": n_tax, "src": [{"file": f, "line_start": 57, "line_end": 58}]},
+                {"label": "支払科目に無い額", "note": "税込売上 − 支払科目合計。2025-03-01 以降", "src": [{"file": f, "line_start": 76, "line_end": 77}]},
+                {"label": "小計", "note": None, "src": [{"file": f, "line_start": 44, "line_end": 44}]}]}]},
+        }
+    good = d_with("注記: " + n_tax, "計算式の説明。注記は「税込売上 - 支払科目合計。2025-03-01 以降」")
+    bad = d_with("括弧付きの参考値として表示されるが、実データでは小計が一致する", "小計から右の表の合計を引いた差額")
+    got = check_row_note_in_remarks(bad)
+    nodata = d_with("x", "y")
+    nodata["react_draft"] = {}
+    return (check_row_note_in_remarks(good) == [] and len(got) == 2
+            and got[0].startswith("[ERROR] [注記] screen_layout.items[IT35](内税額)") and "Screen.tsx:57-58" in got[0] and "差し戻し先 S1" in got[0]
+            and got[1].startswith("[ERROR] [注記] screen_layout.items[IT50]") and check_row_note_in_remarks(nodata) == [])
+
+
+def csv_parts(csv) -> list:
+    """CSV 見出しの名前の括弧の中が「A+B」(足し算の列挙)の形のとき、その部品の並び(例「合計1(売上+釣銭)」→ [売上, 釣銭])。無ければ []。
+    WHY: 括弧が「(現金計)」「(値引前)」のように1語だけの名前は、構成の列挙ではなく区分の名前なので見ない(部品が1つなら [] を返す)。
+    呼出元: check_total_composition。"""
+    m = re.search(r"[(（]([^()（）]*[+＋][^()（）]*)[)）]", str(csv or ""))
+    parts = [p.strip() for p in re.split(r"[+＋]", m.group(1)) if p.strip()] if m else []
+    return parts if len(parts) >= 2 else []
+
+
+def check_total_composition(d) -> list:
+    """合計の行の CSV 見出しが「合計1(売上+釣銭)」のように構成を列挙しているとき、備考がその構成より多くの列を挙げていないかを見る(WARN・差し戻し先 S1)。
+    備考が挙げる列 = 同じ表の他の行の label(正規化して3字以上。この行の label・csv 名・注記の字面に含まれるものは除く)のうち、備考に出るもの。
+    csv 名の部品(売上・釣銭)は、備考の地の文に出るか、備考が挙げた列の名前と包含関係(釣銭 ⊂ 釣銭準備金)で対になるかで1つずつ使い切る。
+    部品に対にならなかった列は、csv 名にも label にも注記にも無い構成要素。
+    WHY(run17 差4): IT40 合計(左)の備考「売上と釣銭準備金・売上回収金を合わせた合計」は、csv 名が示す構成「売上+釣銭」に無い売上回収金を足した。
+    csv 名の部品「売上」は「売上回収金」にも含まれるので、包含だけで対にすると見逃す。地の文の「売上」を先に部品へ使い切る。
+    WARN にする理由: 備考が「売上回収金は含まない」のように除外を書くと同じ形になる(誤検出)。構成の言い換えの正誤は機械では決められない。
+    構成の列挙が無い csv 名・csv 名が無い行は見ない(「小計5(現金計)」の構成は名前から決まらない)。呼出元: _vs_map.run(CHECKS)。"""
+    rd, main = d.get("react_draft"), d.get("main")
+    if not rd or not main:
+        return []
+    specs = _notes.all_specs([rd])
+    out = []
+    for it in (main.get("screen_layout") or {}).get("items") or []:
+        sp = _notes.own_spec(it, specs) if isinstance(it, dict) else None
+        parts = csv_parts((sp or {}).get("csv"))
+        if not parts:
+            continue
+        own = _notes.norm(sp.get("label"))
+        fixed = _notes.norm(f"{sp.get('csv')} {sp.get('note') or ''}")
+        raw = {}
+        for o in specs:
+            ln = _notes.norm(o.get("label"))
+            if len(ln) >= 3 and ln != own and ln not in fixed:
+                raw.setdefault(ln, o.get("label"))
+        rest = _notes.norm(it.get("remarks"))
+        mentioned = []
+        for ln in sorted(raw, key=lambda x: (-len(x), x)):
+            if ln in rest:
+                mentioned.append(ln)
+                rest = rest.replace(ln, "|")
+        left = [p for p in (_notes.norm(x) for x in parts) if p and p not in rest]
+        extra = []
+        for ln in mentioned:
+            hit = next((p for p in left if p in ln or ln in p), None)
+            if hit is None:
+                extra.append(raw[ln])
+            else:
+                left.remove(hit)
+        if extra:
+            out.append(_vs_common.warn(
+                "合計の構成", f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})",
+                f"備考が構成要素に挙げる「{'」「'.join(extra)}」が、CSV 見出し「{sp.get('csv')}」の構成({'+'.join(parts)})にも注記にも無い。"
+                f"構成は CSV 見出しの括弧の字面({'+'.join(parts)})だけで書く → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_total_composition() -> bool:
+    """check_total_composition の正例・負例。run17 の IT40(売上回収金を足した)は WARN、run15 の書き方(売上と釣銭準備金の合計)は指摘なし。
+    構成の列挙が無い csv 名・csv 名の無い行・下書きの無い画面は何も言わない。呼出元: selftest。"""
+    f = "/x/Screen.tsx"
+
+    def d_with(rem, csv="合計1(売上+釣銭)"):
+        return {
+            "main": {"screen_layout": {"items": [{"no": "IT40", "item_name": "合計", "remarks": rem, "src": [{"file": f, "line_start": 63, "line_end": 63}]}]}},
+            "react_draft": {"display_rows": [{"array": "LEFT", "specs": [
+                {"label": "小計（税込売上金額）", "csv": None, "src": [{"file": f, "line_start": 60, "line_end": 60}]},
+                {"label": "釣銭準備金", "csv": None, "src": [{"file": f, "line_start": 61, "line_end": 61}]},
+                {"label": "売上回収金", "csv": None, "src": [{"file": f, "line_start": 62, "line_end": 62}]},
+                {"label": "合計", "csv": csv, "src": [{"file": f, "line_start": 63, "line_end": 63}]}]}]},
+        }
+    bad = check_total_composition(d_with("左の表。売上と釣銭準備金・売上回収金を合わせた合計"))
+    ok_a = check_total_composition(d_with("左の表。売上と釣銭準備金の合計"))
+    ok_b = check_total_composition(d_with("左の表。小計（税込売上金額）と釣銭準備金の合計"))
+    ok_c = check_total_composition(d_with("左の表。売上と釣銭の合計"))
+    no_list = check_total_composition(d_with("左の表。売上と釣銭準備金・売上回収金を合わせた合計", csv="合計1(現金計)"))
+    no_csv = check_total_composition(d_with("左の表。売上と釣銭準備金・売上回収金を合わせた合計", csv=None))
+    nodata = d_with("x")
+    nodata["react_draft"] = {}
+    return (len(bad) == 1 and bad[0].startswith("[WARN] [合計の構成] screen_layout.items[IT40](合計)") and "「売上回収金」" in bad[0] and "釣銭準備金" not in bad[0]
+            and "差し戻し先 S1" in bad[0] and ok_a == [] and ok_b == [] and ok_c == [] and no_list == [] and no_csv == []
+            and check_total_composition(nodata) == [] and csv_parts("合計1(売上+釣銭)") == ["売上", "釣銭"] and csv_parts("小計5(現金計)") == []
+            and csv_parts("A（甲＋乙＋丙）") == ["甲", "乙", "丙"])
+
+
+def check_same_src_items(d) -> list:
+    """画面項目どうしで src(出典の行範囲の並び)が全く同じものを指摘する(WARN・差し戻し先 S1)。
+    WHY(run17 差1): IT15(会計カードの見出し)と IT16(店舗と期間)が、どちらも Card 要素の全体 314-321 を src にした。
+    run15 は見出し 317・副題 318 と分かれていた。同じ範囲を持つ項目が2つあると、画面の要素と項目の対応が行では決まらず、
+    合成の写し(_compose_mapping)が「応答の欄を使う行を src が覆う項目すべて」へ結ぶ(IT15 に店名・レジ・日数が誤って写った)。
+    各項目の src は、その項目の要素の行だけに絞る。同じ範囲が正しい場合(同じ1行に2つの項目を書く画面など)は、WARN なので見送れる。
+    src の無い項目は見ない。呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    main = d.get("main")
+    if not main:
+        return []
+    groups = {}
+    for it in (main.get("screen_layout") or {}).get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        key = tuple(sorted((str(s.get("file")), s.get("line_start"), s.get("line_end") or s.get("line_start"))
+                           for s in it.get("src") or [] if isinstance(s, dict) and s.get("line_start") is not None))
+        if key:
+            groups.setdefault(key, []).append(it)
+    out = []
+    for key, its in groups.items():
+        if len(its) < 2:
+            continue
+        spans = "・".join(f"{Path(f).name}:{a}-{b}" for f, a, b in key)
+        ids = "・".join(str(i.get("no") or i.get("item_name")) for i in its)
+        names = "・".join(str(i.get("item_name")) for i in its)
+        out.append(_vs_common.warn(
+            "src重複", f"screen_layout.items[{ids}]({names})",
+            f"{len(its)} 項目の src が同じ({spans})。同じ範囲の項目は、画面の要素との対応が行で決まらず、写し・初期値が取り違えられる。"
+            f"各項目の src を、その項目の要素の行だけに絞る → 差し戻し先 S1"))
+    return out
+
+
+def _selftest_same_src_items() -> bool:
+    """check_same_src_items の正例・負例。run17 の IT15・IT16(どちらも 314-321)は WARN 1件、行が重なるだけ(入れ子)で同じでない項目と
+    src の無い項目は指摘なし。呼出元: selftest。"""
+    f = "/x/Screen.tsx"
+    sp = lambda a, b: [{"file": f, "line_start": a, "line_end": b}]
+    items = [{"no": "IT15", "item_name": "会計カードの見出し", "src": sp(314, 321)},
+             {"no": "IT16", "item_name": "会計カードの店舗と期間", "src": sp(314, 321)},
+             {"no": "IT17", "item_name": "表", "src": sp(157, 159)},
+             {"no": "IT18", "item_name": "表の一部", "src": sp(158, 158)},
+             {"no": "IT19", "item_name": "src なし", "src": []},
+             {"no": "IT20", "item_name": "src なし2"}]
+    got = check_same_src_items({"main": {"screen_layout": {"items": items}}})
+    ok = check_same_src_items({"main": {"screen_layout": {"items": items[2:]}}})
+    return (len(got) == 1 and got[0].startswith("[WARN] [src重複] screen_layout.items[IT15・IT16](会計カードの見出し・会計カードの店舗と期間)")
+            and "Screen.tsx:314-321" in got[0] and "差し戻し先 S1" in got[0] and ok == [] and check_same_src_items({}) == [])
+
+
 # 検査の本体(check(d) -> list[str])。後で1検査ずつ足す
 CHECKS: list = [check_mapping_target, check_mapping_missing, check_transform_zero_fill, check_response_display_name,
-                check_csv_column_name, check_common_logic_dropped, check_front_logic_dropped, check_docstring_count_example, check_jsx_text_gap]
+                check_csv_column_name, check_common_logic_dropped, check_front_logic_dropped, check_docstring_count_example, check_jsx_text_gap,
+                check_row_note_in_remarks, check_total_composition, check_same_src_items]
 # 検査の自己テスト(引数なし・bool を返す)
 SELFTESTS: list = [_selftest_mapping_target, _selftest_mapping_missing, _selftest_transform_zero_fill,
                    _selftest_response_display_name, _selftest_csv_column_name, _selftest_common_logic_dropped,
-                   _selftest_front_logic_dropped, _selftest_docstring_count_example, _selftest_jsx_text_gap]
+                   _selftest_front_logic_dropped, _selftest_docstring_count_example, _selftest_jsx_text_gap,
+                   _selftest_row_note_in_remarks, _selftest_total_composition, _selftest_same_src_items]
 
 
 def run(inter_dir, feature) -> list:
