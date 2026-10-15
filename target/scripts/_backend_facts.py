@@ -26,7 +26,9 @@ extract_backend_draft.py の下書きに、SQL の集計(SUM/COUNT/MIN/MAX/AVG/a
 ponytail: 括弧は位置で閉じを探すだけ。文字列の中の括弧は _mask で消してある前提。HAVING と ORDER BY の中の集計は見ない。
 """
 import ast
+import io
 import re
+import tokenize
 from pathlib import Path
 
 # 集計の関数名。count(*) のような引数も括弧の中をそのまま arg に入れる
@@ -318,6 +320,32 @@ def common_errors(mods, tables):
                 continue
             # 入口(表を引く関数)の最上位の try だけ。入れ子の try(個別の処理の中)は共通ではない
             out += [_handler_fact(mod, h) for t in f.body if isinstance(t, ast.Try) for h in t.handlers]
+    return out
+
+
+_DOC_TERM = re.compile(r"([々぀-ヿ㐀-鿿]{2,12})(?:[（(]([A-Za-z_]\w*)[）)]|\s*[:：]\s*([A-Za-z_]\w*))")
+
+
+def docstring_terms(mods):
+    """backend の docstring・モジュール定数の文字列・# コメントから「語(列名)」「語:列名」の対を {物理列名: [語,...]} で返す(P17)。
+    WHY: 列名だけでは業務の語が取れない列(id・cnt など)に、コメントや docstring が付けた日本語の語を機械で渡すため。
+    呼出元: extract_backend_draft.extract()(下書きの最上位 docstring_terms)。mods は Module の並び。対の形は _DOC_TERM が読む。
+    ponytail: 同じ列に出る語は重複を除いて出現順に並べる。語は 2〜12 字の連続した日本語に限る。"""
+    out = {}
+    for mod in mods:
+        texts = [ast.get_docstring(mod.tree) or ""]
+        texts += [ast.get_docstring(f) or "" for f in mod.funcs.values()]
+        texts += [v for v in mod.consts.values() if isinstance(v, str)]
+        try:
+            src = Path(mod.path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            src = ""
+        texts += [tok.string.lstrip("#") for tok in tokenize.generate_tokens(io.StringIO(src).readline) if tok.type == tokenize.COMMENT]
+        for text in texts:
+            for m in _DOC_TERM.finditer(text):
+                terms = out.setdefault(m.group(2) or m.group(3), [])
+                if m.group(1) not in terms:
+                    terms.append(m.group(1))
     return out
 
 

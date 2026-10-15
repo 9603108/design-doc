@@ -1580,6 +1580,9 @@ def selftest():
     assert check_cl_csv_format(v7_cl, [{"formats_numbers": False}, {"formats_numbers": True}]) == [], "整形する CSV が1つでもあれば読み飛ばす"
     ok_cl = [{"no": "CL9", "expression": "画面の表示は3桁区切りで整形する。CSVの合計行は2行以上のときだけ足す"}]
     assert check_cl_csv_format(ok_cl, [{"formats_numbers": False}]) == [], "文を分けた書き分けを拾った"
+    # 追加の照合(_vs_*.py)の自己テスト。WHY: 検査は4つのモジュールに足すので、ここは入口の selftest を1回呼ぶだけにする
+    import _vs_checks_ext
+    assert _vs_checks_ext.selftest(), "_vs_checks_ext.selftest が False"
     print("selftest OK")
     return 0
 
@@ -1656,6 +1659,9 @@ def main(argv=None):
     # W11: 例示値の行数の矛盾・書式を落とした transform(ERROR)。display_rows が無い下書きでは何も言わない
     w11_problems = (check_row_count_example(items, disp_rows) + check_transform_format(data.get("api_spec"), items, disp_rows)) if disp_rows else []
     all_lines = problems + kind_problems + type_problems + fetch_problems + bound_problems + fact_problems + new_problems + front_problems + state_problems + csv_format_problems + w11_problems
+    # WHY: 追加の照合(写し・例示値・手順・DB。_vs_*.py)は [WARN] だけを返すので、終了コードの判定(下)に混ぜても変わらない
+    import _vs_checks_ext
+    all_lines += _vs_checks_ext.run_all(INTERMEDIATE_DIR, feat)
     for p in all_lines:
         print(p)
     fact_errors = [p for p in fact_problems if not p.startswith("[WARN]")]

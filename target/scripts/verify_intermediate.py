@@ -1471,8 +1471,11 @@ def _fixed_for_item(s: dict, literal: list) -> list:
     spans = [x for x in ([srcs] if isinstance(srcs, dict) else srcs) if isinstance(x, dict) and x.get("line_start")]
     if not spans:
         return named
+    # WHY(P20): 名前が一致しない文字だけの要素（ボタンの文言など）も、項目の出典の行と重なれば同じ位置の固定文として結ぶ。
+    #      名前の一致だけで結ぶと、見える固定文のボタン文言の Blank を取りこぼすため。名前の一致する要素も、位置が重なるときだけ残る（named は literal の部分集合）。
+    #      呼出元 = check_initialization_items の (c)。
     out = []
-    for el in named:
+    for el in literal:
         els = el.get("src") or []
         for es in ([els] if isinstance(els, dict) else els):
             if isinstance(es, dict) and any(_same_place(es, sp) for sp in spans):
@@ -1510,6 +1513,8 @@ def check_initialization_items(merged: dict, drafts: list = None) -> list:
     env = build_env([si for d in drafts for si in d.get("state_initials") or [] if isinstance(si, dict)],
                     [da for d in drafts for da in d.get("derived_arrays") or [] if isinstance(da, dict)])
     literal = literal_text_elements(drafts)
+    # P20: ボタンの文言（tag が button で label を持つ要素）も固定文の候補に入れる。literal_text_elements は label を持つ要素を外すため、ここで足す
+    literal = literal + [el for d in drafts for el in d.get("jsx_elements") or [] if isinstance(el, dict) and el.get("tag") == "button" and str(el.get("label") or "").strip()]
     # WHY(2026-10-14 run12): 見えるかは項目の位置（画面項目の並び）で持つ。名前の集合で持つと、同じ名前の別の項目
     #      （Card の中の隠れた印「空」と、凡例の「空」）の一方が見えるだけで、隠れた方まで Blank を ERROR にした。
     visible_fixed_pos = set()
@@ -1810,6 +1815,24 @@ def _selftest() -> int:
     two_msgs = [m for _, m in check_initialization_items(two_bad, lit_pos) if "固定文" in m]
     if not (len(two_msgs) == 1 and "items[2]" in two_msgs[0] and "→ 差し戻し先 S1" in two_msgs[0]):
         print(f"[selftest NG] 見える凡例の Blank だけを固定文の ERROR にしない: {two_msgs}")
+        return 1
+    # P20: 名前が一致しないボタンの文言も、項目の出典の行が重なれば固定文として結ぶ（出典の行が重ならなければ結ばない）
+    btn_src = {"file": "/x/S.tsx", "line_start": 20, "line_end": 20}
+    lit_btn = [{"text": "保存する", "visible_chain": [], "src": [btn_src]}]
+    btn_item = {"initialization": {"items": [{"no": 1, "item_name": "保存ボタン", "active": "活性", "visible": "表示", "initial_value": "Blank"}]},
+                "screen_layout": {"items": [{"item_name": "保存ボタン", "item_type": "Button", "src": [btn_src]}]}}
+    if not any("固定文" in m for _, m in check_initialization_items(btn_item, [{"jsx_elements": lit_btn}])):
+        print("[selftest NG] 出典の行が重なるボタンの文言の Blank を固定文の ERROR にしない")
+        return 1
+    btn_far = {"initialization": btn_item["initialization"],
+               "screen_layout": {"items": [{"item_name": "保存ボタン", "item_type": "Button", "src": [{"file": "/x/S.tsx", "line_start": 30, "line_end": 30}]}]}}
+    if any("固定文" in m for _, m in check_initialization_items(btn_far, [{"jsx_elements": lit_btn}])):
+        print("[selftest NG] 出典の行が重ならないボタンの文言を固定文として結んだ")
+        return 1
+    # P20: 下書きのボタン（tag button・label が文言）も、出典の行が重なれば固定文として結ぶ
+    btn_el = [{"tag": "button", "label": "保存する", "visible_chain": [], "src": [btn_src]}]
+    if not any("固定文" in m for _, m in check_initialization_items(btn_item, [{"jsx_elements": btn_el}])):
+        print("[selftest NG] 下書きのボタン(label)の Blank を固定文の ERROR にしない")
         return 1
     # src が無い項目は従来どおり名前で結ぶ(凡例の「空」が初期表示で見える → ERROR)
     no_src = {"initialization": pos_init["initialization"],

@@ -49,6 +49,8 @@ from pathlib import Path
 from _backend_facts import features as _features, merge_features as _merge_features, response_fields as _response_fields
 # 境界値・共通エラーの事実(F2)
 from _backend_facts import boundaries as _boundaries, common_errors as _common_errors, enclosing_if as _enclosing_if
+# 語(列名)・語:列名 の対(P17)。下書きの最上位 docstring_terms に入れる
+from _backend_facts import docstring_terms as _docstring_terms
 
 # FROM / JOIN の直後の別名として読んではいけない語
 _KW = {"WHERE", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN", "ON", "GROUP", "ORDER", "LIMIT",
@@ -1326,7 +1328,9 @@ def extract(files, hints=None):
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
         e["id"] = ids.setdefault(e.get("text_expanded") or e["message"], f"MSE{len(ids) + 1:05d}")
     return {"apis": apis, "unresolved": unresolved, "auth": auth, "logic_candidates": _logic_candidates([x for x in mods.values() if x is not None]),
-            "common_errors": _error_origins(_common_errors([x for x in mods.values() if x is not None], tables))}
+            "common_errors": _error_origins(_common_errors([x for x in mods.values() if x is not None], tables)),
+            # P17: 列名ごとの「語(列名)」の対。論理名の候補とは別の材料として持つ
+            "docstring_terms": _docstring_terms([x for x in mods.values() if x is not None])}
 
 
 def selftest():
@@ -1532,6 +1536,11 @@ def selftest():
         eps = extract([Path(d) / "o.py"])["apis"]["act"]["error_patterns"]
         assert [e["text_expanded"] for e in eps] == ["店舗が違う", "to は必須", "from は必須", "直接"], eps
         assert [e["id"] for e in eps] == ["MSE00001", "MSE00002", "MSE00003", "MSE00004"], eps
+    # P17: docstring・# コメントの「語(列名)」「語:列名」を列名ごとの語にする(同じ列の語は重複を除く)
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "m.py").write_text('"""店番号(mise_no) の表。"""\n# 件数: cnt\n# 店舗番号(mise_no) も見る\n', encoding="utf-8")
+        dterms = extract([Path(d) / "m.py"])["docstring_terms"]
+    assert dterms == {"mise_no": ["店番号", "店舗番号"], "cnt": ["件数"]}, dterms
     print("[selftest OK] extract_backend_draft")
     return 0
 
