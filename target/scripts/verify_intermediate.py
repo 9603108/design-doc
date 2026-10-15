@@ -1282,7 +1282,9 @@ def check_message_code_format(merged: dict) -> list:
 #          同じ ID に別の文面が付く不整合・DB 操作の結合/条件/集計/並び順の英語キーの空欄を止める。
 # 接続情報: 入力 = merged（中間 JSON 全体）/ 出力 = [(level, message), ...] / 呼出元 = main()
 MESSAGE_ID_STRICT_RE = re.compile(r"^MS[EWI]\d{5}$")
-BRACE_HOLE_RE = re.compile(r"\{[^{}\s]+\}")  # 空白を含まない {名前} だけを穴とみなす（JSON 風の記述を誤検出しない）
+# WHY(2026-10-16 run20): 正規表現の量指定 {4}・{1,3}・{2,} は穴ではない。例示値や説明に書いた `\d{4}` の {4} を穴と誤検出し after を止めたため、
+#   先読み (?!\d+(?:,\d*)?\}) で数字だけの波括弧を外す。{名前}・{n1} のように数字以外を含むものは従来どおり穴。
+BRACE_HOLE_RE = re.compile(r"\{(?!\d+(?:,\d*)?\})[^{}\s]+\}")  # 空白を含まない {名前} だけを穴とみなす（JSON 風の記述・量指定を誤検出しない）
 # 応答の形を書く欄(api_spec[].response_pattern・backend_processes[].response_spec.pattern)は、応答の JSON の形で書く。
 # 「成功時 {success: true, data: {rows}}」の {rows} は data の値の置き方(キー名)で、実行時に決まる穴ではない。
 # WHY: 値の位置(「: {名前}」)と、内側に「:」のある波括弧({k: v} の形)だけ JSON の形として外す。それ以外は従来どおり穴。
@@ -2005,6 +2007,14 @@ def _selftest() -> int:
                 "api_spec": [{"description": "{件数} 件を返す"}]}
     if sum("未展開の穴" in m for _, m in check_intermediate_strict(msg_back)) != 2:
         print("[selftest NG] messages_backend・他の欄の {名前} を穴として見逃した")
+        return 1
+    # run20: 正規表現の量指定 {4}・{1,3}・{2,} は穴にしない。{名前} は穴のまま
+    quant = {"api_spec": [{"description": "日付は \\d{4}-\\d{1,2}-\\d{2,} の形"}]}
+    if any("未展開の穴" in m for _, m in check_intermediate_strict(quant)):
+        print("[selftest NG] 正規表現の量指定 {数字} を未展開の穴にした")
+        return 1
+    if not any("未展開の穴" in m for _, m in check_intermediate_strict({"api_spec": [{"description": "\\d{4} と {件数}"}]})):
+        print("[selftest NG] 量指定と並んだ {名前} の穴を見逃した")
         return 1
     if not check_event_action({"events": [{"no": "EV1", "action": ""}]}):
         print("[selftest NG] 動作語の空が出ない")
