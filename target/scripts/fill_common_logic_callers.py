@@ -26,6 +26,8 @@ runs_on が「ブラウザ」の CL は、src の関数・定数を TSX で使�
 起点のイベント)から呼出元の FR を引く(_front_callers。react 下書き <機能名>_react_draft.json を読む)。
   出典の項目が「旗: true」(dead: true 等)を持ち、描画側が旗で項目を落とす条件(showDead || !s.dead)を持つときは、
   その条件の state を変えるイベント(空欄項目の表示切替)も呼出元に入れる(round14 R3。dead の項目の計算は条件が真のときだけ走る)。
+  関数の呼出が、表示用の state(showDead 等)を参照する描画の中にあるときも、その state を変えるイベントを呼出元に入れる
+  (2026-10-15 run16。基準は検査 _vs_flow.check_cl_rerender と同じ。描画に使わず送信時に読むだけの入力欄の state は足さない)。
 WHY: 候補が無くても、定数や補助関数の参照で BE を絞れる。候補と行が重ならない共通ロジックで「全部足す」に
 倒れると、別の BE まで呼出元に入る(run10 の CL4・CL5 は BE1 が誤って入っていた)。
 WHY: サーバー・DB で動くロジックは、呼ぶ FR が呼ぶ BE の中で動くため、呼出元の鎖として BE も示す。
@@ -417,6 +419,94 @@ def _jsx_use_names(lines, n, comp):
     return names
 
 
+_RE_HEADER_END = re.compile(r"(?:\)|=>)\s*(?::\s*[^{=]+)?[{(]?\s*$")
+
+
+def _header_end(lines, b):
+    """直下のブロック b(宣言の行範囲)の見出し(function Card({ ... }: { ... }) { の引数と型の部分)が終わる行(1始まり)を返す。
+    見出しの終わりは、ブロックの先頭から40行までで、行末が `) {`・`=> {`・`=> (` の最初の行。見つからなければ先頭の行。
+    WHY(2026-10-15 run16): コンポーネントの引数の宣言(`showDead,` `showDead: boolean;`)は state の参照ではない。
+    これを参照に数えると、見出しの直後の8行以内にある関数の呼出が、描画に使わない props の state まで拾ってしまう。"""
+    for k in range(b["start"] - 1, min(b["end"], b["start"] + 40)):
+        if _RE_HEADER_END.search(lines[k]):
+            return k + 1
+    return b["start"]
+
+
+def _fed_props(lines, comp, names):
+    """コンポーネント comp を描く JSX の要素(`<comp` の行から最初の `/>` まで。15行を上限)で、names のどれかを含む式を渡している属性名の集合。
+    例: `<Card agg={aggs[i]} showDead={show} />` で names が {show} なら {showDead}。呼出元: _render_ref_states。"""
+    rx = re.compile(r"(?<![A-Za-z0-9_$.])(?:" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")(?![A-Za-z0-9_$])")
+    out = set()
+    for i, ln in enumerate(lines):
+        if not re.search(r"<\s*" + re.escape(comp) + r"(?![A-Za-z0-9_$])", ln):
+            continue
+        block = " ".join(lines[i:i + 15])
+        end = block.find("/>")
+        for m in re.finditer(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\{([^{}]*)\}", block if end < 0 else block[:end]):
+            if rx.search(m.group(2)):
+                out.add(m.group(1))
+    return out
+
+
+def _render_ref_states(lines, f, names, own_lines, states, blocks):
+    """CL の関数(names)の呼出が、その state を参照する描画の中にある state の名前の集合。
+    _vs_flow.check_cl_rerender の「走る条件」と同じ基準(読み方の関数は _vs_flow のものを使う):
+      (1) 呼出行が、その state の参照行(宣言・setter の行・コンポーネントの引数の宣言を除く)の直後 8 行以内にある
+          (フィルタ条件の state の下で関数を呼ぶ形。例: `.filter((s) => showDead || !s.dead).map((s) => num(...))`)
+      (2) 呼出を囲むコンポーネントが、その state(か、そこから作った値)を属性で渡され、その属性を本体で使っている
+    クリックで走る関数(handler)の中の呼出は、再描画で走らないので数えない。
+    WHY(2026-10-15 run16): _front_callers は取得で置き換わる state(rows)しか依存に足さず、表示用の state(showDead)を変える FR(空欄項目の
+    表示切替)が num()・fmt() の呼出元から抜けた。検査(check_cl_rerender)は同じ呼出を「showDead の変化による再描画でも走る」と指摘していた。
+    WHY: (2) で「属性を本体で使っている」を求めるのは、props に渡すだけで描画に使わない state(入力欄の state)を足さないため。
+    入力欄だけの state(描画に使わず送信時に読むもの)は、(1)(2)のどちらにも当たらない。"""
+    from _vs_flow import _derived_names, _enclosing_component, _in_event_handler
+
+    calls = []
+    for n, ln in enumerate(lines, 1):
+        if n in own_lines or not any(re.search(r"(?<![\w$.])" + re.escape(nm) + r"\s*\(", ln) for nm in names):
+            continue
+        if not _in_event_handler(lines, n):
+            calls.append(n)
+    if not calls:
+        return set()
+    # WHY: 引数の宣言を持つのは function の宣言とコンポーネント(先頭が大文字の const)だけ。`const rows = list.filter(...)` のような
+    # 直下の値の宣言は見出しを持たず、行末が `)` の最初の行までを見出しと取り違えると、フィルタの行(参照)まで除いてしまう。
+    heads = [(b["start"], _header_end(lines, b)) for b in blocks
+             if b["name"] and (_RE_TOP_FUNC.match(lines[b["start"] - 1]) or b["name"][:1].isupper())]
+    out = set()
+    # WHY(2026-10-15 run16): 宣言の行は、どの state の宣言の行も参照に数えない(検査の decl_lines と同じ)。自分の宣言だけを除くと、
+    # `useState({ from: todayJst() })` のようにオブジェクトのキー(from)が別の state(from)の名前と同じ行で、todayJst() の呼出が
+    # 「from を参照する描画の中」と取り違えられ、日付の入力欄の FR(集計開始日の入力)が呼出元に入った。
+    decl = set()
+    for info in states.values():
+        for sp in info.get("src") or []:  # fallback-ok: 宣言の出典が無い state は宣言行を除けない(参照に数えるだけ)
+            if _same_file(sp.get("file"), f):
+                decl.update(range(sp.get("line_start", 0), sp.get("line_end", 0) + 1))  # fallback-ok: 行欠けは範囲が空
+    for st, info in states.items():
+        setter = info.get("setter")
+        word = re.compile(r"(?<![\w$.])" + re.escape(st) + r"(?![\w$])")
+        refs = [n for n, ln in enumerate(lines, 1)
+                if word.search(ln) and n not in decl
+                and not (setter and re.search(r"\b" + re.escape(setter) + r"\b", ln))
+                and not any(a <= n <= e for a, e in heads)]
+        if any(r <= c <= r + 8 for r in refs for c in calls):
+            out.add(st)
+            continue
+        dn = _derived_names(lines, {st})
+        for c in calls:
+            comp = _enclosing_component(lines, c)
+            if not comp:
+                continue
+            props = _fed_props(lines, comp, dn)
+            for b in blocks:
+                if b["name"] == comp and any(_word_in(p, ln) for p in props for ln in lines[_header_end(lines, b):b["end"]]):
+                    out.add(st)
+            if st in out:
+                break
+    return out
+
+
 def _front_callers(cl, data, react_draft, idx, cache=None):
     """ブラウザで動く CL の呼出元の FR の ID を返す(新しく足せるものだけでなく、辿れた全部。重複の除去は呼出側)。
     1. CL の src の行にあるモジュール直下の宣言(function / const)と useMemo の変数を defs にする
@@ -533,6 +623,13 @@ def _front_callers(cl, data, react_draft, idx, cache=None):
                     if blk and blk[0]["name"] not in done:
                         # 別の直下の関数・定数の中で使われる(補助関数の連鎖)。コンポーネントなら参照先が無く止まる
                         todo.append(blk[0]["name"])
+        # WHY(2026-10-15 run16): 関数(num・fmt)の呼出が、表示用の state(showDead)を参照する描画の中にあるなら、その state の変化で
+        # 呼出が走り直す(空欄項目が増え、num・fmt が初めて走る)。その state も依存に入れ、下の 4. で変える FR を呼出元にする。
+        # 基準は検査(_vs_flow.check_cl_rerender)と同じ。取得で置き換わる state だけを足していた上の render_states の判定を、表示用の state へ広げる。
+        # 入力欄だけの state(描画に使わず送信時に読むもの)は _render_ref_states が足さない。
+        own_lines = {n for b in blocks if b["name"] in defs for n in range(b["start"], b["end"] + 1)}
+        own_lines |= {n for m in memo_list if m["name"] in defs for n in range(m["start"], m["end"] + 1)}
+        dep_states |= _render_ref_states(lines, f, defs, own_lines, states, blocks)
         # WHY(round14 R3): 出典の項目が「旗: true」(例: dead: true)を持ち、描画側が `showDead || !s.dead` のように旗で項目を
         # 落としているなら、その項目の計算(calc)は表示の条件の state が真のときだけ描かれる(走る)。条件の state は
         # 依存の state に入れ、下の 4. でその state を変えるイベント(例: 「空欄項目も表示」のチェック)を呼出元にする。
@@ -911,6 +1008,109 @@ def _selftest_front_render():
         fill(data, pn, [], {}, rd)
         assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before
     print("[selftest OK] fill_common_logic_callers front render")
+    _selftest_front_state()
+
+
+def _selftest_front_state():
+    """run16: 描画の中で走る関数(num)の呼出が、表示用の state(showDead)を参照する描画の中にあるなら、その state を変える FR も呼出元にする。
+    props に渡すだけで本体で使わない state(hide)・クリックの handler の中だけで読む state(note)を変える FR は足さない。
+    コンポーネントの外(フィルタの直後の呼出)でも、検査と同じく直後 8 行以内なら足す。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tsx = Path(tmp) / "Page.tsx"
+        tsx.write_text("\n".join([
+            "const num = (v: unknown) => Number(v);",                           # 1
+            "",                                                                 # 2
+            "function Card({",                                                  # 3
+            "  agg,",                                                           # 4
+            "  showDead,",                                                      # 5
+            "  hide,",                                                          # 6
+            "}: {",                                                             # 7
+            "  agg: Agg;",                                                      # 8
+            "  showDead: boolean;",                                             # 9
+            "  hide: boolean;",                                                 # 10
+            "}) {",                                                             # 11
+            "  const render = (specs: Spec[]) =>",                              # 12
+            "    specs",                                                        # 13
+            "      .filter((s) => showDead || !s.dead)",                        # 14
+            "      .map((s) => num(agg[s.kin!]));",                             # 15
+            "  return <td>{render(SPECS)}</td>;",                               # 16
+            "}",                                                                # 17
+            "",                                                                 # 18
+            "export default function Page() {",                                 # 19
+            "  const [showDead, setShowDead] = useState(false);",               # 20
+            "  const [hide, setHide] = useState(false);",                       # 21
+            "  const [note, setNote] = useState(\"\");",                        # 22
+            "  const exportCsv = () => {",                                      # 23
+            "    const v = num(note);",                                         # 24
+            "    return v;",                                                    # 25
+            "  };",                                                             # 26
+            "  return (",                                                       # 27
+            "    <main>",                                                       # 28
+            "      <Card agg={a} showDead={showDead} hide={hide} />",           # 29
+            "      <button onClick={exportCsv} />",                             # 30
+            "    </main>",                                                      # 31
+            "  );",                                                             # 32
+            "}",                                                                # 33
+        ]) + "\n", encoding="utf-8")
+        f = str(tsx)
+
+        def ev(code, line, handler):
+            return {"event_code": code, "source": {"handler": handler}, "src": [{"file": f, "line_start": line, "line_end": line}]}
+        rd = {
+            "state_initials": [
+                {"state": "showDead", "setter": "setShowDead", "src": [{"file": f, "line_start": 20, "line_end": 20}]},
+                {"state": "hide", "setter": "setHide", "src": [{"file": f, "line_start": 21, "line_end": 21}]},
+                {"state": "note", "setter": "setNote", "src": [{"file": f, "line_start": 22, "line_end": 22}]}],
+            "events": [ev("EV10", 40, "(e) => setShowDead(e.target.checked)"), ev("EV11", 41, "(e) => setHide(e.target.checked)"),
+                       ev("EV12", 42, "(e) => setNote(e.target.value)")],
+        }
+        data = {
+            "events": [{"no": c, "event_code": c} for c in ("EV10", "EV11", "EV12")],
+            "front_processes": [{"process_id": "FR1", "name": "表示切替", "steps": []}, {"process_id": "FR2", "name": "隠す", "steps": []},
+                                {"process_id": "FR3", "name": "メモ", "steps": []}],
+            "backend_processes": [],
+            "common_logic": [{"name": "NUM", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": f, "line_start": 1, "line_end": 1}]}],
+        }
+        pn = {"EV10": "表示切替", "EV11": "隠す", "EV12": "メモ"}
+        fill(data, pn, [], {}, rd)
+        got = data["common_logic"][0]["used_by_processes_ids"]
+        # showDead(filter の下で num を呼ぶ描画)を変える FR1 だけ。hide は Card の引数に渡すだけ・note は handler の中だけ
+        assert got == ["FR1"], got
+        # 冪等
+        before = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        fill(data, pn, [], {}, rd)
+        assert json.dumps(data, ensure_ascii=False, sort_keys=True) == before
+        # コンポーネントの外: フィルタの直後 8 行以内の呼出(検査の selftest と同じ形)
+        t2 = Path(tmp) / "Flat.tsx"
+        t2.write_text("\n".join([
+            "const conv = (v: unknown) => Number(v);",                          # 1
+            "const [showDead, setShowDead] = useState(false);",                 # 2
+            "const [from, setFrom] = useState(\"\");",                          # 3
+            "const [applied, setApplied] = useState({ from: conv(0) });",       # 4
+            "const rows = list.filter((s) => showDead || !s.dead)",             # 5
+            "  .map((s) => conv(s.v));",                                        # 6
+        ]) + "\n", encoding="utf-8")
+        g = str(t2)
+        # from は別の state(applied)の宣言の行にキー名として出る。その行の conv(0) を「from を参照する描画の中」と取り違えない
+        rd2 = {
+            "state_initials": [{"state": "showDead", "setter": "setShowDead", "src": [{"file": g, "line_start": 2, "line_end": 2}]},
+                               {"state": "from", "setter": "setFrom", "src": [{"file": g, "line_start": 3, "line_end": 3}]},
+                               {"state": "applied", "setter": "setApplied", "src": [{"file": g, "line_start": 4, "line_end": 4}]}],
+            "events": [{"event_code": "EV10", "source": {"handler": "(e) => setShowDead(e.target.checked)"},
+                        "src": [{"file": g, "line_start": 9, "line_end": 9}]},
+                       {"event_code": "EV11", "source": {"handler": "(e) => setFrom(e.target.value)"},
+                        "src": [{"file": g, "line_start": 10, "line_end": 10}]}],
+        }
+        data2 = {
+            "events": [{"no": "EV10", "event_code": "EV10"}, {"no": "EV11", "event_code": "EV11"}],
+            "front_processes": [{"process_id": "FR1", "name": "表示切替", "steps": []}, {"process_id": "FR2", "name": "開始日", "steps": []}],
+            "backend_processes": [],
+            "common_logic": [{"name": "CONV", "used_in": [], "runs_on": "ブラウザ", "src": [{"file": g, "line_start": 1, "line_end": 1}]}],
+        }
+        fill(data2, {"EV10": "表示切替", "EV11": "開始日"}, [], {}, rd2)
+        assert data2["common_logic"][0]["used_by_processes_ids"] == ["FR1"], data2["common_logic"][0]
+    print("[selftest OK] fill_common_logic_callers front state")
 
 
 def main():
