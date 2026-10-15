@@ -175,6 +175,74 @@ def literal_screen_text(file, line_start, line_end):
     return got[0]
 
 
+def fixed_segments(text, line_start, line_end):
+    """TSX の行範囲が描く画面の文の、固定文の並び(決まらない式・段落の要素・<br /> で区切った断片。強調・コード等のインライン要素では区切らない)。
+    範囲の先頭が JSX の開始タグでなければ None。決まらない式は穴として断片を区切るだけで、値は問わない。
+    WHY(2026-10-15 run18): screen_text は「強調要素(<strong>見出し</strong>)で始まり、後ろに文字が続く範囲」を、見出しか本文かが決まらないとして
+    返さない(例示値を触らないための慎重さ)。メッセージの本文は逆で、src の範囲の画面の文を全部写すのが正解なので、見出しも「：」も含めた
+    固定文そのものが要る(MSW00001 の「取込欠損の疑い：」が本文から落ちたのを、verify_vs_source が捕まえるための断片)。
+    呼出元: verify_vs_source.check_messages(_msg_fulltext)。"""
+    from _react_facts import _end, _tag_end
+    lines = text.split("\n")
+    if not (1 <= line_start <= line_end <= len(lines)):
+        return None
+    chunk = "\n".join(lines[line_start - 1:line_end])
+    chunk = re.sub(r"\{\s*/\*.*?\*/\s*\}", "", chunk, flags=re.S)
+    if not re.match(r"\s*<(?:[A-Za-z]|>)", chunk):
+        return None
+    consts = _consts(text)
+    segs, nodes, buf = [], [], []
+    depth, closed_top, i = 0, False, 0
+
+    def flush_buf():
+        if buf:
+            nodes.append(html.unescape(_jsx_clean("".join(buf))))
+            buf.clear()
+
+    def cut():
+        flush_buf()
+        seg = "".join(nodes)
+        nodes.clear()
+        if seg.strip():
+            segs.append(re.sub(r"\s+", " ", seg).strip())
+
+    while i < len(chunk):
+        c = chunk[i]
+        try:
+            if c == "<" and re.match(r"<(?:[A-Za-z/]|>)", chunk[i:i + 2]):
+                te = _tag_end(chunk, i)
+                m = _TAG.match(chunk, i)
+                closing, name = m.group(1) == "/", m.group(2) or ""
+                flush_buf()
+                if name == "br" or (name and (name[0].isupper() or "." in name)) or (name and name not in _INLINE):
+                    cut()
+                selfclose = chunk[te - 1:te] == "/"
+                if closing:
+                    depth -= 1
+                elif not selfclose:
+                    depth += 1
+                closed_top = depth <= 0
+                i = te + 1
+                continue
+            if c == "{":
+                j = _end(chunk, i)
+                v = _expr(chunk[i + 1:j], consts)
+                if v is None:
+                    cut()
+                else:
+                    buf.append(v)
+                i = j + 1
+                continue
+        except (ValueError, IndexError):
+            break  # 範囲の外へ続く括弧・タグは読まない
+        if closed_top and c in ");,}]":
+            break  # 最初の要素が閉じた後の閉じ括弧・セミコロンは JSX の文ではなくコード
+        buf.append(c)
+        i += 1
+    cut()
+    return segs
+
+
 def _tsx_src(item):
     """項目の src のうち TSX/JSX の1件(file・line_start・line_end)。TSX の src が1件でなければ None(どの範囲か決められない)。"""
     srcs = item.get("src") or []

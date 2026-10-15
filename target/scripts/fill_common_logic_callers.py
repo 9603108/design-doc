@@ -112,7 +112,8 @@ def build_index(data, pnames):
                 be_by_key[k] = [bid] + [f for f in callers_of_be.get(bid, []) if f != bid]
     return {"fr_by_id": fr_by_id, "be_ids": be_ids, "fr_by_name": fr_by_name,
             "ev_to_name": ev_to_name, "be_by_key": be_by_key,
-            "be_action": be_action, "be_name": be_name, "bid_by_action": bid_by_action}
+            "be_action": be_action, "be_name": be_name, "bid_by_action": bid_by_action,
+            "callers_of_be": callers_of_be}
 
 
 def resolve(tok, idx):
@@ -155,6 +156,30 @@ def _keys_of_common(cl, cands):
             keys.append(("name", c["name"]))
         if c.get("text"):
             keys.append(("text", c["text"]))
+    return keys
+
+
+def _const_text_keys(cl, mod_cache):
+    """共通ロジックの出典の行に重なる、python のモジュール直下の `名前 = "文字列"` の文字列(空白を除いて12字以上)を、BE の本文を探す手掛かり(text)にする。
+    WHY(2026-10-15 run18 差2): queries_pos.py の LIVE(有効な行の条件)は list_pos_account_report が名前で使い、list_pos_shops は同じ式を
+    SQL に直書きしている(:164)。名前の参照(_module_reach)では直書きの BE を拾えないので、定数の文字列そのものが BE の本文に在るかで引く。
+    辞書・リストの要素(_GROUPS の "p.mise_no" など、どの SQL にも出る短い断片)は取らない: 直下の代入で値が文字列そのものの定数だけにする。"""
+    keys = []
+    for c in cl.get("src") or []:
+        f = c.get("file") or ""  # fallback-ok: file が無い出典は読めないので飛ばす
+        if not f.endswith(".py") or not os.path.isfile(f):
+            continue
+        if ("tree", f) not in mod_cache:
+            try:
+                mod_cache[("tree", f)] = ast.parse(Path(f).read_text(encoding="utf-8"), filename=f)
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                mod_cache[("tree", f)] = None
+        tree = mod_cache[("tree", f)]
+        for st in (tree.body if tree else []):
+            if not (isinstance(st, ast.Assign) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)):
+                continue
+            if st.lineno <= c.get("line_end", 0) and c.get("line_start", 0) <= st.end_lineno and len(_squash(st.value.value)) >= 12:  # fallback-ok: 行番号が欠けた出典は 0 で比べ、どの文とも重ならない
+                keys.append(("text", st.value.value))
     return keys
 
 
@@ -755,6 +780,24 @@ def fill(data, pnames, log, draft=None, react_draft=None):
                         fallback_used = True
             if fallback_used:
                 log.append(f"[WARN] common_logic「{cl.get('name')}」は下書きの候補と行が重ならず、呼ぶ BE を絞れない(FR の BE を全部足す)")
+            # WHY(2026-10-15 run18 差2): 上の鎖は S1 の used_in が結んだ FR から BE へ辿るだけで、その FR 以外が呼ぶ BE や、別の BE が
+            # 同じ条件を使う(queries_pos.py の CL2 は list_pos_account_report の LIVE と list_pos_shops の直書き)ことを拾えなかった。
+            # 全 BE を、この CL の出典を使うと判る場合(上の(a)(b)か、CL の出典の行が BE のソース範囲の中にある)だけ足す。
+            # 判らないときの「全部足す」退避はここでは使わない(別の BE まで入る誤りを増やさない)。
+            gkeys = keys + _const_text_keys(cl, mod_cache)
+            for bid in sorted(idx["be_ids"], key=lambda b: (len(b), b)):
+                if bid in resolved:
+                    continue
+                action = idx["be_action"].get(bid)
+                brange = (apis.get(action) or {}).get("src")  # fallback-ok: action が無い BE は範囲なし(重なりなしと扱う)
+                if (gkeys and _be_fits(bid, gkeys, idx, apis, cache)) or _overlaps(cl.get("src"), brange) \
+                        or _module_reach(cl, bid, idx, apis, mod_cache) is True:
+                    resolved.append(bid)
+            # WHY(run18 差2): CL を使う BE は、その BE を呼ぶ FR も呼出元。S1 の used_in が一部の FR の名前しか書かなくても、
+            # BE の呼出元(FR の steps の backend_call)と同じ集合を機械で入れる(検査 verify_intermediate.check_cl_callers_cover_be が照合する)
+            for rid in list(resolved):
+                if rid in idx["be_ids"]:
+                    resolved.extend(f for f in idx["callers_of_be"].get(rid, []) if f not in resolved)
         for rid in resolved:
             if rid not in ids:
                 ids.append(rid)
@@ -773,9 +816,15 @@ def selftest():
         be2.write_text('def list_report(p):\n    return sql(COND_B2 + " AND t.c>0")\nCOND_B2 = "t.b IS NULL"\n', encoding="utf-8")
         # 候補が無い形: CONST_X は list_x だけが参照する定数、list_y は参照しない
         be3.write_text('def list_x(p):\n    return sql(CONST_X)\nCONST_X = "t.q = 1"\ndef list_y(p):\n    return sql("t.r = 2")\n', encoding="utf-8")
+        # run18 差2: 定数 COND_LIVE を名前で使う list_a と、同じ式を直書きする list_b
+        be5 = t / "be5.py"
+        be5.write_text('COND_LIVE = "t.superseded_by IS NULL AND t.x = 1"\ndef list_a(p):\n    return sql(COND_LIVE)\n'
+                       'def list_b(p):\n    return sql("SELECT 1 WHERE t.superseded_by IS NULL AND  t.x = 1")\n', encoding="utf-8")
         # 下書き: BE1・BE2 の行範囲と、共通ロジックの候補(名前あり・名前なし・出典の行が無いもの)
         draft = {
             "apis": {
+                "list_a": {"src": [{"file": str(be5), "line_start": 2, "line_end": 3}]},
+                "list_b": {"src": [{"file": str(be5), "line_start": 4, "line_end": 5}]},
                 "list_shops": {"src": [{"file": str(be1), "line_start": 1, "line_end": 3}]},
                 "list_report": {"src": [{"file": str(be2), "line_start": 1, "line_end": 3}]},
                 "list_x": {"src": [{"file": str(be3), "line_start": 1, "line_end": 2}]},
@@ -793,12 +842,16 @@ def selftest():
                 {"process_id": "FR1", "name": "初期表示", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE1"}}]},
                 {"process_id": "FR2", "name": "集計", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE2"}}]},
                 {"process_id": "FR3", "name": "別の画面", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE3"}}, {"kind": "backend_call", "backend_call": {"backend_id": "BE4"}}]},
+                {"process_id": "FR4", "name": "一覧A", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE5"}}]},
+                {"process_id": "FR5", "name": "一覧B", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE6"}}]},
             ],
             "backend_processes": [
                 {"process_id": "BE1", "name": "店舗一覧", "endpoint": {"action": "list_shops"}},
                 {"process_id": "BE2", "name": "集計処理", "endpoint": {"action": "list_report"}},
                 {"process_id": "BE3", "name": "別画面A", "endpoint": {"action": "list_x"}},
                 {"process_id": "BE4", "name": "別画面B", "endpoint": {"action": "list_y"}},
+                {"process_id": "BE5", "name": "一覧処理A", "endpoint": {"action": "list_a"}},
+                {"process_id": "BE6", "name": "一覧処理B", "endpoint": {"action": "list_b"}},
             ],
             "common_logic": [
                 {"name": "A", "used_in": ["EV1", "初期表示"], "runs_on": "ブラウザ"},
@@ -822,6 +875,15 @@ def selftest():
                 # 候補と行が重ならない(絞れない → 従来どおり全部足して WARN)
                 {"name": "CL_D", "used_in": ["集計"], "runs_on": "データベース",
                  "src": [{"file": str(t / "none.py"), "line_start": 1, "line_end": 1}]},
+                # run18 差2: used_in は FR1 だけだが、条件(COND_B2)を使う BE2 と、BE2 を呼ぶ FR2 も呼出元に入る(BE1 は使わない)
+                {"name": "CL_G", "used_in": ["初期表示"], "runs_on": "データベース",
+                 "src": [{"file": str(be2), "line_start": 3, "line_end": 3}]},
+                # run18 差2: 名前で使う BE5(list_a)と、同じ式を直書きする BE6(list_b)の両方と、それぞれを呼ぶ FR4・FR5 が入る
+                {"name": "CL_J", "used_in": [], "runs_on": "データベース",
+                 "src": [{"file": str(be5), "line_start": 1, "line_end": 1}]},
+                # run18 差2: 候補も used_in も無くても、出典の行が BE4(list_y)のソース範囲の中なら、BE4 と BE4 を呼ぶ FR3 が入る
+                {"name": "CL_I", "used_in": [], "runs_on": "データベース",
+                 "src": [{"file": str(be3), "line_start": 5, "line_end": 5}]},
             ],
         }
         pn = {"EV00": "初期表示", "EV01": "集計"}
@@ -842,6 +904,9 @@ def selftest():
         assert cl["CL_D"]["used_by_processes_ids"] == ["FR2", "BE2"], cl["CL_D"]
         assert cl["CL_E"]["used_by_processes_ids"] == ["FR3", "BE3"], cl["CL_E"]
         assert not any("CL_E" in m or "別の画面" in m for m in log), log
+        assert cl["CL_G"]["used_by_processes_ids"] == ["FR1", "BE2", "FR2"], cl["CL_G"]
+        assert cl["CL_I"]["used_by_processes_ids"] == ["BE4", "FR3"], cl["CL_I"]
+        assert cl["CL_J"]["used_by_processes_ids"] == ["BE5", "BE6", "FR4", "FR5"], cl["CL_J"]
         # WARN: C は結べない語(1件)。B・E は src が無く BE を足さない(各1件)。CL_D は候補と行が重ならず絞れない(1件)。
         # round(clwarn): ブラウザの CL で src が無い A・F は画面の呼出元を引けない WARN(各1件)。計6件
         assert len(log) == 6, log

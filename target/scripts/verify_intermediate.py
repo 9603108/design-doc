@@ -1746,7 +1746,42 @@ def check_common_logic_callers(merged: dict) -> list:
         if not (cl.get("used_by_processes_ids") or []):
             no = cl.get("no") or cl.get("logic_id") or "?"
             issues.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): used_by_processes_ids が空（呼出元の FR・BE を結ぶ）"))
+    issues.extend(_check_cl_covers_be_callers(merged))
     return issues
+
+
+def _check_cl_covers_be_callers(merged: dict) -> list:
+    """run18 差2: サーバー・データベースで動く CL の呼出元の FR は、その CL を使う BE の呼出元の FR を全部含む(CL の呼出元の FR ⊇ BE の呼出元の FR)。
+
+    WHY: DB の共通ロジック(BE が使う SQL 条件)の呼出元が S1 の used_in の FR だけだと、同じ BE を呼ぶ他の FR(初期表示・店舗の変更・表示)が抜け、
+         BE の called_by_front と JSON の中で食い違う(run18 の CL1〜CL3 は FR1・FR3・FR6 が抜けた)。BE の呼出元は backend_processes[].called_by_front と、
+         FR の steps の backend_call の両方から取る。差し戻し先は S1(呼出元の根拠は used_in)。fill_common_logic_callers.py が機械で足すので、
+         ここで出るのは、足す前の JSON か、BE が結ばれていない CL。
+    接続情報: 入力 = merged['common_logic'] / ['backend_processes'] / ['front_processes'] / 出力 = [(level, message), ...] / 呼出元 = check_common_logic_callers"""
+    callers = {}
+    for bp in merged.get("backend_processes") or []:
+        bid = bp.get("process_id")
+        if bid:
+            callers.setdefault(bid, set()).update(f for f in (bp.get("called_by_front") or []) if isinstance(f, str))
+    for fp in merged.get("front_processes") or []:
+        fid = fp.get("process_id") or fp.get("no")
+        for s in fp.get("steps") or []:
+            bid = (s.get("backend_call") or {}).get("backend_id") if isinstance(s, dict) else None
+            if fid and bid:
+                callers.setdefault(bid, set()).add(fid)
+    out = []
+    for cl in merged.get("common_logic") or []:
+        ro = cl.get("runs_on") or cl.get("runtime_location") or ""  # fallback-ok: 動作場所が無い CL は対象外(fill_common_logic_callers と同じ判定)
+        if "サーバー" not in ro and "データベース" not in ro:
+            continue
+        ids = set(cl.get("used_by_processes_ids") or [])
+        for bid in sorted(i for i in ids if i in callers):
+            lack = sorted(callers[bid] - ids)
+            if lack:
+                no = cl.get("no") or cl.get("logic_id") or "?"
+                out.append(("ERROR", f"common_logic[{no}]({cl.get('name') or ''}): 呼出元に {'・'.join(lack)} が無い"
+                                     f"(使う {bid} の呼出元の FR。CL の呼出元の FR は BE の呼出元の FR を全部含む) → 差し戻し先 S1"))
+    return out
 
 
 def _selftest() -> int:
@@ -1882,6 +1917,20 @@ def _selftest() -> int:
         return 1
     if not check_common_logic_callers({"common_logic": [{"no": "CL1", "used_by_processes_ids": []}]}):
         print("[selftest NG] 呼出元の空が出ない")
+        return 1
+    # run18 差2: DB の CL の呼出元の FR ⊇ CL を使う BE の呼出元の FR。足りなければ ERROR(S1)、揃えば出ない。ブラウザの CL・BE を含まない CL は見ない
+    cl_be = {"backend_processes": [{"process_id": "BE2", "called_by_front": ["FR1", "FR2"]}],
+             "front_processes": [{"process_id": "FR3", "steps": [{"kind": "backend_call", "backend_call": {"backend_id": "BE2"}}]}],
+             "common_logic": [{"no": "CL1", "name": "条件", "runs_on": "データベース", "used_by_processes_ids": ["FR2", "BE2"]}]}
+    got_cl = [m for lv, m in check_common_logic_callers(cl_be) if lv == "ERROR"]
+    if len(got_cl) != 1 or "FR1・FR3" not in got_cl[0] or "S1" not in got_cl[0]:
+        print(f"[selftest NG] CL の呼出元が BE の呼出元の FR を欠く ERROR が出ない: {got_cl}")
+        return 1
+    cl_be["common_logic"][0]["used_by_processes_ids"] = ["FR1", "FR2", "FR3", "BE2"]
+    cl_be["common_logic"].append({"no": "CL2", "runs_on": "ブラウザ", "used_by_processes_ids": ["FR2", "BE2"]})
+    cl_be["common_logic"].append({"no": "CL3", "runs_on": "データベース", "used_by_processes_ids": ["FR2"]})
+    if check_common_logic_callers(cl_be):
+        print(f"[selftest NG] 揃った呼出元・ブラウザの CL・BE を結ばない CL で ERROR が出た: {check_common_logic_callers(cl_be)}")
         return 1
     # B16 差異6 (2026-10-14): 初期表示の活性・表示を出典の TSX の行から再評価する。
     # 記載が評価と違えば ERROR、評価が決まらない・TSX が無い項目は見ない（INFO のみ）

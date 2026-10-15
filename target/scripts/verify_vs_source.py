@@ -20,6 +20,7 @@ LLM が書いた文言・例示値が、ソース(Python / TSX)の文字列に�
   例: python3 target/scripts/verify_vs_source.py <機能名>
 """
 import ast
+import html
 import json
 import re
 import sys
@@ -371,6 +372,52 @@ def _in_source(text, strings):
     return any("{_}" in s and len("".join(s.split("{_}")).strip()) >= 2 and re.search("(?:.+?)".join(re.escape(p) for p in s.split("{_}")), text) for s in lits)
 
 
+def _msg_fulltext(data):
+    """messages[] の message が、src の範囲(TSX/JSX で、範囲の先頭が開始タグ)の画面の文の固定文を全部含むか。欠けは ERROR(差し戻し先 H4)。
+    WHY(2026-10-15 run18): 従来の文言照合(_in_source)は「message がソースの文字列に含まれるか」なので、本文の頭の見出し(強調要素の
+    「取込欠損の疑い」と区切りの「：」)が落ちた部分文字列も通った(MSW00001)。画面の文は src の範囲に全部ある事実なので、範囲の全文の側から
+    message を照らし、見出し・前後の固定文の欠けを捕まえる。空白は画面でも見えないので全部除いて比べる。
+    決まらない式({…})で断片が分かれるため、断片ごとに message(の穴の前後を含めた全体)に入るかを見る。範囲の先頭が開始タグでない src
+    (属性の行・コードの行・py の raise)は照らさない。"""
+    from _compose_fixed_example import fixed_segments
+
+    def sq(s):
+        return "".join(html.unescape(s).split())
+
+    def has_text(seg):
+        return re.search(r"[0-9A-Za-z぀-ヿ㐀-鿿]", seg) is not None
+
+    out, cache = [], {}
+    for m in data.get("messages") or []:
+        if not isinstance(m, dict) or not m.get("message"):
+            continue
+        srcs = m.get("src") or []
+        if isinstance(srcs, dict):
+            srcs = [srcs]
+        body = sq(str(m["message"]))
+        for s in srcs:
+            f = str((s or {}).get("file") or "")  # fallback-ok: file が無い src は読めないので下の拡張子判定で飛ばす
+            if not f.endswith((".tsx", ".jsx")):
+                continue
+            if f not in cache:
+                try:
+                    cache[f] = Path(f).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    cache[f] = None
+            if cache[f] is None:
+                continue
+            a = s.get("line_start")
+            b = s.get("line_end") or a  # fallback-ok: 終了行が無い src は開始行だけの1行
+            if not isinstance(a, int) or not isinstance(b, int):
+                continue
+            segs = fixed_segments(cache[f], a, b)
+            missing = [g for g in (segs or []) if has_text(g) and sq(g) not in body]
+            if missing:
+                out.append(f"[ERROR] [文言] messages[{m.get('message_id')}]: 画面の文(src {Path(f).name}:{a}-{b})の「{missing[0][:40]}」が本文に無い(見出し・区切りの「：」・前後の固定文を落とさず全文を写す) → 差し戻し先 H4")
+                break
+    return out
+
+
 def check_messages(data, strings):
     """messages[]/messages_backend[] の message と、event_processes[].details の「…」の画面文言が、ソースに実在するか。"""
     problems = []
@@ -385,6 +432,7 @@ def check_messages(data, strings):
             t = str(m.get("message") or "") if isinstance(m, dict) else ""
             if t[:1] and t[:1] in "：:、。 　":
                 problems.append(f"[ERROR] [文言] {key}[{m.get('message_id')}]: 本文が記号「{t[:1]}」で始まる。強調要素の文言を先頭に付けるか記号を除く → 差し戻し先 H4")
+    problems += _msg_fulltext(data)
     for ep in data.get("event_processes") or []:
         for line in ep.get("details") or []:
             for q in re.findall(r"「([^」]+)」", line) if isinstance(line, str) else []:
@@ -1728,6 +1776,34 @@ def selftest():
               "messages_backend": [{"message_id": "MSE00002", "message": "正しい本文", "code": "MSE00002"}]}
     errs = [g for g in check_messages(bad_mb, set()) if g.startswith("[ERROR]")]
     assert len(errs) == 1 and "H4" in errs[0] and "messages[MSW00001]" in errs[0], errs
+    # T22(run18): メッセージ本文を src の範囲の画面の全文と照らす。見出し(強調要素)・区切りの「：」・前後の固定文の欠けは ERROR(H4)、全文は通す
+    with tempfile.TemporaryDirectory() as d22:
+        tp = Path(d22, "W.tsx")
+        tp.write_text("\n".join([
+            "export default function W() {",                                                  # 1
+            "  return (",                                                                     # 2
+            '    <div className="warn-note">',                                                # 3
+            "      <strong>取込欠損の疑い</strong>：この期間に、取込の不具合があります。",     # 4
+            "      該当日の金額は小さくなっています（§6.4）。",                                # 5
+            "      <ul>{rows.map((r) => <li>{r.n}</li>)}</ul>",                               # 6
+            "    </div>",                                                                     # 7
+            '    <div className="m">この期間のデータはありません。{n}件</div>',               # 8
+            "  );",                                                                           # 9
+            "}",                                                                              # 10
+        ]) + "\n", encoding="utf-8")
+        sr = [{"file": str(tp), "line_start": 4, "line_end": 5}]
+        full = "取込欠損の疑い：この期間に、取込の不具合があります。 該当日の金額は小さくなっています（§6.4）。"
+        assert [g for g in _msg_fulltext({"messages": [{"message_id": "MSW00001", "message": full, "src": sr}]})] == [], "全文を誤検出"
+        for lost in (full.replace("取込欠損の疑い：", ""), full.replace("該当日の金額は小さくなっています（§6.4）。", ""), full.replace("：", "")):
+            got = _msg_fulltext({"messages": [{"message_id": "MSW00001", "message": lost, "src": sr}]})
+            assert len(got) == 1 and got[0].startswith("[ERROR] [文言]") and "H4" in got[0], (lost, got)
+        # 式({n})で断片が分かれても、固定文が全部あれば通る。範囲の先頭が開始タグでない src(コード・py)は照らさない
+        s8 = [{"file": str(tp), "line_start": 8, "line_end": 8}]
+        assert _msg_fulltext({"messages": [{"message_id": "MSI00001", "message": "この期間のデータはありません。{n}件", "src": s8}]}) == []
+        assert len(_msg_fulltext({"messages": [{"message_id": "MSI00001", "message": "この期間のデータ", "src": s8}]})) == 1
+        s1 = [{"file": str(tp), "line_start": 1, "line_end": 2}]
+        assert _msg_fulltext({"messages": [{"message_id": "MSE1", "message": "何でも", "src": s1}]}) == []
+        assert _msg_fulltext({"messages": [{"message_id": "MSE1", "message": "何でも"}]}) == []
     # T18: 値が無いときを 0 と書いた備考は、num() 等を通らないオペランドを持つ式だけ ERROR
     cg = [{"id": "CC11", "label": "差引額", "expr": "r.a - r.b", "operands": ["a", "b"], "funcs": [], "literals": [],
            "operand_labels": {"a": ["売上"], "b": ["返品"]}, "operand_guard": {"a": "num", "b": "none"}}]
