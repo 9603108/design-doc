@@ -1052,6 +1052,7 @@ def check_enum_mentions(data, react_draft):
     """列挙型の引数(react 下書きの select の options)の選択肢を、API の説明が一部だけ書いているものを ERROR にする(B15 c)。
     WHY: 「店舗別のときは…」だけ書くと、残りの選択肢(レジ別)の扱いが読み手に伝わらない。全部並べるか、既定値を添える。
     対: 選択肢の表示名の括弧書きを除いた語(「レジ別（現行と同じ）」→「レジ別」)。一部だけ現れ、既定の語が無いときだけ ERROR。
+    全選択肢を書いた引数の行(request_params)があれば通す(第19回。description は30字以内で全部は書けない。合成 _compose_enum_description が足す)。
     呼出元: main(react 下書きがあるとき)。"""
     problems = []
     for el in (react_draft or {}).get("jsx_elements") or []:
@@ -1062,6 +1063,15 @@ def check_enum_mentions(data, react_draft):
         for a in data.get("api_spec") or []:
             d = str(a.get("description") or "")
             found = [o for o in opts if o in d]
+            # WHY(2026-10-15 run16): API の description は30字以内(verify_partials.check_s2_overview)で、選択肢と既定値を全部は書けない。
+            # 選択肢の全部を、その引数の行(request_params の name・description・validation・default)が書いていれば、description が
+            # 片方だけを書いても読み手に残りの扱いは伝わる。S2 に description を30字に収めたまま全部並べさせると毎回差し戻されたので、
+            # 全部を書いた引数の行があるときは通す(合成 _compose_enum_description がその引数の行へ全選択肢と既定値を足す)。
+            vals = [str(o.get("value")) for o in el.get("options") or [] if isinstance(o, dict) and o.get("value") not in ("", None)]
+            if any(all(t in pt for t in opts) or (vals and all(len(v) >= 3 and v in pt for v in vals))
+                   for pt in (" ".join(str(p.get(k) or "") for k in ("name", "description", "validation", "default"))
+                              for p in a.get("request_params") or [] if isinstance(p, dict))):
+                continue
             if found and len(found) < len(opts) and not _DEFAULT_WORDS.search(d):
                 # WHY(2026-10-15 run15): 末尾が「→ 全部並べるか既定値を添える(差し戻し先 S2)」で、[ERROR] の印も「→ 差し戻し先 X」の形も無く、
                 # run_units.parse_sendbacks が拾えず after の差し戻しが「unknown: ERROR 0 件の INFO 行」になった。他の ERROR 行と同じ形にする
@@ -1201,6 +1211,7 @@ def check_row_count_example(items, display_rows):
     """画面項目の example・remarks が書く「N行」が、「空欄項目(dead)を除く」と言いながら除かない行数になっていないかを見る(新1。ERROR)。
     下書きの display_rows ごとに、全行数 T(specs の数)と dead を除いた行数 L を取る。文(「。」と改行で切る)ごとに「N行」を拾い、
     N が T のどれかに一致し L のどれにも一致しないとき、同じ文に「除く・除いた・除き」があれば ERROR(例 左段22行（空欄項目を除く）)。
+    ただし同じ文に L の数(正しい行数)も書いてあれば通す(第19回。「22行(空欄項目を除くと14行)」は全行数と既定の行数を並べた正しい書き方)。
     WHY: S1 は表の行数に dead の行を含めたまま「空欄項目を除く」と書く(run12 の IT17)。dead は画面で隠れるので読み手は除いた数だと読む。
     呼出元: main(display_rows のある下書きがあるとき)。差し戻し先は S1(例示値は S1 が書く)。dead の欄が無い spec は dead でないとみなす。"""
     ts, ls = [], []
@@ -1220,7 +1231,13 @@ def check_row_count_example(items, display_rows):
             for sent in re.split(r"[。\n]", str(it.get(k) or "")):
                 if not _EXCLUDE_WORDS.search(sent):
                     continue
-                bad += [n for n in dict.fromkeys(int(x) for x in _ROW_COUNT.findall(sent)) if n in ts and n not in ls and n not in bad]
+                nums = list(dict.fromkeys(int(x) for x in _ROW_COUNT.findall(sent)))
+                # WHY(2026-10-15 run16): 同じ文に dead を除いた正しい行数(L)も書いてあれば、全行数(T)は「オンのときの数」として並べたもので、
+                # 食い違いではない(「22行(空欄項目を除くと14行)」「既定(空欄項目を除く)は14行で、オンにすると全項目の22行」)。
+                # 以前はこの形も ERROR にし、S1 の手順書が「でよい」と書く形と食い違って毎回差し戻された。正しい行数の無い文だけを見る。
+                if any(n in ls for n in nums):
+                    continue
+                bad += [n for n in nums if n in ts and n not in ls and n not in bad]
         # WHY: 1項目に1行(左段・右段の2つの数が同じ誤りでも指摘は1件。差し戻しの数を増やさない)
         if bad:
             problems.append(f"[ERROR] [例示値] screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')}): 例示値の {'・'.join(f'{n}行' for n in bad)} は空欄項目を含む行数(除くと {'・'.join(str(x) for x in dict.fromkeys(ls))}行) → 差し戻し先 S1")
@@ -1282,6 +1299,10 @@ def selftest():
     assert check_row_count_example(w11_it("1行目", "2行以上のとき表示する。1行目を除く"), w11_rows) == [], "T・L に一致しない数は見ない"
     assert check_row_count_example(w11_it("左段14行（空欄項目を除く）"), w11_rows) == [], "L に一致する数は通す"
     assert check_row_count_example(w11_it("左段22行（空欄項目を除く）"), []) == [] and check_row_count_example([], w11_rows) == []
+    # 第19回: 同じ文に dead を除いた正しい行数(14行)があれば、全行数(22行)はオンのときの数として並べたもの。通す
+    assert check_row_count_example(w11_it("22行(空欄項目を除くと14行)"), w11_rows) == [], "正しい行数を併記した文を ERROR にした"
+    assert check_row_count_example(w11_it("14行(空欄項目を表示すると22行)", "既定(空欄項目を除く)は14行で、オンにすると全項目の22行になる"), w11_rows) == [], "既定の行数を書いた文を ERROR にした"
+    assert len(check_row_count_example(w11_it("22行(空欄項目を除く)", "既定は14行"), w11_rows)) == 1, "正しい行数が別の文にあるだけの誤りを通した"
     w11_map = [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].k0", "screen_item_name": "総売上", "transform": "そのまま表示"}]}]
     w11_items = [{"item_name": "総売上", "format": "#,##0 円"}]
     got = check_transform_format(w11_map, w11_items, w11_rows)
@@ -1577,6 +1598,11 @@ def selftest():
     assert len(got) == 1 and got[0].startswith("[ERROR] [列挙]") and got[0].endswith("→ 差し戻し先 S2") and "レジ別" in got[0], got
     assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別かレジ別で集計する"}]}, rd_e) == []
     assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別に集計する(既定)"}]}, rd_e) == []
+    # 第19回: 全選択肢を書いた引数の行(表示名の語、または value の語)があれば、description が片方だけでも通す。引数の行も片方だけなら ERROR のまま
+    full_p = {"name": "group", "description": "集計単位。register はレジ別、shop は店舗別", "validation": "register または shop"}
+    assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別に集計する", "request_params": [full_p]}]}, rd_e) == []
+    assert check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別に集計する", "request_params": [{"name": "group", "description": "集計単位", "validation": "register または shop"}]}]}, rd_e) == []
+    assert len(check_enum_mentions({"api_spec": [{"action": "act", "description": "店舗別に集計する", "request_params": [{"name": "group", "description": "店舗別にまとめる", "validation": "文字列"}]}]}, rd_e)) == 1
     # 形(run15): [列挙] の行が run_units.parse_sendbacks で S2 に拾われる。印の無い行は main の入口で [ERROR] が付く。差し戻し先の無い ERROR 行は数えられる
     import run_units
     assert list(run_units.parse_sendbacks("\n".join(normalize_findings(got)), run_units.load_units())) == ["S2"], got

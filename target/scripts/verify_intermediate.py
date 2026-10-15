@@ -1022,6 +1022,11 @@ def check_description_granularity(d, verify_overrides):
         for parent in d.get(section_key, []):
             parent_id = parent_id_fn(parent)
             for step in parent.get(step_key, []) or []:
+                # WHY(2026-10-15 run16): common_logic の processing_steps が文字列の並びで来て、step.get が例外になり検査が止まった。
+                # 例外にせず、形の誤りとして ERROR で出す(合成 merge_partials.normalize_processing_steps が common_logic では dict にそろえる)
+                if not isinstance(step, dict):
+                    issues.append(("ERROR", f"形: {section_key}[{parent_id}].{step_key} の要素が dict でない({str(step)[:40]})。{{no, kind, description}} の形で書く"))
+                    continue
                 v = step.get("description") or ''
                 if not isinstance(v, str):
                     continue

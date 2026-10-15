@@ -74,6 +74,29 @@ def renumber_common_logic(items: list) -> list:
     return items
 
 
+def normalize_processing_steps(steps):
+    """common_logic[].processing_steps の要素が文字列なら {no, kind, description} の dict にする(dict はそのまま)。steps が配列でなければそのまま返す。
+    WHY(2026-10-15 run16): S1 が processing_steps を文の並び(文字列)で書くことがある。sectionCommonLogic(generate_docx.js)は
+    {no, kind, description} で読むので文字列は空セルになり、verify_intermediate.check_description_granularity と verify_vs_source の
+    _vs_map._cl_covers は dict 前提の .get で例外になった(run16 の after は _vs_map の例外が WARN に隠れて通った)。
+    合成の入口で形をそろえ、後段が文字列に当たらないようにする。kind は種別を推測せず「処理」とする。呼出元: main(common_logic の読み替え)。"""
+    if not isinstance(steps, list):
+        return steps
+    return [s if isinstance(s, dict) else {"no": i, "kind": "処理", "description": str(s)} for i, s in enumerate(steps, 1)]
+
+
+def _selftest_steps() -> int:
+    """normalize_processing_steps の形: 文字列は dict になり番号は並び順、dict はそのまま、配列でない・空はそのまま。終了コード 0=OK / 1=NG。"""
+    got = normalize_processing_steps(["文1", {"no": 2, "kind": "演算", "description": "文2"}, "文3"])
+    ok = (got == [{"no": 1, "kind": "処理", "description": "文1"}, {"no": 2, "kind": "演算", "description": "文2"}, {"no": 3, "kind": "処理", "description": "文3"}]
+          and normalize_processing_steps([]) == [] and normalize_processing_steps(None) is None and normalize_processing_steps("x") == "x")
+    if not ok:
+        print(f"[selftest NG] normalize_processing_steps: {got}")
+        return 1
+    print("[selftest OK] merge_partials.normalize_processing_steps")
+    return 0
+
+
 def load_react_drafts() -> list:
     """react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
     呼出元: build_initialization。意味合い: 初期値（useState の初期値）と初期表示の API は下書きの事実が正。
@@ -715,7 +738,7 @@ def main():
         return
     # --selftest: 組込みの検査だけ走らせる（partial・機能名は不要。機能名の解決は先頭で済んでいて、ここでは使わない）
     if "--selftest" in sys.argv[1:]:
-        sys.exit(_selftest_initialization())
+        sys.exit(_selftest_initialization() or _selftest_steps())
     if "--compose-units" in sys.argv[1:]:
         sys.exit(compose_units())
     se = load_partial("screen_events")
@@ -746,6 +769,8 @@ def main():
         if not item.get("used_by_processes") and item.get("used_in"):
             used = item["used_in"]
             item["used_by_processes"] = [used] if isinstance(used, str) else list(used)
+        if item.get("processing_steps"):
+            item["processing_steps"] = normalize_processing_steps(item["processing_steps"])
         if not item.get("processing_steps"):
             # sectionCommonLogic は processing_steps[] を {no, kind, description} で読む(文字列だと空セルになる)
             vals = [(kind, item[key]) for key, kind in

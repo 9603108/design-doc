@@ -925,6 +925,22 @@ def _attach_facts(draft, extra):
                 cur.append(f)
 
 
+# onChange の要素の種類(input の type)ごとの、events[].action の語と、trigger の「{項目名}」の後ろに続く文。
+# 型は 02_イベント一覧.md の change(チェックボックス・ラジオ)の行と、verify_vs_source の _vs_flow._TYPE_VERB・_trigger_verdict が決める。
+_CHANGE_TYPE_WORDS = {
+    "checkbox": ("チェック", "をチェック、または未チェック。"),
+    "radio": ("選択", "を選択する。"),
+}
+_INPUT_TYPE = re.compile(r"""\btype\s*=\s*\{?\s*["'](\w+)["']""")
+
+
+def _input_type(tag):
+    """開きタグの文字(link["tag"])から input の type 属性の値(小文字)を返す。無ければ空文字。
+    呼出元: build_draft。WHY: 要素の種類で action の語と trigger の型が決まるため(_CHANGE_TYPE_WORDS)。"""
+    m = _INPUT_TYPE.search(str(tag or ""))
+    return m.group(1).lower() if m else ""
+
+
 def build_draft(links, unresolved, screen_name, failure_effects=(), state_names=None):
     """解析結果を Phase 1 の下書き JSON(dict)に組む。
 
@@ -946,6 +962,14 @@ def build_draft(links, unresolved, screen_name, failure_effects=(), state_names=
             code = f"EV{n:02d}"
             action_word = ACTION_WORDS.get(link["attr"], link["attr"])
             trigger = f"{screen_name}の{link['element']}を{action_word}する。"
+            # WHY(2026-10-15 run16): checkbox の onChange は、外す操作でも走る。手順書(02_イベント一覧.md)の型は action「チェック」・
+            # trigger「{項目名}をチェック、または未チェック。」だが、下書きが「変更」「…を変更する。」と出すので、毎回 H1 が型に直すまで
+            # [イベントの語] で差し戻された(run15・run16)。events[].action は合成が下書きから取るため、H1 が正しく書いても
+            # 下書きの「変更」が残って検査に落ちた。要素の種類はソースの type 属性の事実なので、下書きの段階で機械的に入れる。
+            typ = _input_type(link.get("tag"))
+            if link["attr"] == "onChange" and typ in _CHANGE_TYPE_WORDS:
+                action_word, tail = _CHANGE_TYPE_WORDS[typ]
+                trigger = f"{screen_name}の{link.get('ui_label') or link['element']}{tail}"
         events.append({
             "event_code": code,
             "trigger": trigger,
@@ -1079,6 +1103,13 @@ def _display_rows(sources):
                     #   (平均単価・客単価は 合算の税込小計 ÷ 合算の点数・客数 であって、行の値の合算ではない)。_csv_seq_facts が合計行の文を書き分けるのに読む
                     s["has_calc"] = s.get("_calc") is not None
                     s.pop("_calc", None)
+    # WHY(2026-10-15 run16): 表(Grid)の例示値の行数は、S1 が毎回「22行(空欄項目を除くと14行)」と全行数を書いて [例示値] の ERROR で
+    # 差し戻された(run13〜run16)。画面は `showDead || !s.dead` で行を描くので、既定(空欄項目の表示がオフ)で出る行数は
+    # dead を除いた数で、オンのときが全行数。数える元を S1 の目に任せず、事実として下書きに置く(合成 _compose_grid_example が例示値に使う)。
+    for r in rows:
+        specs = [s for s in r.get("specs") or [] if isinstance(s, dict)]
+        r["rows_total"] = len(specs)
+        r["rows_shown"] = sum(1 for s in specs if not s.get("dead"))
     return rows
 
 
@@ -1465,6 +1496,30 @@ def _continuous_ops(links, sources=()):
     return ops
 
 
+def _attach_option_facts(draft):
+    """jsx_elements の select(選択肢が2つ以上)に option_texts(括弧書きを除いた選択肢の語の全部)と、既定値 default_value・default_text を足す。
+    既定値は、select に bind した state(state_initials)の初期値がリテラルで、その値と value が一致する選択肢。決まらなければ足さない。
+    WHY(2026-10-15 run16): API の description が選択肢の一部(「レジ別」)だけを書くと [列挙] の ERROR になり、毎回 S2 が全部並べるか既定値を
+    添えるまで差し戻された。選択肢の全値と既定値はソースの事実(option 要素と useState の初期値)なので、下書きに置き、
+    合成 _compose_enum_description が description に入れる。語の取り方(括弧書きを除く・2字以上・重複除去)は verify_vs_source.check_enum_mentions と同じ。
+    呼出元: main。"""
+    inits = {s.get("state"): s for s in draft.get("state_initials") or [] if isinstance(s, dict)}
+    for el in draft.get("jsx_elements") or []:
+        opts = [o for o in el.get("options") or [] if isinstance(o, dict) and o.get("value") not in ("", None)]
+        pairs = [(o, re.sub(r"[（(].*$", "", str(o.get("text") or "")).strip()) for o in opts]
+        texts = list(dict.fromkeys(t for _, t in pairs if len(t) >= 2))
+        if len(texts) < 2:
+            continue
+        el["option_texts"] = texts
+        init = inits.get(el.get("bind"))
+        if init and init.get("kind") == "literal":
+            lit = str(init.get("initial") or "").strip().strip("\"'")
+            for o, t in pairs:
+                if o.get("value") == lit and len(t) >= 2:
+                    el["default_value"], el["default_text"] = lit, t
+                    break
+
+
 def write_draft(draft, out_path):
     """下書きを UTF-8 の JSON で書く(親フォルダは作る)。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1542,6 +1597,10 @@ def main(argv=None):
     # 目的: 初期表示で呼ぶ API の一覧(initial_fetches)と、useState の初期値・結ぶ画面項目(state_initials)を下書きに足す。接続: _react_facts.initial_fetches / state_initials
     draft.update(_react_facts.initial_fetches(sources, api_names))
     draft.update(_react_facts.state_initials(sources))
+    # 目的(第19回): select の選択肢の全値と既定値(bind した state の初期値と value が一致する選択肢)を jsx_elements に足す。接続: 合成 _compose_enum_description
+    _attach_option_facts(draft)
+    # 目的(第19回): 画面側の共通関数(num・fmt・todayJst など、2か所以上から呼ぶ非 JSX の関数)を logic_candidates に足す。接続: verify_vs_source の _vs_map.check_front_logic_dropped
+    draft.update(_react_facts.logic_candidates(sources))
     # 目的: 派生配列(useMemo・素の filter 等で作る配列)を下書きに足す。接続: _react_facts.derived_arrays。B4 の配線(B5 が担当)
     draft.update(_react_facts.derived_arrays(sources))
     # 目的: 表示行の名前と連続操作の判定を、下書きの追加キーとして出す(既存キーは変えない)。接続: _display_rows / _continuous_ops
@@ -2043,6 +2102,104 @@ def _selftest_jsx_join():
     return 0
 
 
+def _selftest_change_type():
+    """checkbox・radio の onChange のイベントが、下書きの段階で型どおりの action・trigger になることを assert する(run16 の [イベントの語])。
+
+    呼出元: selftest()。意味合い: checkbox は action「チェック」・trigger「…をチェック、または未チェック。」、radio は「選択」、
+    type の無い input・select は従来どおり「変更」。終了コード 0=OK / 1=NG。"""
+    import tempfile
+    tsx = (
+        'export default function S() {\n'
+        '  const [a, setA] = useState(false);\n'
+        '  const [b, setB] = useState(0);\n'
+        '  const [c, setC] = useState("");\n'
+        '  const [dd, setD] = useState("");\n'
+        '  return (\n'
+        '    <div>\n'
+        '      <label><input type="checkbox" checked={a} onChange={(e) => setA(e.target.checked)} />空欄項目も表示</label>\n'
+        '      <input type="radio" onChange={() => setB(1)} aria-label="集計単位" />\n'
+        '      <input onChange={(e) => setC(e.target.value)} />\n'
+        '      <select onChange={(e) => setD(e.target.value)}></select>\n'
+        '    </div>\n'
+        '  );\n'
+        '}\n'
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / "S.tsx"
+            tp.write_text(tsx, encoding="utf-8")
+            links, unresolved, _ex = analyze_sources([tp], [])
+        draft = build_draft(links, unresolved, "テスト画面")
+        ev = {e["event_code"]: e for e in draft["events"]}
+        assert [ev[k]["action"] for k in ("EV01", "EV02", "EV03", "EV04")] == ["チェック", "選択", "変更", "変更"], [e["action"] for e in draft["events"]]
+        assert ev["EV01"]["trigger"] == "テスト画面の空欄項目も表示をチェック、または未チェック。", ev["EV01"]["trigger"]
+        assert ev["EV02"]["trigger"] == "テスト画面の集計単位を選択する。", ev["EV02"]["trigger"]
+        assert ev["EV03"]["trigger"].endswith("を変更する。") and ev["EV04"]["trigger"].endswith("を変更する。"), "type の無い input・select は従来のまま"
+        assert _input_type('<input type={"checkbox"} ') == "checkbox" and _input_type("") == "" and _input_type(None) == ""
+    except AssertionError as e:
+        print(f"[selftest NG] change_type {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] change_type 例外: {e!r}")
+        return 1
+    return 0
+
+
+def _selftest_draft_facts():
+    """表示行の行数の事実(rows_total・rows_shown)と、select の選択肢の全値・既定値(option_texts・default_value・default_text)を assert する(第19回)。
+
+    呼出元: selftest()。意味合い: S1 の [例示値](空欄項目を除く行数)と S2 の [列挙](集計単位の片方だけ)が毎回出た所を、事実として下書きに置く。
+    終了コード 0=OK / 1=NG。"""
+    import tempfile
+    tsx = (
+        'const LEFT: Spec[] = [\n'
+        '  { label: "総売上", kin: "a" },\n'
+        '  { label: "外税", kin: "b", dead: true },\n'
+        '  { label: "合計", kin: "c" },\n'
+        '];\n'
+        'export default function S() {\n'
+        '  const [group, setGroup] = useState<G>("register");\n'
+        '  const [kind, setKind] = useState("");\n'
+        '  return (\n'
+        '    <div>\n'
+        '      <select value={group} onChange={(e) => setGroup(e.target.value)}>\n'
+        '        <option value="register">レジ別（現行と同じ）</option>\n'
+        '        <option value="shop">店舗別（レジ合算）</option>\n'
+        '      </select>\n'
+        '      <select value={kind} onChange={(e) => setKind(e.target.value)}>\n'
+        '        <option value="">全て</option>\n'
+        '        <option value="x">種別X</option>\n'
+        '        <option value="y">種別Y</option>\n'
+        '      </select>\n'
+        '    </div>\n'
+        '  );\n'
+        '}\n'
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / "S.tsx"
+            tp.write_text(tsx, encoding="utf-8")
+            rows = _display_rows([tp])
+            draft = {}
+            draft.update(_react_facts.jsx_elements([tp]))
+            draft.update(_react_facts.state_initials([tp]))
+            _attach_option_facts(draft)
+        assert len(rows) == 1 and rows[0]["rows_total"] == 3 and rows[0]["rows_shown"] == 2, rows
+        sel = {e["label"] if e.get("label") else e["bind"]: e for e in draft["jsx_elements"] if e["tag"] == "select"}
+        g = [e for e in draft["jsx_elements"] if e.get("bind") == "group"][0]
+        assert g["option_texts"] == ["レジ別", "店舗別"] and g["default_value"] == "register" and g["default_text"] == "レジ別", g
+        k = [e for e in draft["jsx_elements"] if e.get("bind") == "kind"][0]
+        assert k["option_texts"] == ["種別X", "種別Y"] and "default_value" not in k and "default_text" not in k, k  # 初期値 "" は選択肢に無い
+        assert sel, "select が拾えていない"
+    except AssertionError as e:
+        print(f"[selftest NG] draft_facts {e}")
+        return 1
+    except Exception as e:
+        print(f"[selftest NG] draft_facts 例外: {e!r}")
+        return 1
+    return 0
+
+
 def selftest():
     """最小の api.ts と TSX(ラッパー経由・useEffect 連鎖・解決不能の1件)で、解析と組立の期待値を assert する。
 
@@ -2120,6 +2277,10 @@ def selftest():
     if _selftest_w7():
         return 1
     if _selftest_jsx_join():
+        return 1
+    if _selftest_change_type():
+        return 1
+    if _selftest_draft_facts():
         return 1
     print("[selftest OK] extract_react_draft")
     return 0

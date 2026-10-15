@@ -962,6 +962,19 @@ SPA構成時のみ。詳細は 12_API仕様.md 参照。`related_db_operations` 
 
 `logic_candidates[].kind` は `sql_condition`（SQL の条件・集計の事実）と `sql_fragment`（表名の対応・列の並びなど部品の定数）。`check_common_logic_dropped` は、common_logic に拾われていない候補が sql_condition なら ERROR、sql_fragment なら WARN にする。
 
+### 下書きJSON の追加キー（第19回。中間JSON本体には無い）
+
+毎回の実走で同じ差し戻しが出た所を、検査で戻す前に、下書きの事実と合成で機械的に入れるためのキー（run16 の4型）。
+
+| キー | 出力元 | 中身 | 読み手 |
+|:---|:---|:---|:---|
+| `display_rows[].rows_total`・`rows_shown` | react 下書き | 表の全行数（specs の数）と、既定（空欄項目の表示がオフ）で出る行数（`dead` を除いた数） | S1（表の例示値の行数）、合成 `_compose_grid_example`（Grid 項目の example を「<rows_shown>行(空欄項目を表示すると<rows_total>行)」にする） |
+| `jsx_elements[].option_texts`・`default_value`・`default_text` | react 下書き（選択肢が2つ以上の select） | 括弧書きを除いた選択肢の語の全部と、既定の選択肢（bind した state の初期値がリテラルで、value が一致するもの） | S2、合成 `_compose_enum_description`（一部の選択肢だけの API の、選択肢を受ける引数の行 `request_params[]` へ全選択肢と既定値を足す）、`check_enum_mentions`（全選択肢を書いた引数の行があれば通す） |
+| `logic_candidates[]`（react 下書き） | react 下書き（最上位） | 画面のモジュール直下にある、2か所以上から使われる非 JSX の関数（num・fmt・todayJst など）。`{name, kind(frontend_function), text, runs_on(ブラウザ), comment, uses, src}` | S1（common_logic に拾う）、`_vs_map.check_front_logic_dropped`（拾われていなければ WARN） |
+| `events[].action`・`trigger`（checkbox・radio の onChange） | react 下書き | checkbox は action「チェック」・trigger「{項目名}をチェック、または未チェック。」、radio は action「選択」・trigger「{項目名}を選択する。」。type 属性の事実から下書きの段階で入れる | H1、`_vs_flow.check_event_verb`（[イベントの語]） |
+
+検査の例外（`_vs_checks_ext.run_all` が握る例外）は、第19回から `[ERROR] [検査の例外]` にする。検査が走らないまま after が通るのを防ぐため。`common_logic[].processing_steps` が文字列の並びで来たときは、`merge_partials.normalize_processing_steps` が `{no, kind, description}` にそろえる。
+
 ### diagrams（任意、構成図を載せるときのみ）
 
 図は `target/scripts/` の Python スクリプトが作る（diagram-design スキルは任意の代替。無くても作れる）。詳細仕様は 17_構成図生成.md。docx 埋め込みは 16_docx出力ハンドオフ.md「23. 図ガバナンス」を参照。

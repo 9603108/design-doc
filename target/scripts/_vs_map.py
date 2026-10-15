@@ -491,11 +491,16 @@ def _cl_covers(cand, cl) -> bool:
     (「集計単位の切替」のように、別の処理の名前が候補の語に一致するため)。呼出元: check_common_logic_dropped。"""
     if _src_overlap(cand.get("src"), cl.get("src")):
         return True
+    # WHY(2026-10-15 run16): processing_steps は {no・kind・description} の dict の並びのほか、文字列の並び(run16 の CL1〜CL3)で
+    # 来ることがある。dict 前提の .get が文字列で落ち、_vs_map の検査が丸ごと走らなかった。文字列はそのまま文として読む。
+    steps = [s.get("description") if isinstance(s, dict) else s for s in cl.get("processing_steps") or []]
     body = " ".join(str(x) for x in [cl.get("name"), cl.get("description"), cl.get("expression"), cl.get("null_handling"),
-                                     cl.get("zero_division"), cl.get("remarks")]
-                    + [s.get("description") for s in cl.get("processing_steps") or []] if x)
+                                     cl.get("zero_division"), cl.get("remarks")] + steps if x)
     ids = {cand.get("name")} | {t for t in re.findall(r"[A-Za-z]+(?:_[A-Za-z0-9]+)+", str(cand.get("text") or "")) if len(t) >= 8}
     if any(t and len(t) >= 4 and t in body for t in ids):
+        return True
+    # WHY(第19回): 画面側の関数名(num・fmt)は3字で、上の4字以上の部分一致では拾えない。3字の名前は別の語の一部と誤るので、前後が英数字でないときだけ拾う
+    if any(t and len(t) == 3 and re.search(r"(?<![A-Za-z0-9_])" + re.escape(t) + r"(?![A-Za-z0-9_])", body) for t in ids):
         return True
     return bool(_jp_grams(cand.get("comment")) & _jp_grams(body))
 
@@ -589,9 +594,73 @@ def _selftest_common_logic_dropped() -> bool:
     frag_warn = len(mixed) == 1 and mixed[0].startswith("[WARN] [共通ロジック漏れ]") and "_COLS" in mixed[0]
     cond_err = check_common_logic_dropped(d_with([by_src, browser], extra=(frag,)))
     cond_err_ok = (len([x for x in cond_err if x.startswith("[ERROR]")]) == 1 and len([x for x in cond_err if x.startswith("[WARN]")]) == 1)
-    return (ok and len(one) == 1 and "LIVE" in one[0] and one[0].startswith("[ERROR] [共通ロジック漏れ]") and "差し戻し先 S1" in one[0]
+    # WHY(run16 の例外): processing_steps が文字列の並びでも落ちず、その文の語(コメントの語)で拾う。dict と文字列が混ざっても落ちない
+    str_steps = {"name": "有効な行", "processing_steps": ["取り直しで置き換えた古い行には印が付く", {"description": "印の無い行だけ数える"}], "src": []}
+    str_ok = check_common_logic_dropped(d_with([by_src, str_steps])) == []
+    return (ok and str_ok and len(one) == 1 and "LIVE" in one[0] and one[0].startswith("[ERROR] [共通ロジック漏れ]") and "差し戻し先 S1" in one[0]
             and len(none_) == 2 and other == [] and old_hits == 2 and old_other == [] and by_ident == [] and nodata
             and frag_warn and cond_err_ok)
+
+
+def check_front_logic_dropped(d) -> list:
+    """画面側の下書き(react_draft)の logic_candidates(2か所以上から使う非 JSX の関数。num・fmt・todayJst など)のうち、
+    common_logic に拾われていない(_cl_covers が真になる項目が1つも無い)ものを指摘する([WARN]・差し戻し先 S1)。
+    WHY(run16): S1 が backend の候補(SQL の条件 3件)だけを common_logic に書き、画面側の共通の処理(値が無いときの0扱い・3桁区切り・
+    本日の決め方。run15 までの CL にあった)が丸ごと消えた。check_common_logic_dropped は backend の候補しか見ないので、画面側の落ちは
+    どの検査も言わなかった。画面側の候補は下書き(extract_react_draft → _react_facts.logic_candidates)が事実として出す。
+    WARN にする理由: 関数ごとに common_logic の1項目に立てるか、1項目にまとめるか(「値が無いときは0」と「3桁区切り」を別にするか)は
+    設計の判断で、落ちていること自体が誤りと言い切れる backend の sql_condition(ERROR)とは違うため。終了コードには影響しない。
+    main に common_logic の欄が無いとき(合成の前)・react_draft に logic_candidates が無いときは何も言わない。
+    呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
+    rd, main = d.get("react_draft"), d.get("main")
+    if not rd or not main or main.get("common_logic") is None:
+        return []
+    cls = [cl for cl in main.get("common_logic") or [] if isinstance(cl, dict)]
+    out = []
+    for cand in rd.get("logic_candidates") or []:
+        if any(_cl_covers(cand, cl) for cl in cls):
+            continue
+        s = (cand.get("src") or [{}])[0]
+        where = f"react_draft.logic_candidates[{cand.get('name')}] ({Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})"
+        out.append(_vs_common.warn(
+            "共通ロジック漏れ", where,
+            f"画面側の共通の処理 {cand.get('name')}({str(cand.get('text') or '')[:50]})が、common_logic のどの項目にも対応していない"
+            f"(src の行が重ならず、名前も common_logic の文に出ない)。画面で動く共通ロジックとして足す"
+            f"(runs_on はブラウザ。src は定義の行 {s.get('line_start')}-{s.get('line_end')}) → 差し戻し先 S1"))
+    return list(dict.fromkeys(out))
+
+
+def _selftest_front_logic_dropped() -> bool:
+    """check_front_logic_dropped の正例・負例。合成 d で、画面側の候補が common_logic の src の行・関数名に拾われていれば指摘なし、
+    落ちていれば WARN(差し戻し先 S1)。backend の3件だけを書いた run16 の形(画面側が丸ごと無い)で、num・fmt・todayJst の3件が出る。
+    WHY: 誤検出を実データの前に合成で確かめる。呼出元: selftest。"""
+    f = "/x/Screen.tsx"
+
+    def cand(name, line, end=None, comment=""):
+        return {"name": name, "kind": "frontend_function", "text": f"const {name} = ...", "runs_on": "ブラウザ", "comment": comment,
+                "src": [{"file": f, "line_start": line, "line_end": end or line}]}
+    cands = [cand("num", 92), cand("fmt", 93), cand("todayJst", 107, 109, "本日の日付の決め方")]
+    db_only = [{"name": "判定", "description": "取込欠損の日", "src": [{"file": "/x/queries_pos.py", "line_start": 79, "line_end": 79}]}]
+
+    def d_with(cls, cs=cands):
+        return {"main": {"common_logic": cls}, "react_draft": {"logic_candidates": cs}}
+    none_ = check_front_logic_dropped(d_with(db_only))
+    by_src = [{"name": "値が無いときは0", "src": [{"file": f, "line_start": 92, "line_end": 92}]},
+              {"name": "3桁区切り", "src": [{"file": f, "line_start": 93, "line_end": 93}]},
+              {"name": "本日", "src": [{"file": f, "line_start": 107, "line_end": 109}]}]
+    # 行が重ならなくても、関数名(3字は前後が英数字でないとき)・コメントの語が文に出れば拾っているとみなす
+    by_word = [{"name": "値の0扱い", "description": "num() で値が無いときは0にする", "src": []},
+               {"name": "整形", "description": "fmt で3桁区切りにする", "src": []},
+               {"name": "本日の日付(JST基準)", "description": "現在時刻に9時間を足す", "src": []}]
+    # 3字の名前は別の語の一部では拾わない(number の中の num)
+    partial = [{"name": "数", "description": "number の扱い", "src": []}, by_word[1], by_word[2]]
+    one = check_front_logic_dropped(d_with(partial))
+    return (len(none_) == 3 and all(x.startswith("[WARN] [共通ロジック漏れ] react_draft.logic_candidates[") and x.endswith("差し戻し先 S1") for x in none_)
+            and check_front_logic_dropped(d_with(by_src)) == [] and check_front_logic_dropped(d_with(by_word)) == []
+            and len(one) == 1 and "num" in one[0]
+            and check_front_logic_dropped({"main": {}, "react_draft": {"logic_candidates": cands}}) == []
+            and check_front_logic_dropped({"main": {"common_logic": []}, "react_draft": {}}) == []
+            and check_front_logic_dropped({"main": {"common_logic": []}}) == [])
 
 
 # ---- 差5: 実行時の値を含む文言の例示値(店数など)の照合 ----------------------------------------------------------
@@ -722,11 +791,11 @@ def _selftest_jsx_text_gap() -> bool:
 
 # 検査の本体(check(d) -> list[str])。後で1検査ずつ足す
 CHECKS: list = [check_mapping_target, check_mapping_missing, check_transform_zero_fill, check_response_display_name,
-                check_csv_column_name, check_common_logic_dropped, check_docstring_count_example, check_jsx_text_gap]
+                check_csv_column_name, check_common_logic_dropped, check_front_logic_dropped, check_docstring_count_example, check_jsx_text_gap]
 # 検査の自己テスト(引数なし・bool を返す)
 SELFTESTS: list = [_selftest_mapping_target, _selftest_mapping_missing, _selftest_transform_zero_fill,
                    _selftest_response_display_name, _selftest_csv_column_name, _selftest_common_logic_dropped,
-                   _selftest_docstring_count_example, _selftest_jsx_text_gap]
+                   _selftest_front_logic_dropped, _selftest_docstring_count_example, _selftest_jsx_text_gap]
 
 
 def run(inter_dir, feature) -> list:

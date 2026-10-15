@@ -1626,6 +1626,139 @@ def derived_arrays(sources):
     return {"derived_arrays": out}
 
 
+# モジュール直下(行頭)の、小文字で始まる関数の定義。function 宣言と、const の アロー関数。コンポーネント(大文字始まり)は含めない
+_TOP_FN = re.compile(
+    r"^(?:export\s+)?(?:(?:async\s+)?function\s+([a-z_$][\w$]*)\s*(?:<[^>(]*>)?\s*\("
+    r"|const\s+([a-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=\n>]+)?=>)", re.M)
+# 本体に JSX の要素(<tag ...> / </tag> / <tag />)があるか。あれば描く関数で、共通ロジックの候補にしない
+_JSX_IN_BODY = re.compile(r"</[A-Za-z]|<[A-Za-z][\w.]*(?:\s[^<>]*)?/>|<[A-Za-z][\w.]*(?:\s[^<>]*)?>\s*[\n(<{A-Za-z぀-鿿]")
+
+
+def _stmt_end(text, i):
+    """text[i] から始まる式文の終わり(深さ0の ; の位置、無ければ行末で括弧が閉じた位置)を返す。文字列の中は数えない。呼出元: logic_candidates。"""
+    depth, quote, esc = 0, None, False
+    for j in range(i, len(text)):
+        c = text[j]
+        if quote is not None:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth <= 0:
+            return j
+        elif c == "\n" and depth <= 0 and text[i:j].strip():
+            return j
+    return len(text) - 1
+
+
+def _lead_comment(text, pos):
+    """pos(定義の行頭)の直前に続く // コメントの行を、// を除いて1つの文にして返す。無ければ空文字。呼出元: logic_candidates。"""
+    lines = text[:pos].split("\n")[:-1]
+    got = []
+    for ln in reversed(lines):
+        s = ln.strip()
+        if not s.startswith("//"):
+            break
+        got.append(s[2:].strip())
+    return " ".join(reversed(got))
+
+
+def logic_candidates(sources):
+    """画面(TSX)のモジュール直下にある、2か所以上から使われる非 JSX の関数(num・fmt・todayJst など)を
+    {"logic_candidates": [{name, kind, text, runs_on, comment, uses, src}]} で返す(第19回)。
+
+    呼出元: extract_react_draft.main()。意味合い: 画面側の共通の処理(値が無いときの0扱い・3桁区切り・本日の決め方)は、
+    S1 が common_logic に起こす決まりだが、run16 は backend の候補(SQL の条件)だけを書き、画面側の全部が丸ごと消えた。backend には下書きの
+    logic_candidates があり検査が見張るが、画面側には事実の一覧が無く、検査も見られなかった。同じ形(name・kind・text・src・comment)で出し、
+    verify_vs_source の _vs_map.check_front_logic_dropped が common_logic と照合する。
+    拾う条件: 行頭の function 宣言か const のアロー関数・名前が小文字始まり(大文字はコンポーネント)・本体に JSX が無い・
+    イベントの handler(onClick={名前})として渡されていない・定義の外から名前が2回以上出る(1か所だけの変換は共通と言えないので除く)。
+    ponytail: 関数の入れ子(exportCsv の中の q など)は見ない。モジュール直下だけ。"""
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        text = Path(p).read_text(encoding="utf-8")
+        for m in _TOP_FN.finditer(text):
+            name = m.group(1) or m.group(2)
+            if m.group(1):
+                bo = text.find("{", _end(text, m.end() - 1))
+                end = _end(text, bo) if bo >= 0 else m.end()
+            else:
+                rest = text[m.end():]
+                # アロー関数の本体は { で始まるブロックか、式1つ(; か行末まで)
+                end = _end(text, m.end() + len(rest) - len(rest.lstrip())) if rest.lstrip().startswith("{") else _stmt_end(text, m.end())
+            body = text[m.start():end + 1]
+            if _JSX_IN_BODY.search(body):
+                continue
+            ident = rf"(?<![\w$.]){re.escape(name)}(?![\w$])"
+            if re.search(rf"\bon[A-Z]\w*\s*=\s*\{{\s*{re.escape(name)}\s*\}}", text):
+                continue
+            uses = len(re.findall(ident, text[:m.start()] + text[end + 1:]))
+            if uses < 2:
+                continue
+            out.append({
+                "name": name, "kind": "frontend_function", "text": " ".join(body.split())[:120], "runs_on": "ブラウザ",
+                "comment": _lead_comment(text, m.start()), "uses": uses,
+                "src": [{"file": str(p), "line_start": text.count("\n", 0, m.start()) + 1, "line_end": text.count("\n", 0, end) + 1}]})
+    return {"logic_candidates": out}
+
+
+def selftest_logic_candidates():
+    """画面側の共通関数の候補: 2か所以上から使う非 JSX の関数だけを拾い、コンポーネント・1か所だけ・handler・JSX を返す関数は拾わない。"""
+    # fallback-ok: 次の TSX は試験の入力(文字列)。num の `?? 0` は検査対象のソースの字面で、このスクリプトの既定値ではない
+    tsx = (
+        "const num = (v: unknown) => Number(v ?? 0);\n"  # fallback-ok: 同上(試験の入力)。1行目: 拾う(使用 3)
+        "const fmt = (v: number) => v.toLocaleString(\"ja-JP\");\n"                        # 2 拾う(使用 2)
+        "function toAgg(r: Row): Agg {\n"                                                   # 3 使用 1 → 除く
+        "  const a: Agg = {};\n"
+        "  return a;\n"
+        "}\n"                                                                               # 6
+        "// 本日(JST)の日付\n"                                                              # 7
+        "function todayJst(): string {\n"                                                   # 8 拾う(使用 2)
+        "  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);\n"
+        "}\n"
+        "function Card({ agg }: { agg: Agg }) {\n"                                          # コンポーネント → 除く
+        "  return <td>{fmt(num(agg.x))}</td>;\n"
+        "}\n"
+        "const cell = (v: number) => <td>{fmt(v)}</td>;\n"                                  # JSX を返す → 除く
+        "const onSave = () => { save(); };\n"                                               # handler → 除く
+        "export default function S() {\n"
+        "  const [a, setA] = useState(todayJst());\n"
+        "  const [b, setB] = useState(todayJst().slice(0, 8));\n"
+        "  const rows = [1].map(toAgg);\n"
+        "  return <div><button onClick={onSave}>x</button>{num(a)}{cell(1)}{onSave}</div>;\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "S.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = logic_candidates([p])["logic_candidates"]
+            (Path(d) / "api.ts").write_text("const helper = (v) => v;\nhelper(1);\nhelper(2);\n", encoding="utf-8")
+            only_view = logic_candidates([Path(d) / "api.ts"])["logic_candidates"]
+        by = {g["name"]: g for g in got}
+        assert sorted(by) == ["fmt", "num", "todayJst"], sorted(by)
+        assert by["num"]["src"] == [{"file": str(p), "line_start": 1, "line_end": 1}] and by["num"]["uses"] >= 2, by["num"]
+        assert by["todayJst"]["comment"] == "本日(JST)の日付" and by["todayJst"]["src"][0]["line_start"] == 8 and by["todayJst"]["src"][0]["line_end"] == 10, by["todayJst"]
+        assert all(g["kind"] == "frontend_function" and g["runs_on"] == "ブラウザ" for g in got), got
+        assert only_view == [], "画面(.tsx・.jsx)以外は見ない"
+    except AssertionError as e:
+        print(f"[selftest NG] logic_candidates {e}")
+        return 1
+    print("[selftest OK] _react_facts.logic_candidates")
+    return 0
+
+
 def selftest_chain():
     """表示条件の鎖(and・三項の then/else・map・同じファイルの部品の呼出元)と disabled_chain、derived_arrays を最小の TSX で assert する。"""
     tsx = (
@@ -1735,6 +1868,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain() or selftest_logic_candidates())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)
