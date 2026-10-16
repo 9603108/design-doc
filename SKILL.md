@@ -346,7 +346,7 @@ Agent({
 
 Phase 4 の後に中間 JSON へ手で書いた内容は、Phase 4（`migrate_v17_to_v18.py`）をやり直すと消える。やり直す前に中間 JSON の控えを取る。
 
-`error_patterns` は Phase 1 で `api_spec[].error_patterns`（`{condition, status_code, message_id}` の配列）に書けば、Phase 4 の `migrate_v17_to_v18.py` が対応する `backend_processes[].error_patterns` へ写す（Phase 4 をやり直しても消えない入口）。空のままだと `verify_intermediate.py` が ERROR にする。本当にエラーを返さない API は `api_spec[].error_patterns_none_reason` に理由を書く。処理名を description と別にしたいときは `api_spec[].name`（任意）を書く（書かなければ description の1文目が処理名になり、概要は2文目以降があればそちら）。
+`error_patterns` は Phase 1 で `api_spec[].error_patterns`（`{condition, status_code}` の配列。`message_id` は任意、画面に出す文があれば `display`）に書けば、Phase 4 の `migrate_v17_to_v18.py` が対応する `backend_processes[].error_patterns` へ写す（Phase 4 をやり直しても消えない入口）。空のままだと `verify_intermediate.py` が ERROR にする。本当にエラーを返さない API は `api_spec[].error_patterns_none_reason` に理由を書く。処理名を description と別にしたいときは `api_spec[].name`（任意）を書く（書かなければ description の1文目が処理名になり、概要は2文目以降があればそちら）。
 
 渡し方:
 

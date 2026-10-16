@@ -68,7 +68,7 @@ _CONST = re.compile(r"\bconst\s+([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=(?![=>])\s*")
 _ARROW = re.compile(r"(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]*)?=>")
 _EFFECT = re.compile(r"\buseEffect\s*\(")
 _EVENT_ATTR = re.compile(r"\s(on[A-Z]\w*)=\{")
-_TAG = re.compile(r"<([A-Za-z][\w.]*)")
+_TAG = re.compile(r"(?<![\w$])<([A-Za-z][\w.]*)")  # 直前が識別子の < は型引数(p.val<string>(...))で、JSX のタグではない
 # call<T>("action", ...) の第1引数の文字列リテラル。型引数は複数行にまたがりうる
 _API_LIT = re.compile(r"\s*(?:<[\s\S]*?>)?\s*\(\s*([\"'])([^\"'\n]+)\1")
 
@@ -233,8 +233,19 @@ def _resolve(span, ctx, seen, acc):
     # コールバックを後で呼ぶ形(then(cb)・ラッパー)なので、従来どおり文字の順のままにする。Promise の連鎖は文字の順が実行順。
     order = {}
     idents = list(_idents(text, s, e))
+    # 目的(G27): 位置 s の部品が受ける props(p.onX・props.onX・分割代入 {onX})の参照を拾う。名前の後ろに `.属性名` が続く形(p.onX)は、
+    #       識別子 p の位置から属性名と参照の終わりを引く。分割代入の名前は、その名前自身が参照(終わりは名前の終わり)。
+    comp, pparam, plocal = _component_props(text, s)
+    pref = {}
     for name, i in idents:
-        k = i + len(name)
+        if comp and pparam and name == pparam:
+            pd = _PROP_DOT.match(text, i + len(name), e)
+            if pd and (comp, pd.group(1)) in ctx.get("props", {}):
+                pref[i] = (pd.group(1), pd.end())
+        elif comp and name in plocal and (comp, plocal[name]) in ctx.get("props", {}):
+            pref[i] = (plocal[name], i + len(name))
+    for name, i in idents:
+        k = pref[i][1] if i in pref else i + len(name)
         while k < e and text[k] in " \t\r\n":
             k += 1
         if k < e and text[k] == "(":
@@ -242,6 +253,10 @@ def _resolve(span, ctx, seen, acc):
             if not re.search(r"=>|\bfunction\b", text[k:c]):
                 order[i] = c
     for name, i in sorted(idents, key=lambda t: order.get(t[1], t[1])):
+        # 目的(G27): props 経由の参照は、親がその属性に渡した式(<Child onX={...}>)を辿る。親も props 経由なら、さらに親へ辿る。
+        if i in pref:
+            _resolve_prop(comp, pref[i][0], ctx, seen, acc)
+            continue
         # 目的: 画面が使う API 関数の定義(api.ts 側)を、excerpt に抜くために覚える。接続: _excerpt_chunks()
         if name in ctx["funcs"] and ctx["funcs"][name][0].suffix not in (".tsx", ".jsx"):
             ctx["used"].add(name)
@@ -324,6 +339,85 @@ def _enclosing_component(text, pos):
     return name
 
 
+_PROP_DOT = re.compile(r"\s*\??\.\s*([A-Za-z_$][\w$]*)")  # p.onX・p?.onX の .onX
+_COMP_PARAMS = re.compile(r"\s*(?:(?:React\.)?(?:memo|forwardRef)\s*\(\s*)?(?:async\s+)?(?:function\s*[\w$]*\s*)?\(")
+_PROPS_CACHE = {}
+
+
+def _pattern_names(text, ob, cb):
+    """分割代入 {a, b: c, d = 1, ...rest} (ob が {、cb が }) の {局所名: 属性名} を返す。"""
+    out = {}
+    for ps, pe in _top_split(text, ob + 1, cb):
+        piece = text[ps:pe].strip()
+        if not piece or piece.startswith("..."):
+            continue
+        m = re.match(r"([A-Za-z_$][\w$]*)\s*(?::\s*([A-Za-z_$][\w$]*))?", piece)
+        if m:
+            out[m.group(2) or m.group(1)] = m.group(1)
+    return out
+
+
+def _component_props(text, pos):
+    """位置 pos を含むコンポーネントが props を受ける形を (部品名, props の仮引数名, {局所名: 属性名}) で返す。
+
+    受け方は3つ(どれも拾う): 関数の引数 p をそのまま p.onX で使う形(仮引数名 = p)、引数での分割代入 ({ onX }: Props)、
+    本体での分割代入 (const { onX } = p;)。部品でない位置・props の無い部品は (名前, "", {}) か ("", "", {})。
+    呼出元: _resolve()。WHY: props の仮引数名は p・props など決まっていないので、定義から引く。
+    """
+    last = None
+    for m in _COMP_DEF.finditer(text, 0, pos):
+        last = m
+    if last is None:
+        return "", "", {}
+    key = (text, last.start())  # id(text) は GC 後に再利用されうるので、本文そのものを鍵にする(同じ文字列は同一物で比べる)
+    if key in _PROPS_CACHE:
+        return _PROPS_CACHE[key]
+    name = last.group(1) or last.group(2)
+    param, local, pe = "", {}, last.end()
+    if last.group(1):
+        po = last.end() - 1
+    else:
+        pm = _COMP_PARAMS.match(text, last.end())
+        po = pm.end() - 1 if pm else -1
+    if po >= 0:
+        pe = _close(text, po)
+        first = _top_split(text, po + 1, pe)[0]
+        head = text[first[0]:first[1]].lstrip()
+        hs = first[1] - len(head)
+        if head.startswith("{"):
+            local.update(_pattern_names(text, hs, _close(text, hs)))
+        else:
+            m = re.match(r"[A-Za-z_$][\w$]*", head)
+            param = m.group(0) if m else ""
+    elif (m := re.match(r"\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*=>", text[last.end():last.end() + 80])):
+        param = m.group(1)
+    nxt = _COMP_DEF.search(text, last.end())
+    region_end = nxt.start() if nxt else len(text)
+    if param:
+        for m in re.finditer(r"\b(?:const|let)\s*(\{)", text[pe:region_end]):
+            ob = pe + m.start(1)
+            cb = _close(text, ob)
+            if re.match(r"\s*(?::[^=;]+)?=\s*" + re.escape(param) + r"\s*(?:;|$)", text[cb + 1:cb + 80], re.M):
+                local.update(_pattern_names(text, ob, cb))
+    _PROPS_CACHE[key] = (name, param, local)
+    return _PROPS_CACHE[key]
+
+
+def _resolve_prop(comp, key, ctx, seen, acc):
+    """部品 comp の props の属性 key に、親が <comp key={式}> で渡した式を全部辿る(_resolve と同じ acc に積む)。
+
+    acc["props"] に (部品名, 属性名) を残す。analyze_sources が、子のイベントとして解決できた属性の親側のタグを重ねて立てないために使う。
+    同じ (部品名, 属性名) は1回だけ辿る(seen)ので、props を渡し合う循環では止まる。
+    """
+    acc.setdefault("props", set()).add((comp, key))
+    tag = ("prop", comp, key)
+    if tag in seen:
+        return
+    seen.add(tag)
+    for span in ctx["props"][(comp, key)]:
+        _resolve(span, ctx, seen, acc)
+
+
 def _collect_prop_bindings(texts):
     """親の TSX の JSX で、定義が読んだ TSX にある大文字始まりのタグの 属性={式} を全部拾う。
 
@@ -379,7 +473,8 @@ def analyze_sources(source_files, api_call_functions, info=None):
       excerpt: 画面が使う API 関数と参照する型の断片(TS の文字列。無ければ空文字)。main() が書き出す
     辿り方: イベント属性の式 → 局所関数(useCallback を含む)・api_call_functions の直接呼出 → setter で変わる状態
             → その状態に依存する派生値(const・useCallback/useMemo の依存配列)を閉包 → 依存配列が交わる useEffect の本体。
-    子の部品の props 経由(onChange={onChange}・props.onSave)は、親が同名の属性で式を渡していれば親の式まで辿って links に入れる
+    子の部品の props 経由(onChange={onChange}・props.onSave・p.onSave・分割代入 {onSave}。関数の中から呼ぶ p.onSave() も同じ)は、
+    親が同名の属性で式を渡していれば親の式まで辿って links に入れる。親も props 経由なら、さらに親まで辿る(_resolve → _resolve_prop)
     (親側の <Child onSave={...}> は重ねて入れない)。親が渡していない等で参照先を1つも解決できないイベント属性は links に入れず unresolved に出す。
     """
     texts = {p: p.read_text(encoding="utf-8") for p in source_files
@@ -389,7 +484,9 @@ def analyze_sources(source_files, api_call_functions, info=None):
     funcs, setters, derived, effects, unresolved = {}, {}, {}, [], []
     for p, t in texts.items():
         _collect_defs(p, t, funcs, setters, derived, effects, unresolved)
-    ctx = {"api": set(api_call_functions), "funcs": funcs, "setters": setters, "unresolved": unresolved, "used": set()}
+    _PROPS_CACHE.clear()
+    ctx = {"api": set(api_call_functions), "funcs": funcs, "setters": setters, "unresolved": unresolved, "used": set(),
+           "props": prop_table}
     # 目的: JSX の 0件分岐を画面の状態名で引けるように、状態 → 表示文言 を先に集める。接続: 下の links 組立の "empty"
     branches = {}
     for p, t in texts.items():
@@ -416,6 +513,9 @@ def analyze_sources(source_files, api_call_functions, info=None):
                     _resolve(pspan, ctx, set(), acc)
                 if acc["hit"] or acc["actions"]:
                     child_resolved.add(pkey)
+            if acc["hit"] or acc["actions"]:
+                # 目的(G27): _resolve が props 経由で辿った (部品名, 属性名)。この子のイベントで解決できたので、親側の <部品 属性={...}> は重ねない
+                child_resolved |= acc.get("props", set())
             if not acc["hit"] and not acc["actions"]:
                 unresolved.append({"file": str(p), "line": _line(t, m.start()),
                                    "reason": f"{m.group(1)} の参照先を解決できない: {expr}"})
@@ -2470,6 +2570,54 @@ def selftest():
         assert [k["attr"] for k in links2] == ["mount", "onChange", "onClick"], f"親子: links の attr(親の <Child on*> が重ならない): {[k['attr'] for k in links2]}"
         assert links2[1]["ui_label"] == "名前", f"親子: 子の入力欄の ui_label: {links2[1]['ui_label']}"
         assert links2[2]["ui_label"] == "保存" and links2[2]["actions"] == ["save"], f"親子: 保存ボタン: {links2[2]}"
+        # 目的(G27): 子の props の受け方3つと、props の連鎖。(a) 仮引数 p を p.setV(x) で使い、局所関数 put の中から呼ぶ形
+        #       (b) 引数の分割代入 Leaf({ go })に、中間の部品が go={p.onSave} で渡す(2段) (c) 本体の const { onSave } = props;
+        #       親の <Mid onSave=...>・<Foot onSave=...> は子のイベントが立つので重ねない。値 get<string>(...) の < は JSX のタグではない。
+        mid_parent = (
+            'import { useState } from "react";\n'
+            'import { call } from "./api";\n'
+            'export default function Parent() {\n'
+            '  const [v, setV] = useState("");\n'
+            '  const save = () => { call("save"); };\n'
+            '  return <div><Mid setV={setV} onSave={save} /><Foot onSave={save} /></div>;\n'
+            '}\n'
+        )
+        mid_child = (
+            'function Mid(p: { setV: (s: string) => void; onSave: () => void }) {\n'
+            '  const put = (x: string) => p.setV(x);\n'
+            '  return (\n'
+            '    <div>\n'
+            '      <input placeholder="名前" value={get<string>("k")} onChange={(e) => put(e.target.value)} />\n'
+            '      <Leaf go={p.onSave} />\n'
+            '    </div>\n'
+            '  );\n'
+            '}\n'
+            'function Leaf({ go }: { go: () => void }) {\n'
+            '  return <button onClick={go}>保存</button>;\n'
+            '}\n'
+            'function Foot(props: any) {\n'
+            '  const { onSave } = props;\n'
+            '  return <a onClick={() => onSave()}>戻す</a>;\n'
+            '}\n'
+        )
+        with tempfile.TemporaryDirectory() as d4:
+            dp4 = Path(d4)
+            (dp4 / "api.ts").write_text(api_src, encoding="utf-8")
+            (dp4 / "Parent.tsx").write_text(mid_parent, encoding="utf-8")
+            (dp4 / "Mid.tsx").write_text(mid_child, encoding="utf-8")
+            links4, unresolved4, _ex4 = analyze_sources([dp4 / "api.ts", dp4 / "Parent.tsx", dp4 / "Mid.tsx"], ["call"])
+        assert unresolved4 == [], f"props 連鎖: unresolved が残った: {unresolved4}"
+        assert [(k["element"], k["attr"]) for k in links4] == [("", "mount"), ("input", "onChange"), ("button", "onClick"), ("a", "onClick")], \
+            f"props 連鎖: links(親の <Mid onSave>・<Foot onSave> が重ならない・input が get<string> の string にならない): {[(k['element'], k['attr']) for k in links4]}"
+        assert links4[1]["ui_label"] == "名前", f"props 連鎖: 入力欄: {links4[1]}"
+        assert [k["actions"] for k in links4[2:]] == [["save"], ["save"]], f"props 連鎖: 2段・分割代入の保存: {[k['actions'] for k in links4[2:]]}"
+        # 親が渡さない props は、仮引数 p の形でも従来どおり unresolved(辿る先が無いものを解決したことにしない)
+        with tempfile.TemporaryDirectory() as d5:
+            dp5 = Path(d5)
+            (dp5 / "api.ts").write_text(api_src, encoding="utf-8")
+            (dp5 / "Lone.tsx").write_text(mid_child.split("function Leaf")[0].replace("put(e.target.value)", "p.setV(e.target.value)"), encoding="utf-8")
+            _l5, unresolved5, _ex5 = analyze_sources([dp5 / "api.ts", dp5 / "Lone.tsx"], ["call"])
+        assert len(unresolved5) == 1 and "onChange" in unresolved5[0]["reason"], f"props 連鎖: 親の無い p.setV は unresolved: {unresolved5}"
         draft = build_draft(links, unresolved, "テスト画面")
         assert [e["event_code"] for e in draft["events"]] == ["EV00", "EV01", "EV02"], "event_code(EV00 = 初期表示、以降 EV01…)"
         assert draft["events"][0]["trigger"] == "テスト画面の初期表示時", "EV00 の trigger"

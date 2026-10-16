@@ -71,6 +71,214 @@ _PARAM = re.compile(r"^(?:\?|%s|:(\w+)|%\((\w+)\)s)$")
 # 認証の呼出の名前(identify 等)。入口がディスパッチ表を引く前に呼ぶものだけを auth にする
 _AUTH_CALL = re.compile(r"identify|identity|auth|login|token|session|permission", re.IGNORECASE)
 
+from types import SimpleNamespace
+
+# --- G29: 実行時に展開される列の式を、ソースの実際の形で組むための限定評価 ---------------------------------------------------
+# 目的: 補助関数が組む列の式(count(DISTINCT CASE ... END)::bigint AS f_<種別>)と、SQL の穴に入る局所変数(ft = face_type_sql("sd.jodai")・
+#       types = ", ".join(...))を、NULL や X に潰さず実際の SQL にする。評価できるのは、定数・文字列の整形・内包表記・
+#       同じフォルダのモジュールの定数と「代入と return だけの関数」まで。I/O・ループ・分岐・未知の呼出しがあるものは評価せず(決められない)、
+#       呼び出し側は X や式の雛形({式})にする。接続: Module._expand が _func_ns を持ち、_render が _expand_cols を、extract が _call_locals を呼ぶ。
+_SAFE_NODES = (ast.Expression, ast.Constant, ast.Name, ast.Load, ast.Store, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.BinOp, ast.Add, ast.Mod, ast.Mult,
+               ast.UnaryOp, ast.Not, ast.USub, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq, ast.In, ast.NotIn, ast.Lt, ast.LtE,
+               ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.IfExp, ast.JoinedStr, ast.FormattedValue, ast.Subscript, ast.Slice, ast.Attribute,
+               ast.Call, ast.keyword, ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp, ast.comprehension)
+_SAFE_BUILTINS = {"tuple": tuple, "list": list, "set": set, "sorted": sorted, "len": len, "str": str, "int": int, "min": min, "max": max,
+                  "range": range, "enumerate": enumerate, "zip": zip}
+_SAFE_METHODS = {"join", "format", "strip", "lstrip", "rstrip", "lower", "upper", "replace", "split", "startswith", "endswith"}
+_NS_CACHE = {}  # ファイルのパス -> そのモジュールの名前空間(extract の始めに空にする)
+
+
+def _safe_eval(node, ns):
+    """式 node を ns の名前だけで評価する。許すのは _SAFE_NODES と、安全な組込み(_SAFE_BUILTINS)・文字列のメソッド・_Pure の呼出だけ。
+    許さないもの・評価で例外になるものは例外をそのまま投げる(呼び出し側が「決められない」とする)。"""
+    for n in ast.walk(node):
+        if not isinstance(n, _SAFE_NODES):
+            raise ValueError(type(n).__name__)
+        if isinstance(n, ast.Attribute) and n.attr.startswith("__"):
+            raise ValueError(n.attr)
+        if isinstance(n, ast.Call) and not (isinstance(n.func, ast.Name) or (isinstance(n.func, ast.Attribute) and n.func.attr in _SAFE_METHODS)):
+            raise ValueError("call")
+    g = {"__builtins__": {}, **_SAFE_BUILTINS}
+    g.update({k: v for k, v in ns.items() if not callable(v) or isinstance(v, _Pure)})
+    expr = ast.Expression(node)
+    ast.fix_missing_locations(expr)
+    return eval(compile(expr, "<g29>", "eval"), g)
+
+
+class _Pure:
+    """「代入と return だけ」の関数(face_type_sql のように文字列を組むだけのもの)を、_safe_eval が呼べる形に包む。
+    それ以外の文(ループ・分岐・例外・import)があれば呼ぶと ValueError(= 決められない)。"""
+
+    def __init__(self, fn, modns):
+        self.fn, self.modns = fn, modns
+
+    def __call__(self, *args, **kw):
+        a = self.fn.args
+        if a.vararg or a.kwarg or a.kwonlyargs or a.posonlyargs:
+            raise ValueError("args")
+        names, loc = [x.arg for x in a.args], {}
+        for i, nm in enumerate(names):
+            j = i - (len(names) - len(a.defaults))
+            if i < len(args):
+                loc[nm] = args[i]
+            elif nm in kw:
+                loc[nm] = kw[nm]
+            elif j >= 0:
+                loc[nm] = _safe_eval(a.defaults[j], self.modns)
+            else:
+                raise ValueError("missing")
+        ns = {**self.modns, **loc}
+        for st in self.fn.body:
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+                continue  # docstring
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                ns[st.targets[0].id] = _safe_eval(st.value, ns)
+            elif isinstance(st, ast.Return) and st.value is not None:
+                return _safe_eval(st.value, ns)
+            else:
+                raise ValueError(type(st).__name__)
+        raise ValueError("no return")
+
+
+def _bind_stmt(n, ns, folder, depth):
+    """文 n(同じフォルダのモジュールの import・名前 = 式・def)を名前空間 ns に反映する。評価できない代入はその名前を消す。"""
+    if isinstance(n, ast.ImportFrom) and n.module and not n.level:
+        sub = _mod_ns(folder / (n.module.replace(".", "/") + ".py"), depth + 1)
+        for a in n.names:
+            if a.name in sub:
+                ns[a.asname or a.name] = sub[a.name]
+    elif isinstance(n, ast.Import):
+        for a in n.names:
+            p = folder / (a.name.replace(".", "/") + ".py")
+            if "." not in a.name and p.is_file():
+                ns[a.asname or a.name] = SimpleNamespace(**{k: v for k, v in _mod_ns(p, depth + 1).items() if k.isidentifier()})
+    elif isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+        try:
+            ns[n.targets[0].id] = _safe_eval(n.value, ns)
+        except Exception:  # noqa: BLE001 - 評価できない = 決められない(名前を消す)
+            ns.pop(n.targets[0].id, None)
+    elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        ns[n.name] = _Pure(n, ns)
+
+
+def _mod_ns(path, depth=0):
+    """モジュール path の最上位の名前空間(評価できた定数・同じフォルダからの import・関数)。循環 import は途中の状態で止まる。"""
+    key = str(path)
+    if key in _NS_CACHE:
+        return _NS_CACHE[key]
+    ns = _NS_CACHE[key] = {}
+    if depth > 5 or not path.is_file():
+        return ns
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return ns
+    for n in tree.body:
+        _bind_stmt(n, ns, path.parent, depth)
+    return ns
+
+
+def _func_ns(path, f):
+    """関数 f(モジュール path の中)が見る名前空間: モジュールの名前空間 + 関数の中の import(from X import 名 や import X)。"""
+    ns = dict(_mod_ns(path))
+    for n in ast.walk(f):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            _bind_stmt(n, ns, path.parent, 0)
+    return ns
+
+
+def _call_locals(fn, mod, env):
+    """列を実行時に展開する補助関数(env['__expand__'])を呼ぶ関数 fn の、定数と純粋な関数だけで決まる局所変数を返す。
+    関数内の import と、最上位の「名前 = 式」を上から順に評価し、評価できたものだけを {名前: 値} にする。
+    WHY: 展開列を含む SQL の穴(ft・types)を実際の形にする。展開列を持たない関数では従来どおり X のまま(他画面の下書きを変えない)。"""
+    ex = env.get("__expand__") or {}
+    if not any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in ex for c in ast.walk(fn)):
+        return {}
+    ns, out = dict(_mod_ns(mod.path)), {}
+    for st in fn.body:
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            tmp = {}
+            _bind_stmt(st, tmp, mod.path.parent, 0)
+            ns.update(tmp)
+            out.update(tmp)
+        elif isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            _bind_stmt(st, ns, mod.path.parent, 0)
+            nm = st.targets[0].id
+            if nm in ns:
+                out[nm] = ns[nm]
+            else:
+                out.pop(nm, None)
+    return {k: v for k, v in out.items() if isinstance(v, (str, int, float, tuple, list, dict, SimpleNamespace))}
+
+
+def _fmt_template(node, loc):
+    """列の式の雛形 node("…%s…" % (…) か f 文字列)を loc の名前で文字列にする。決められない穴は {式} のまま残す。組めなければ None。"""
+    try:
+        v = _safe_eval(node, loc)
+        return v if isinstance(v, str) else None
+    except Exception:  # noqa: BLE001 - 一部だけ決められないときは下で穴ごとに決める
+        pass
+
+    def part(e):
+        try:
+            return str(_safe_eval(e, loc))
+        except Exception:  # noqa: BLE001
+            return "{" + ast.unparse(e) + "}"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        try:
+            fmt = _safe_eval(node.left, loc)
+        except Exception:  # noqa: BLE001
+            return None
+        args = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+        try:
+            return fmt % tuple(part(e) for e in args) if isinstance(fmt, str) else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(node, ast.JoinedStr):
+        return "".join(str(v.value) if isinstance(v, ast.Constant) else part(v.value) for v in node.values)
+    return None
+
+
+def _expand_cols(ex, call, env):
+    """展開列の補助関数の呼出 call を、SELECT 項目の文字列の配列("式 AS 別名")にする。組めなければ None(呼び元が NULL の列へ戻る)。
+    値(values)があれば値ごとに実際の式。値が無ければ目印の別名(__expand_<接頭辞>__from__<反復元>)1項目で、反復変数は {変数名} のままにした式の雛形
+    (反復の中の代入は値ごとに結果が変わるので評価せず {名前} のまま残す)。仮引数には呼出の実引数を評価して入れる。"""
+    tpl = ex.get("template")
+    if tpl is None:
+        return None
+    base = dict(ex["ns"])
+    scope = {**base, **{k: v for k, v in env.items() if isinstance(v, (str, int, float, tuple, list, dict, SimpleNamespace, _Pure))}}
+    for p, a in zip(ex["params"], call.args):
+        try:
+            base[p] = _safe_eval(a, scope)
+        except Exception:  # noqa: BLE001
+            base[p] = "{" + ast.unparse(a) + "}"
+    out = []
+    for x in ex.get("values") or [None]:
+        loc = dict(base)
+        if x is None:
+            loc[ex["var"]] = "{" + ex["var"] + "}"
+        else:
+            loc[ex["var"]] = x
+            for st in ex["stmts"]:
+                try:
+                    loc[st.targets[0].id] = _safe_eval(st.value, loc)
+                except Exception:  # noqa: BLE001 - 決められない代入の名前は式の中で {名前} のまま残る
+                    loc.pop(st.targets[0].id, None)
+        s = _fmt_template(tpl, loc)
+        if s is None:
+            return None
+        if x is None:
+            marker = f"__expand_{ex['prefix']}__from__{ex['source']}"
+            s2 = re.sub(r"(\bAS\s+)" + re.escape(ex["prefix"]) + r"\S*\s*$", lambda m: m.group(1) + marker, s)
+            if s2 == s:
+                return None
+            s = s2
+        elif not re.search(r"\bAS\s+" + re.escape(ex["prefix"] + x) + r"\s*$", s):
+            return None
+        out.append(s)
+    return out
+
 
 class Module:
     """1 つの backend ファイルの構文木と、解決に使う表(関数・定数・import)を持つ。"""
@@ -138,7 +346,12 @@ class Module:
                     except (OSError, SyntaxError, ValueError):
                         v = None  # 辿れない・定数でない = 決められない(values None)
                 ok = isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v)
-                return {"prefix": prefix, "values": list(v) if ok else None, "source": src, "type": ty.group(1) if ty else ""}
+                # template 以下は、列の式を実際の形で組み直すための材料(_expand_cols が読む): append の引数の式・反復変数・append より前の
+                # 反復の中の代入・仮引数名・補助関数の名前空間(モジュールの定数と関数内の import)
+                stmts = [s for s in loop.body if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name) and s.lineno < c.lineno]
+                return {"prefix": prefix, "values": list(v) if ok else None, "source": src, "type": ty.group(1) if ty else "",
+                        "template": c.args[0], "var": loop.target.id, "stmts": stmts, "params": [a.arg for a in f.args.args],
+                        "ns": _func_ns(self.path, f)}
         return None
 
     def env(self):
@@ -180,8 +393,11 @@ def _render(node, env, sql):
                 ex = env.get("__expand__", {}).get(call.func.id) if sql and isinstance(call, ast.Call) and isinstance(call.func, ast.Name) else None
                 if ex:
                     # 型のキャストは目印だけに付ける(_dataset が型を取る)。値で展開した列に NULL::型 を付けると、後段が NULL 許容と誤読する
-                    names = [f"NULL AS {ex['prefix']}{x}" for x in ex["values"]] if ex.get("values") else \
-                        [f"NULL{'::' + ex['type'] if ex.get('type') else ''} AS __expand_{ex['prefix']}__from__{ex['source']}"]
+                    # G29: まず補助関数が組む実際の式(count(DISTINCT CASE ... END)::bigint AS f_<種別>)を、値ごとに(値が無ければ目印の列に式の雛形を)入れる。
+                    # 組めないときだけ NULL の列に戻る。
+                    names = _expand_cols(ex, call, env) or (
+                        [f"NULL AS {ex['prefix']}{x}" for x in ex["values"]] if ex.get("values") else
+                        [f"NULL{'::' + ex['type'] if ex.get('type') else ''} AS __expand_{ex['prefix']}__from__{ex['source']}"])
                     out.append(", ".join(names))
                 else:
                     out.append("X" if sql else "{" + ast.unparse(v.value) + "}")
@@ -683,7 +899,8 @@ def _dataset(sql, unresolved, action):
             tbl = real(q.group(1)) if q and q.group(1) in alias else main
             xm = re.fullmatch(r"__expand_(\w+?)__from__(\w+)", col) if am else None  # _render が置いた、実行時に展開される列の目印
             if xm and tbl != "X":
-                ty = re.match(r"NULL::(\w+)\s+AS\b", item, re.IGNORECASE)
+                # 型は列の式の末尾のキャスト(...)::bigint AS 目印 か、式を組めないときの NULL::型 AS 目印
+                ty = re.search(r"::(\w+)\s+AS\s+__expand_", item, re.IGNORECASE) or re.match(r"NULL::(\w+)\s+AS\b", item, re.IGNORECASE)
                 rows.append({"column": xm.group(1) + "*", "table": tbl, "expanded": True,
                              "rule": f"実行時に {xm.group(2)} の値ごとに {xm.group(1)}<値> の列を作る", "type": ty.group(1) if ty else ""})
             elif tbl != "X":
@@ -1384,6 +1601,7 @@ def extract(files, hints=None, actions=None):
     actions: この画面が呼ぶ action の集合。与えると apis にはそれだけを載せる(共通モジュールの表にある他画面の action は載せない。
     共通モジュールは、その action の処理が呼ぶ関数を辿るためだけに読む)。None なら表の全 action を載せる。"""
     hints = hints or {}
+    _NS_CACHE.clear()  # G29: 名前空間の結果はこの呼出の中だけで使う(別のファイル群を続けて解析しても古い結果を読まない)
     mods = {p.stem: Module(p) for p in files}
     # csv_header: backend の定数の辞書、または (列名, 日本語の見出し) の組の並びから、列名→見出しを取る。位置だけで対応する配列は推測しない
     csv = {}
@@ -1435,9 +1653,12 @@ def extract(files, hints=None, actions=None):
                     for x in ast.walk(f2):
                         if isinstance(x, ast.Name) and action not in uses.setdefault((str(m2.path), x.id), []):
                             uses[(str(m2.path), x.id)].append(action)
-                    lists = _local_lists(f2, m2.env())  # 条件付きの append は断片ごとの when を持つ(B1)
+                    env0 = m2.env()
+                    # G29: 展開列を組む補助関数を呼ぶ関数では、定数と純粋な関数だけで決まる局所変数(ft・types)も SQL の穴に入れる
+                    env0 = {**env0, **_call_locals(f2, m2, env0)}
+                    lists = _local_lists(f2, env0)  # 条件付きの append は断片ごとの when を持つ(B1)
                     cond_map = _cond_map(lists)
-                    scens = _scenarios(f2, {**m2.env(), **{k: [t for t, _ in v] for k, v in lists.items()}})
+                    scens = _scenarios(f2, {**env0, **{k: [t for t, _ in v] for k, v in lists.items()}})
                     env = scens[0][1]  # 句以外(列・出典・エラー)は最初の通りで組む。句だけ全部の通りで取る
                     parts = set()  # f 文字列・+ 連結の部品。親の _render が一括で組むので単独では拾わない
                     for s in ast.walk(f2):
@@ -1789,6 +2010,50 @@ def selftest():
             assert xe["expanded"] is True and xe["type"] == "bigint" and "TYPES" in xe["rule"], xe
         else:
             assert not any(x.get("expanded") for x in xd), xd
+    # G29(式): 展開した列の式を NULL にせず、補助関数が組む実際の式を種別ごとに入れる(種別ごとに鍵が変わる・仮引数 ft は呼び元の局所変数)。
+    #       SQL の穴(ft・types)も X にせず、同じフォルダのモジュールの定数と「代入と return だけの関数」から実際の形にする。
+    #       種類の一覧が決められないときは、NULL でなく反復変数を {t} のままにした式の雛形(目印の列 1 項目)。
+    helper2 = ('def _fc(ft):\n    from pack import FACE_TYPES\n    import pack\n    cols = []\n    for t in FACE_TYPES:\n'
+               '        key = "d.k" + (" || \'|\' || d.s" if t in pack.SIZE_TYPES else "")\n'
+               '        cols.append("count(DISTINCT CASE WHEN (%s) = \'%s\' THEN %s END)::bigint AS f_%s" % (ft, t, key, t))\n'
+               '    return ", ".join(cols)\n'
+               'def mk(jod):\n    return "CASE WHEN %s > 0 THEN \'a\' ELSE \'b\' END" % jod\n'
+               'def g(p):\n    from pack import FACE_TYPES\n    ft = mk("d.jodai")\n    types = ", ".join("\'%s\'" % t for t in FACE_TYPES)\n'
+               '    sql = f"SELECT d.id AS id, count(*) FILTER (WHERE ({ft}) NOT IN ({types}))::bigint AS n, {_fc(ft)} FROM real_tbl d GROUP BY 1"\n'
+               '    return {"rows": sql}\n')
+    ft_sql = "CASE WHEN d.jodai > 0 THEN 'a' ELSE 'b' END"
+    for pack, known in (('FACE_TYPES = ("a", "b")\nSIZE_TYPES = tuple(t for t in FACE_TYPES if t == "b")\n', True),
+                        ('FACE_TYPES = load_types()\nSIZE_TYPES = load_types()\n', False)):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "h.py").write_text('import q\nA = {"g": q.g}\n', encoding="utf-8")
+            (Path(d) / "q.py").write_text(helper2, encoding="utf-8")
+            (Path(d) / "pack.py").write_text(pack, encoding="utf-8")
+            xr = extract([Path(d) / "h.py", Path(d) / "q.py"])
+        cols = {c["alias"]: c for c in xr["apis"]["g"]["db_operations"][0]["columns"]}
+        assert xr["unresolved"] == [], xr["unresolved"]
+        # 局所変数の穴はどちらの場合も実際の形
+        n = cols["n"]["expression"]
+        assert ft_sql in n and "(X)" not in n.replace("NOT IN (X)", ""), n
+        if known:
+            assert "NOT IN ('a', 'b')" in n, n
+            assert set(cols) == {"id", "n", "f_a", "f_b"}, set(cols)
+            assert cols["f_a"]["expression"] == f"count(DISTINCT CASE WHEN ({ft_sql}) = 'a' THEN d.k END)::bigint", cols["f_a"]["expression"]
+            assert cols["f_b"]["expression"] == f"count(DISTINCT CASE WHEN ({ft_sql}) = 'b' THEN d.k || '|' || d.s END)::bigint", cols["f_b"]["expression"]
+            assert all(cols[k]["expression"] != "NULL" and cols[k]["table"] == "real_tbl" for k in ("f_a", "f_b")), cols
+        else:
+            assert "NOT IN ({types})" in n or "NOT IN (X)" in n, n
+            tpl = [c for a, c in cols.items() if a.startswith("__expand_f_")]
+            assert len(tpl) == 1 and tpl[0]["expression"] != "NULL" and "= '{t}'" in tpl[0]["expression"] and "{key}" in tpl[0]["expression"], cols
+            xe = [x for x in xr["apis"]["g"]["dataset"] if x.get("expanded")]
+            assert len(xe) == 1 and xe[0]["column"] == "f_*" and xe[0]["type"] == "bigint" and xe[0]["table"] == "real_tbl", xe
+    # 限定評価は I/O や属性の抑え込みを通さない(決められない = 例外)
+    for bad in ("open('x')", "__import__('os')", "(1).__class__", "[].append(1)", "(lambda: 1)()"):
+        try:
+            _safe_eval(ast.parse(bad, mode="eval").body, {})
+        except Exception:  # noqa: BLE001
+            continue
+        raise AssertionError(f"_safe_eval が通した: {bad}")
+    assert _safe_eval(ast.parse("', '.join(\"'%s'\" % t for t in X)", mode="eval").body, {"X": ("a", "b")}) == "'a', 'b'"
     print("[selftest OK] extract_backend_draft")
     return 0
 
