@@ -683,10 +683,12 @@ def _expand(ex, merged, project_root, statement, src):
                 take_def(path, plines, name, DEPTH2_BLOCK_MAX)
 
 
-def _excerpt(src, project_root, cache, merged=None, statement="", budget=None):
+def _excerpt(src, project_root, cache, merged=None, statement="", budget=None, files_out=None):
     """src の行の前後 EXCERPT_CONTEXT 行(主抜粋)と、merged があれば文が指す参照先を足した抜粋を返す。読めなければ空文字。
     WHY: 出典の file は絶対パスと project_root 基準の相対が混ざるため、両方に対応する。cache はファイルごとの行の一覧。
-    budget は全体の行数の予算(None なら EXCERPT_TOTAL)。build_claims が再判定用に EXCERPT_TOTAL_WIDE で呼び直す。"""
+    budget は全体の行数の予算(None なら EXCERPT_TOTAL)。build_claims が再判定用に EXCERPT_TOTAL_WIDE で呼び直す。
+    files_out が list なら、主抜粋と参照先の断片が読んだファイルの絶対パス(str)を重複なく出現順に足す。
+    WHY: 照合の依頼文(run_units.py)が、抜粋の代わりに各ファイルの全文を載せられるようにするため(G18)。"""
     path = _resolve(src["file"], project_root)
     lines = _read_lines(path, cache)
     if lines is None:
@@ -702,6 +704,10 @@ def _excerpt(src, project_root, cache, merged=None, statement="", budget=None):
             _expand(ex, merged, project_root, statement, src)
         except (OSError, ValueError, RecursionError):
             pass  # 参照先の追加に失敗しても、主抜粋だけは返す
+    if files_out is not None:
+        for seg in ex.segs:
+            if str(seg[0]) not in files_out:
+                files_out.append(str(seg[0]))
     return ex.text()
 
 
@@ -720,7 +726,8 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
         if (text, excerpt) in prior_ok:
             continue
         # 再判定(unknown の見直し)用に、予算を広げた抜粋も添える。キャッシュ照合は上の excerpt(従来の予算)で行うので内容を変えない
-        excerpt_wide = _excerpt(src, project_root, cache, merged, text, EXCERPT_TOTAL_WIDE)
+        src_files = []  # 抜粋が読んだファイル(主+参照先)。再判定の抜粋と同じ範囲で集める
+        excerpt_wide = _excerpt(src, project_root, cache, merged, text, EXCERPT_TOTAL_WIDE, src_files)
         claims.append({
             "id": f"AC{len(claims) + 1:03d}",
             "kind": kind,
@@ -729,6 +736,7 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
             "text": text,
             "src_excerpt": excerpt,
             "src_excerpt_wide": excerpt_wide,
+            "src_files": src_files,
             "src_ref": ({"file": src["file"], "line_start": src["line_start"], "line_end": src.get("line_end")} if src else None),
         })
     return claims
@@ -927,6 +935,11 @@ def _selftest():
             return 0
         if g14_c["src_excerpt"] != _excerpt({"file": str(ap), "line_start": 13, "line_end": 13}, "", {}, merged_g14, stmt_g14):
             print("[selftest NG] src_excerpt が従来の予算の抜粋(_excerpt の既定)と変わった")
+            return 0
+        # G18: src_files は主抜粋のファイルと参照先(サーバ処理)のファイルを重複なく出現順に持ち、抜粋の中身は変えない
+        g14_names = [Path(f).name for f in g14_c["src_files"]]
+        if g14_names != [ap.name, sv.name]:
+            print(f"[selftest NG] src_files が主ファイルと参照先ファイルを重複なく持たない: {g14_c['src_files']}")
             return 0
         # G14(取り残し): (a) 読込中の表示は state を読むだけで、更新(setLoading)は useCallback の hook の中にある
         # (b) 入力の state(from)を別の state(applied)へ写す setApplied({ from }) は、文にも主抜粋にも applied が出なくても抜粋に入る

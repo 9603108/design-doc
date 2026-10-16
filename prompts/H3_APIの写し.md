@@ -16,4 +16,5 @@
 - action・key・name の字面は S2 も使う。ソースどおりに書く
 
 ## 書かない欄
-- name・description・auth・related_*・source・transform_backend・response_to_screen_mapping・error_patterns(S2)
+- name・description・auth・related_*・transform_backend・response_to_screen_mapping・error_patterns(S2)
+- response_items の source・expression・type・src(extract_backend_draft.py の下書きから合成が入れる。書いても残らない)

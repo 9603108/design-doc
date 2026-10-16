@@ -3,7 +3,7 @@
     "目的": "Phase 1 で LLM が書く欄を、委譲の単位(サブエージェント1体)ごとに分ける分担表。target/scripts/_units.py が読む",
     "書式": "owns = その単位だけが書く欄(汎用パス。'[]' は識別子つき一覧の各行)。creators = 識別子つき一覧の行を作る単位。他の単位は、作り手が作った行に欄を足すだけ",
     "識別子": "screen_layout.items=item_name / events・events_peripheral・event_processes=event_code / db_operations=id / api_spec=action / response_items=key / request_params=name / messages_backend=message_id",
-    "合成で振る欄": "screen_layout.items・validations_frontend・calculations・parameters_backend・common_logic の no は単位が書かず、_units.compose が並び順で振る(_units.NUMBERED)。合成後の必須キーは _units.REQUIRED で検査し、欠けは owns の単位へ戻す。api_spec[].response_to_screen_mapping[].screen_no も単位は書かず、add_screen_areas.py が screen_item_name から items の screen_no を写す",
+    "合成で振る欄": "screen_layout.items・validations_frontend・calculations・parameters_backend・common_logic の no は単位が書かず、_units.compose が並び順で振る(_units.NUMBERED)。合成後の必須キーは _units.REQUIRED で検査し、欠けは owns の単位へ戻す。api_spec[].response_to_screen_mapping[].screen_no も単位は書かず、add_screen_areas.py が screen_item_name から items の screen_no を写す。api_spec[].response_items[].source・expression は単位が書かず、extract_backend_draft.py の下書きから合成が入れる(src・type も同じ。担当は書かない)",
     "変更": "欄の担当を変えるときは、このファイルと prompts/<単位>_*.md の両方を直し、verify_partials.py --selftest を流す"
   },
   "units": {
@@ -28,9 +28,7 @@
         "api_spec[].auth",
         "api_spec[].related_db_operations",
         "api_spec[].related_cache_operations",
-        "api_spec[].response_items[].source",
         "api_spec[].response_items[].transform_backend",
-        "api_spec[].response_items[].expression",
         "api_spec[].response_items[].description",
         "api_spec[].response_to_screen_mapping",
         "api_spec[].response_to_screen_mapping_none_reason",

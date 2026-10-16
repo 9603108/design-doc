@@ -218,7 +218,11 @@ def _side(aliases, pt2lt, col, q, c):
 
 def _translate_condition(cond, aliases, pt2lt, col, log=None):
     """joins の「別名.列」を、下書きの table_aliases で表へ解決し「論理表.論理列」に作り直す。
-    WHY: 解決できない側は元の字面のまま残す(推測しない)。"""
+    WHY: 解決できない側は元の字面のまま残す(推測しない)。
+    G21: condition が文字列でない(dict など)のは中間 JSON の約束違反なので落としてよいが、正規表現の TypeError の追跡でなく、
+    何を直すかが分かる文言で落とす。接続: 呼出元 = fill の joins の走査(condition が空でないときだけ呼ばれる)。"""
+    if cond is not None and not isinstance(cond, str):
+        raise TypeError(f"joins の condition は文字列にしてください(型 {type(cond).__name__}: {cond!r})")
     def rep(m):
         q, c = m.group(1), m.group(2)
         pt = aliases.get(q)
@@ -609,6 +613,12 @@ def selftest():
     assert _translate_condition("s.id = p.mise_no", tl, ptl, cl) == "店舗マスタ(推定).店番号 = POS会計(推定).店番号"
     assert _translate_condition("s.id = x.mise_no", tl, ptl, cl) == "s.id = x.mise_no"
     assert _translate_condition("s.id > p.mise_no", tl, ptl, cl) == "s.id > POS会計(推定).店番号"
+    # G21: condition が dict など文字列でないときは、「joins の condition は文字列」と分かる文言で落とす
+    try:
+        _translate_condition({"left": "s.id", "right": "p.mise_no"}, tl, ptl, cl)
+        raise AssertionError("condition が dict でも落とされなかった")
+    except TypeError as e:
+        assert "joins の condition は文字列" in str(e) and "dict" in str(e), str(e)
     assert op["aggregate"][0]["alias"] == "warn_dates" and op["aggregate"][1]["alias"] == "days"
     assert all(r["logical_table"].endswith("(推定)") for r in ln), ln
     # 2回目を流しても結果が変わらない(冪等)

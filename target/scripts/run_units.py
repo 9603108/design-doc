@@ -438,6 +438,20 @@ def selftest():
             head = ps[1]["prompt"].splitlines()[0]
             assert [p["part"] for p in ps] == [1, 2] and head.startswith("あなたは part 2") and "_audit_part_2.json" in head and "AC026〜AC030" in head, head
             assert "主語26" in ps[1]["prompt"] and ps[0]["claims"][0]["id"] == "AC001", "判定項目に主語・claims の写し"
+            # G18: src_files が上限以内の項目はソース全文(見出し+行番号)を載せ text を持たせない。上限超えを含む項目は従来の抜粋。同じファイルは1 part に1回だけ
+            small_f, big_f = Path(td) / "small.py", Path(td) / "big.py"
+            small_f.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+            big_f.write_text("x = 0\n" * (AUDIT_SRC_MAX_BYTES // 6 + 10), encoding="utf-8")  # 上限を超える大きさ
+            ref = {"file": str(small_f), "line_start": 2, "line_end": 2}
+            gc = [{"id": cid, "kind": "remarks", "owner": "S1", "subject": f"全文{cid}", "text": f"文{cid}", "src_excerpt": f"抜粋{cid}", "src_ref": ref, "src_files": files}
+                  for cid, files in (("AC901", [str(small_f)]), ("AC902", [str(small_f)]), ("AC903", [str(big_f)]), ("AC904", [str(small_f), str(big_f)]))]
+            gp = build_audit_prompts("機能", gc)[0]["prompt"]
+            gitems = json.loads(gp[gp.index("- 判定項目:\n") + len("- 判定項目:\n"):])
+            assert "- ソース全文" in gp and f"==== ソース: {small_f}(全 3 行)====" in gp and "   2| b = 2" in gp, "全文の節と見出しと行番号"
+            assert gp.count(f"==== ソース: {small_f}") == 1 and f"==== ソース: {big_f}" not in gp, "同じファイルは1 part に1回、上限超えは載せない"
+            assert all("text" not in i["src_excerpt"] for i in gitems[:2]) and gitems[0]["src_files"] == [str(small_f)], "全文を載せた項目は text を持たない"
+            assert [i["src_excerpt"].get("text") for i in gitems[2:]] == ["抜粋AC903", "抜粋AC904"], "上限超えを含む項目は従来の抜粋"
+            assert "==== ソース:" not in ps[0]["prompt"] and "全文の節" not in ps[0]["prompt"], "src_files 無しの claims は全文の節を出さない"
 
             def write(n, ids, extra=None):
                 rows = [{"id": i, "verdict": "ok", "evidence_line": 1, "reason": "r"} for i in ids] + (extra or [])
@@ -608,13 +622,45 @@ def audit_sendbacks(rows, units):
 
 
 AUDIT_BATCH = 25  # WHY: 1依頼あたりの判定項目の上限。Haiku の1回の読みを小さく保ち、part を分けて書かせる
+# WHY: 1ファイルの全文を依頼文に載せる上限(バイト)。大きすぎると Haiku の1回の読みが崩れるので、超えるファイルは従来の抜粋に戻す(G18)
+AUDIT_SRC_MAX_BYTES = 60000
 
 
-def _audit_item(c):
+def _audit_sources(batch):
+    """batch の判定項目が参照するソースファイル(claim の src_files)の全文を、行番号つきで1回ずつ並べる。(text, full_ids) を返す。
+    WHY(G18): 抜粋を参照の識別子で継ぎ足す方式では、142件中31件が「根拠が抜粋の外」で unknown のまま残った。全文なら外に出ない。
+    full_ids は src_files の全部が載った項目の id。src_files が空・読めない・上限超えのファイルを含む項目は入れない(従来の抜粋で渡す)。
+    呼出元: build_audit_prompts(audit の依頼文)。"""
+    blocks, bad = {}, set()
+    for c in batch:
+        for f in c.get("src_files") or []:
+            if f in blocks or f in bad:
+                continue
+            try:
+                raw = Path(f).read_bytes()
+            except OSError:
+                bad.add(f)
+                continue
+            if len(raw) > AUDIT_SRC_MAX_BYTES:
+                bad.add(f)
+                continue
+            lines = raw.decode("utf-8", errors="replace").splitlines()
+            blocks[f] = f"==== ソース: {f}(全 {len(lines)} 行)====\n" + "\n".join(f"{i:4d}| {ln}" for i, ln in enumerate(lines, 1))
+    full_ids = {c["id"] for c in batch if c.get("src_files") and all(f in blocks for f in c["src_files"])}
+    used = {f for c in batch if c["id"] in full_ids for f in c["src_files"]}  # 全文で渡す項目が使うファイルだけ載せる
+    return "\n\n".join(b for f, b in blocks.items() if f in used), full_ids
+
+
+def _audit_item(c, full=False):
     """判定項目 1 件を、判定の担当に渡す形(id・主語・文・抜粋)にする。audit の依頼文と再判定の依頼文が同じ形を使う。
-    WHY: 文だけでは何の記述か分からない項目(「点数と金額の2列。左段」)があり、担当が unknown を返していた。主語(subject)を添える。"""
+    WHY: 文だけでは何の記述か分からない項目(「点数と金額の2列。左段」)があり、担当が unknown を返していた。主語(subject)を添える。
+    full が真のとき(ソース全文を依頼文の上に載せた項目)は、src_excerpt を text なしの出典(file・line_start・line_end)にし、
+    読むべきファイルを src_files で指す。偽のときは従来どおり text(抜粋)を持つ。"""
+    ref = c.get("src_ref") or {}
+    if full:
+        return {"id": c["id"], "subject": c.get("subject") or "", "statement": c["text"], "src_excerpt": dict(ref), "src_files": list(c.get("src_files") or [])}
     return {"id": c["id"], "subject": c.get("subject") or "", "statement": c["text"],
-            "src_excerpt": {**(c.get("src_ref") or {}), "text": c.get("src_excerpt") or ""}}
+            "src_excerpt": {**ref, "text": c.get("src_excerpt") or ""}}
 
 
 def build_audit_prompts(feat, claims):
@@ -626,6 +672,9 @@ def build_audit_prompts(feat, claims):
     part の番号は 1 始まりで、配列の位置とは別に各要素が持ち(part)、本文にも書く。audit-check はこの part と ids を正として照合する。
     各要素の claims は、audit が判定に渡した判定項目の写し。audit-check はこれを正とする
     (claims.json が audit の後で作り直されて id がずれても、判定を別の項目に結ばないため)。
+    WHY(G18): 抜粋を参照の識別子で継ぎ足す方式では、run21 でも142件中31件が「根拠が抜粋の外」で unknown のまま残った。
+    そこで各 part が参照するソースファイルの全文を行番号つきで1回ずつ判定項目の前に載せ、全文を載せた項目は出典の行範囲で指す。
+    1ファイルが AUDIT_SRC_MAX_BYTES を超える(Haiku の1回の読みが崩れる)項目だけは、従来どおり抜粋(text)で渡す。
     接続: 呼出元 = main の audit 分岐。手順書は prompts/AU_意味の照合.md(入力の形は判定項目の subject・statement・src_excerpt)。
     """
     au = SKILL / "prompts" / "AU_意味の照合.md"
@@ -634,14 +683,19 @@ def build_audit_prompts(feat, claims):
     for n, batch in enumerate(chunks, 1):
         out = INTER / f"{feat}_audit_part_{n}.json"
         first, last = batch[0]["id"], batch[-1]["id"]
+        src_text, full_ids = _audit_sources(batch)
+        src_part = (["- ソース全文(行番号つき。判定の根拠はここだけ。載せたソースの外を根拠にしない):", src_text,
+                     "- 全文を載せた項目(src_files あり・text なし)の evidence_line は、ソースファイルの行番号(出典 line_start〜line_end の中の行番号。見出し行の番号ではない)。"
+                     "抜粋(text)を持つ項目は従来どおり text の先頭を1とする"] if src_text else [])
         prompt = "\n".join([
             f"あなたは part {n}(全 {len(chunks)} part)。書き先は {out}。判定項目は {first}〜{last} の {len(batch)} 件。",
             f"design-doc の意味の照合(haiku)。機能名: {feat}。",
             f"- 手順書: {au}(読んで従う。正解はソースの抜粋だけ)",
             f"- 書くのは {out} の1ファイルだけ。他の part のファイルは書かない。"
             f"中身は判定の JSON 配列(id・verdict・evidence_line・reason)を、下の判定項目と同じ順・同じ {len(batch)} 件で。id は {first}〜{last} のものだけ",
+            *src_part,
             "- 判定項目:",
-            json.dumps([_audit_item(c) for c in batch], ensure_ascii=False, indent=1),
+            json.dumps([_audit_item(c, full=c["id"] in full_ids) for c in batch], ensure_ascii=False, indent=1),
         ]) + "\n"
         prompts.append({"part": n, "subagent_type": SUBAGENT_TYPE, "model": "haiku", "out": str(out), "first_id": first, "last_id": last,
                         "ids": [c["id"] for c in batch], "claims": batch, "prompt": prompt})
@@ -920,18 +974,23 @@ def main(argv=None):
         if unknown and not (INTER / f"{a.feature}_audit_part_retry.json").exists():
             # WHY: Haiku で決められなかった件(unknown)だけを sonnet に1回判定させる。ok を含む全件は読み直さない
             retry_out = INTER / f"{a.feature}_audit_part_retry.json"
-            # WHY(G14 run20): 再判定には予算を広げた抜粋(src_excerpt_wide)を渡す。無い項目(旧形式の claims)は従来の src_excerpt のまま。_audit_item 自体は通常の判定の形を保つ
+            # WHY(G18): 再判定もソースの全文(行番号つき)を載せ、全文が載った項目は出典の行範囲で指す。抜粋を継ぎ足す方式では外に出た根拠を拾えない。
+            # 上限超え・読めない・旧形式(src_files 無し)の項目だけは、従来どおり予算を広げた抜粋(src_excerpt_wide)。無ければ src_excerpt(G14 run20)
+            src_text, full_ids = _audit_sources(unknown)
             items = []
             for c in unknown:
-                it = _audit_item(c)
-                if c.get("src_excerpt_wide"):
+                it = _audit_item(c, full=c["id"] in full_ids)
+                if c["id"] not in full_ids and c.get("src_excerpt_wide"):
                     it["src_excerpt"]["text"] = c["src_excerpt_wide"]
                 items.append(it)
+            src_part = ["- ソース全文(行番号つき):", src_text] if src_text else []
             prompt = "\n".join([
                 f"design-doc の意味の照合の再判定(sonnet)。機能名: {a.feature}。",
                 f"- 手順書: {SKILL / 'prompts' / 'AU_意味の照合.md'}(読んで従う)",
                 f"- 書くのは {retry_out} の1ファイルだけ。中身は判定の JSON 配列(id・verdict・evidence_line・reason)",
-                "- 決まり: 抜粋(src_excerpt_wide を入れた src_excerpt.text)に無い物を根拠に ok にしない。抜粋で確かめられなければ unknown のまま返す",
+                "- 決まり: 載せたソース(全文の節、または抜粋の text)の外を根拠に ok にしない。確かめられなければ unknown のまま返す。"
+                "evidence_line は全文の項目(src_files あり・text なし)ではソースファイルの行番号、抜粋の項目では text の先頭を1とする",
+                *src_part,
                 "- 判定項目:",
                 json.dumps(items, ensure_ascii=False, indent=1),
             ]) + "\n"

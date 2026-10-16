@@ -1293,6 +1293,27 @@ def _docstring_counts(mods):
     return out
 
 
+def _field_sources(a):
+    """応答欄(a["response_fields"])のうち、末尾の名前が SQL 列の別名と一致する欄に、ソースから機械で決まる source・expression・src を足す。
+    なぜ: 欄の起源(db か calculated か・どの DB 操作のどの列か・出典行)は担当(S2・H3)に書かせると run ごとに揺れるため、下書きで決める。
+    接続: extract の B3 ブロックから呼ばれ、_compose_response._fill_sources が response_items へ写す(契約 i3.k1)。
+    別名が一致しない欄(rows・group のような入れ物、型だけの欄)には足さない。同じ別名が複数の DB 操作にあるときは下書きの並びで最初のものに決める。"""
+    first = {}
+    for o in a["db_operations"]:
+        for c in o["columns"]:
+            first.setdefault(c["alias"], (o, c))
+    for f in a["response_fields"]:
+        o_c = first.get(f["path"].replace("[]", "").rsplit(".", 1)[-1])
+        if not o_c:
+            continue
+        o, c = o_c
+        expr = c["expression"]
+        # 素の列参照(t.a・a)だけ db。関数・集計・演算・CASE を含む式は calculated
+        f["source"] = {"type": "db" if re.fullmatch(r"[\w.]+", expr) else "calculated", "op": o["id"], "column": c["alias"]}
+        f["expression"] = expr
+        f["src"] = [{k: s[k] for k in ("file", "line_start", "line_end")} for s in o["src"]]
+
+
 def extract(files, hints=None):
     """backend ファイル(Path の並び)から {apis, unresolved} を作る。
     hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。"""
@@ -1315,7 +1336,13 @@ def extract(files, hints=None):
     apis, unresolved, tables = {}, [], set()
     # (ファイル, 名前) → その名前を関数の中で使う API の action。logic_candidates の used_by になる(画面ごとの共通ロジックの候補の絞り込みに使う)
     uses = {}
-    for mod in list(mods.values()):  # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ
+    # WHY(G19): apis の並びは API の番号(B001…)を決める。run20 と run21 で backend_files の渡し順が違い、list_pos_shops と
+    # list_pos_account_report が入れ替わった。走査するモジュールの順を渡し順に依存させず、入口モジュール(他のモジュールの imports から
+    # 参照されない)を先、補助モジュールを後にし、同じ区分では stem の昇順にする。入口ファイルの表での出現順は変えない。
+    # 接続: 並べ替えた mods の走査 → apis の挿入順(= 下流の B 番号)。
+    referenced = {s for m in mods.values() for s in m.imports.values()}
+    # _callees が補助のモジュールを mods へ足すので、走査は最初の backend_files だけ(list() で今の分に固定)
+    for mod in sorted(mods.values(), key=lambda m: (m.path.stem in referenced, m.path.stem)):
         for n in mod.tree.body:
             if not (isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and n.value.keys):
                 continue
@@ -1407,6 +1434,7 @@ def extract(files, hints=None):
                     if typ and path not in have:
                         have.add(path)
                         a["response_fields"].append({**idx, "path": path, "sql_hint": c["expression"], "db_type": typ, "db_nullable": nul})
+        _field_sources(a)  # 別名が一致する欄に source・expression・src を足す(契約 i3.k1)
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
     for e in [e for a in apis.values() for e in a["error_patterns"]] + [e for a in auth for e in a["error_patterns"]]:
@@ -1472,6 +1500,11 @@ def selftest():
     assert rf["rows[].b"]["nullable"] is True and rf["rows[].b"]["ts_base"] == "number", rf
     assert rf["rows[].name"]["nullable"] is False and rf["tags"]["ts_base"] == "string[]" and rf["n"]["ts_base"] == "number", rf
     assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
+    # G20: 別名が一致する欄だけ source(db / calculated)・expression・src を持つ。入れ物(rows)・別名の無い欄には付けない
+    assert rf["rows[].name"]["source"] == {"type": "db", "op": "db_op_get_x", "column": "name"} and rf["rows[].name"]["expression"] == "s.name", rf["rows[].name"]
+    assert rf["rows[].b"]["source"]["type"] == "calculated" and rf["rows[].b"]["source"]["op"] == "db_op_get_x", rf["rows[].b"]
+    assert rf["rows[].b"]["src"] and set(rf["rows[].b"]["src"][0]) == {"file", "line_start", "line_end"}, rf["rows[].b"]
+    assert "source" not in rf["rows"] and "src" not in rf["rows"], rf["rows"]
     # F4: SQL に入る定数(COND)は共通ロジックの候補。中身が SQL らしくない定数(COLS)は出さない
     assert [(c["name"], c["kind"], c["text"], c["runs_on"]) for c in r["logic_candidates"]] == [("COND", "sql_condition", "t.b IS NULL", "データベース")], r["logic_candidates"]
     # 差4: 候補は、使う API の action(used_by)と、直上の # コメントを持つ。使う API が無い定数は used_by が空
@@ -1641,6 +1674,20 @@ def selftest():
         (Path(d) / "m.py").write_text('"""店番号(mise_no) の表。"""\n# 件数: cnt\n# 店舗番号(mise_no) も見る\n', encoding="utf-8")
         dterms = extract([Path(d) / "m.py"])["docstring_terms"]
     assert dterms == {"mise_no": ["店番号", "店舗番号"], "cnt": ["件数"]}, dterms
+    # G19: apis の並びは入口モジュールの表での出現順。backend_files の渡し順・キーの辞書順に左右されない
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "e.py").write_text('import h\nT = {"zz_b": h.fb, "aa_a": h.fa}\n', encoding="utf-8")
+        (Path(d) / "h.py").write_text('def fa(p):\n    return {"k": 1}\ndef fb(p):\n    return {"k": 1}\n', encoding="utf-8")
+        for order in (["e.py", "h.py"], ["h.py", "e.py"]):
+            got = list(extract([Path(d) / n for n in order])["apis"])
+            assert got == ["zz_b", "aa_a"], f"apis の並びが backend_files の順や名前順に左右された: {order} → {got}"
+    # 表を持つ入口モジュールが複数あるときも、backend_files の渡し順ではなくモジュール名順で並ぶ(渡し順の走査だと b1 が先になる順がある)
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "b.py").write_text('def fb(p):\n    return {"k": 1}\nT = {"b1": fb}\n', encoding="utf-8")
+        (Path(d) / "a.py").write_text('def fa(p):\n    return {"k": 1}\nT = {"a1": fa}\n', encoding="utf-8")
+        for order in (["b.py", "a.py"], ["a.py", "b.py"]):
+            got = list(extract([Path(d) / n for n in order])["apis"])
+            assert got == ["a1", "b1"], f"入口モジュールが複数のとき apis の並びが backend_files の順に左右された: {order} → {got}"
     print("[selftest OK] extract_backend_draft")
     return 0
 

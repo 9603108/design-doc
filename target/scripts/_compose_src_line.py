@@ -94,6 +94,23 @@ def _draft_src(directory):
     return out
 
 
+def _draft_field_src(directory):
+    """下書きの {action: {response_fields の path: src の配列}}(契約 i3.k1)。src を持つ欄だけ。読めないファイルは飛ばす。
+    WHY: response_items の src(出典の行)は backend と frontend のどちらを指すかが run ごとに揺れたため、SQL の出典を持つ下書きの値に固定する。
+    接続: fill が response_items の key と path を突き合わせて src を置き換える。"""
+    out = {}
+    for p in sorted(Path(directory).glob("*_backend_draft.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for act, a in (d.get("apis") or {}).items():  # fallback-ok: 下書きの apis は任意
+            if isinstance(a, dict):
+                out[act] = {f["path"]: [s for s in f["src"] if isinstance(s, dict)] for f in a.get("response_fields") or []
+                            if isinstance(f, dict) and f.get("path") and isinstance(f.get("src"), list) and f["src"]}
+    return out
+
+
 def _by_draft(s, drafts):
     """s が下書きの src の1件と「+1 するとちょうど一致」するなら、その下書きの src。違えば s。
     WHY: 関数の範囲は名前が範囲の先頭の行に出るので、0始まりでずれても本文の照合(_fix_api)では分からない。下書きの行(AST)が正。"""
@@ -128,7 +145,7 @@ def _fix_list(srcs, fix, label, log):
 def fill(out, log):
     """api_spec の行と request_params の行の src の1行ずれを直す。下書き・ソースが読めなければ何もしない。"""
     from _config_loader import INTERMEDIATE_DIR
-    drafts, cache = _draft_src(INTERMEDIATE_DIR), {}
+    drafts, cache, fsrc = _draft_src(INTERMEDIATE_DIR), {}, _draft_field_src(INTERMEDIATE_DIR)
     for api in out.get("api_spec") or []:  # fallback-ok: api_spec は任意
         if not isinstance(api, dict) or not api.get("action"):
             continue
@@ -142,6 +159,12 @@ def fill(out, log):
             n = re.escape(str(p["name"]))
             rx_p = re.compile(r"[\"']" + n + r"[\"']|\b" + n + r"\??\s*[:=]")
             p["src"] = _fix_list(p["src"], lambda s: _fix_param(s, rx_p, cache), f"api_spec[{act}].request_params[{p['name']}]", log)
+        # G20: response_items の src は下書きの SQL の出典(契約 i3.k1)に固定する。下書きに src が無い欄は触らない
+        for x in api.get("response_items") or []:  # fallback-ok: response_items は任意
+            new = fsrc.get(act, {}).get(x.get("key")) if isinstance(x, dict) else None
+            if new and x.get("src") != new:
+                log.append(f"[出典] api_spec[{act}].response_items[{x['key']}] の src を下書きの SQL の出典 {[_vs_common.span(s) for s in new]} に直す")
+                x["src"] = new
 
 
 def _selftest():
@@ -151,6 +174,25 @@ def _selftest():
     import copy
     import tempfile
     import _config_loader
+    # G20: response_items の src は、下書きの response_fields に src がある欄だけ置き換わる。src の無い欄と、response_items の src 以外の欄(display_name 等)は残る
+    with tempfile.TemporaryDirectory() as gd:
+        gs = {"file": "q.py", "line_start": 3, "line_end": 9}
+        Path(gd, "G_backend_draft.json").write_text(json.dumps({"apis": {"ga": {"response_fields": [
+            {"path": "rows[].t", "src": [gs]}, {"path": "rows[].u"}]}}}), encoding="utf-8")
+        assert _draft_field_src(gd) == {"ga": {"rows[].t": [gs]}}, _draft_field_src(gd)
+        orig_g = _config_loader.INTERMEDIATE_DIR
+        try:
+            _config_loader.INTERMEDIATE_DIR = Path(gd)
+            gout = {"api_spec": [{"action": "ga", "response_items": [
+                {"key": "rows[].t", "display_name": "合計", "src": [{"file": "app.tsx", "line_start": 1, "line_end": 1}]},
+                {"key": "rows[].u", "src": [{"file": "app.tsx", "line_start": 2, "line_end": 2}]}]}]}
+            glog = []
+            fill(gout, glog)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = orig_g
+        gt, gu = gout["api_spec"][0]["response_items"]
+        assert gt["src"] == [gs] and gt["display_name"] == "合計" and len(glog) == 1, (gt, glog)
+        assert gu["src"] == [{"file": "app.tsx", "line_start": 2, "line_end": 2}], gu
     with tempfile.TemporaryDirectory() as td:
         h = Path(td, "handler.py")
         h.write_text('ACTIONS = {\n    "list_kinds": f,\n    # 注記1\n    # 注記2\n    "list_a": g,\n    "list_b": h,\n}\n'

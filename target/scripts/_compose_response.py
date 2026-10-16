@@ -296,6 +296,34 @@ def _fill_types(api, bd, log):
             log.append(f"[型] api_spec[{api.get('action')}].response_items[{key}] を事実で決める: {old[0]}・null可 {old[1]} → {new[0]}・null可 {new[1]}")
 
 
+def _fill_sources(out, api, bd, log):
+    """response_items の source(type・source_column・source_ref)と expression を、backend 下書きの response_fields の事実(契約 i3.k1)で決める。
+    WHY: 欄の起源は担当(S2)に書かせると run ごとに揺れる(pos_account_reports と DB2 など)ため、extract_backend_draft._field_sources が決めた値を写す。
+    下書きに source が無い欄・response_items に同じ key の行が無い欄は触らない。source_ref は、下書きの op(db_op_…)が out の db_operations の行
+    (id か、番号振り後の legacy_id が一致)に引けるときだけ設定し、引けないときは変えずにログに残す。"""
+    ids = {r.get(k) for r in _list(out, "db_operations") for k in ("id", "legacy_id") if r.get(k)}
+    facts = {f.get("path"): f for f in bd.get("response_fields") or [] if isinstance(f, dict) and isinstance(f.get("source"), dict)}
+    for x in _list(api, "response_items"):
+        key = str(x.get("key") or "")
+        f = facts.get(key)
+        if not f:
+            continue
+        s = x.get("source") if isinstance(x.get("source"), dict) else {}
+        old = (s.get("type"), s.get("source_ref"), s.get("source_column"), x.get("expression"))
+        s["type"], s["source_column"] = f["source"].get("type"), f["source"].get("column")
+        op = f["source"].get("op")
+        if op in ids:
+            s["source_ref"] = op
+        else:
+            log.append(f"[出典] api_spec[{api.get('action')}].response_items[{key}] の source_ref は下書きの op {op} を db_operations に引けないので変えない")
+        x["source"] = s
+        if f.get("expression") is not None:
+            x["expression"] = f["expression"]
+        new = (s.get("type"), s.get("source_ref"), s.get("source_column"), x.get("expression"))
+        if new != old:
+            log.append(f"[出典] api_spec[{api.get('action')}].response_items[{key}] を下書きの事実で決める: {old} → {new}")
+
+
 def fill(out, log):
     """api_spec の各行を補う。下書きが無い API は、下書きの db 操作の数が 0 なので b) は動かず、a) の列の参照も空になる。"""
     from _config_loader import INTERMEDIATE_DIR
@@ -309,6 +337,7 @@ def fill(out, log):
         _fix_merged_source(api, len(dbs), log)
         _fill_screen_nth(api, specs, log)
         _fill_types(api, bd, log)
+        _fill_sources(out, api, bd, log)
 
 
 def _selftest():
@@ -341,6 +370,20 @@ def _selftest():
         a2 = {"action": "a", "response_items": [{"key": "k", "source": {"type": "merged", "source_ref": "x"}}]}
         _fix_merged_source(a2, n, [])
         assert a2["response_items"][0]["source"]["type"] == want, (n, a2)
+
+    # G20: 下書きに source がある欄だけ type・source_column・expression を書き換え、source_ref は db_operations に引けるときだけ。無い欄は元のまま
+    a3 = {"action": "g", "response_items": [{"key": "rows[].t", "source": {"type": "merged", "source_ref": "old"}, "expression": "x"},
+                                          {"key": "rows[].u", "source": {"type": "const", "source_ref": "keep"}, "expression": "keep"},
+                                          {"key": "rows[].v", "source": {"type": "merged", "source_ref": "old"}}]}
+    bd3 = {"response_fields": [{"path": "rows[].t", "source": {"type": "calculated", "op": "db_op_g", "column": "t"}, "expression": "SUM(t.k)"},
+                               {"path": "rows[].v", "source": {"type": "db", "op": "db_op_zz", "column": "v"}, "expression": "t.v"},
+                               {"path": "rows[].u"}]}
+    log3 = []
+    _fill_sources({"db_operations": [{"id": "DB1", "legacy_id": "db_op_g"}]}, a3, bd3, log3)
+    g_t, g_u, g_v = a3["response_items"]
+    assert g_t["source"] == {"type": "calculated", "source_ref": "db_op_g", "source_column": "t"} and g_t["expression"] == "SUM(t.k)", g_t
+    assert g_u == {"key": "rows[].u", "source": {"type": "const", "source_ref": "keep"}, "expression": "keep"}, g_u
+    assert g_v["source"]["type"] == "db" and g_v["source"]["source_ref"] == "old" and g_v["expression"] == "t.v" and any("db_op_zz" in m for m in log3), (g_v, log3)
 
     # c) 「小計」が3つ(kin s3・s4・cnt n5)のとき、kin か cnt の末尾の語で nth を引く。「合計」は1つだけなので入れない。
     #    どの表示行にも無い語(s9)は入れない
