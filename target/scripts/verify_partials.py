@@ -37,6 +37,7 @@ import re
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
+import _config_loader  # 下書き・設定を機能名で1本に決める(draft_files / resolve_feature_name)
 
 # 意味合い: 概要は業務担当者が一目で読む長さに抑える取り決め(30 字)。値が変わるならここだけを直す
 OVERVIEW_MAX = 30
@@ -167,7 +168,11 @@ def selftest():
         todo["event_processes"][1]["details"] = [DETAIL_TODO, "・load をリクエストする"]
         assert [p for p in check_partial(todo, "受注入力") if p.startswith("[未記入]")], "未記入の印を検出しない"
 
+        # 下書きは機能名の1本だけ読む。試験の下書き(x_*_draft.json)に合わせて機能名を x にする(実の target/intermediate の下書きは読まない)
+        import os
+        os.environ["FEATURE_NAME"] = "x"
         selftest_units()
+        selftest_feature()
         selftest_warn()
         import verify_vs_source
         assert verify_vs_source.selftest() == 0
@@ -297,7 +302,7 @@ def check_unit_extras(frags, directory):
     problems = []
     s1 = frags.get("S1")
     if s1 is not None:
-        for p in sorted(Path(directory).glob("*_react_draft.json")):
+        for p in _config_loader.draft_files("react", directory):  # 機能名の下書き1本(別画面の下書きを読まない)
             try:
                 rows = json.loads(p.read_text(encoding="utf-8")).get("display_rows") or []
             except (OSError, json.JSONDecodeError):
@@ -318,7 +323,7 @@ def check_unit_extras(frags, directory):
             if bad:
                 problems.append(f"[英語キー] db_operations[{op.get('id')}].{fld}: 日本語のキー {', '.join(bad)}(英語のキー名で書く) → 差し戻し先 H2")
     if frags.get("H2") is not None:
-        for p in sorted(Path(directory).glob("*_backend_draft.json")):
+        for p in _config_loader.draft_files("backend", directory):  # 機能名の下書き1本
             try:
                 draft = json.loads(p.read_text(encoding="utf-8"))
                 problems += check_h2_columns(frags["H2"], draft) + check_h2_features(frags["H2"], draft)
@@ -482,7 +487,10 @@ def _verify_overrides(directory):
     d = Path(directory)
     vo, sc = {}, {}
     for suffix, slot in (("_project_config.json", "pc"), ("_screen_config.json", "sc")):
-        for p in sorted(d.glob(f"*{suffix}"))[:1]:
+        # 機能名の設定1本(別画面の設定を拾わない)。無い設定は空のまま
+        for p in [d / f"{_config_loader.resolve_feature_name()}{suffix}"]:
+            if not p.exists():
+                continue
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -719,9 +727,26 @@ def check_db_exception_wording(frags):
     return problems
 
 
-def main_units(directory, only=None):
-    """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。"""
+def resolve_units_feature(feature=None):
+    """--units の機能名を決める。--feature を優先し、無ければ環境変数 FEATURE_NAME。どちらも無ければ None(推測して選ばない)。
+    決めた値は環境変数 FEATURE_NAME にも入れる(下書き・設定を読む側 _config_loader.draft_files が同じ値を使う)。"""
+    import os
+    name = feature or os.environ.get("FEATURE_NAME") or None
+    if name:
+        os.environ["FEATURE_NAME"] = name
+    return name
+
+
+def main_units(directory, only=None, feature=None):
+    """--units の入口。分担表と断片を読み、_units.check_all の問題を出す。終了コード 0/1/2。
+    機能名(--feature か環境変数 FEATURE_NAME)を必ず求める。無いと終了コード 2 で止める。
+    下書き・設定はその機能名の1本だけ読み、断片の meta.feature_name が違う・無いと ERROR。"""
     import _units
+    feature = resolve_units_feature(feature)
+    if not feature:
+        print("[入力不正] 機能名が決まらない。--feature <機能名> か環境変数 FEATURE_NAME で、どの画面かを必ず指定する"
+              "(断片 _unit_*.json は機能名に依らない固定名なので、推測して別の画面の下書きを読まない)", file=sys.stderr)
+        return 2
     if not directory:
         from _config_loader import INTERMEDIATE_DIR
         directory = INTERMEDIATE_DIR
@@ -735,6 +760,7 @@ def main_units(directory, only=None):
         print(f"[入力不正] {directory} に _unit_*.json が無い", file=sys.stderr)
         return 2
     problems += _units.check_all(spec, frags, only)
+    problems += [p for p in _units.check_feature(frags, feature) if not only or f"差し戻し先 {only}" in p]
     extra = check_unit_extras(frags, directory) + check_example_format(frags)
     # 合成後の穴(画面への写しの欠け・400 の検査の漏れ)。project_config を渡して下書きの展開済み ID へ寄せた形で見る
     composed = _units.compose(spec, frags, {})  # check_composed_gaps と check_src_warn(合成の後に数える)で使い回す
@@ -754,11 +780,11 @@ def main_units(directory, only=None):
         print(w)
     for w in check_src_warn(composed, spec, skip) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags) + check_data_type_warn(frags):
         print(w)
-    # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
+    # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は --feature / FEATURE_NAME で決めたもの(下書きのファイル名からは取らない)
     s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
-    for p in sorted(Path(directory).glob("*_react_draft.json"))[:1]:
+    for _p in _config_loader.draft_files("react", directory):
         import verify_vs_source
-        for w in verify_vs_source.check_examples(s1_items, verify_vs_source.source_strings(p.name[:-len("_react_draft.json")])):
+        for w in verify_vs_source.check_examples(s1_items, verify_vs_source.source_strings(feature)):
             print(w)
     if problems:
         return 1
@@ -972,6 +998,72 @@ def selftest_units():
     assert check_error_rows(s2(ok_row)) == [], "message_id のある行を ERROR にした"
 
 
+def selftest_feature():
+    """機能名の取り違え(棚分析の検査が POS会計レポートの下書きを読んだ事故)を防ぐ仕組みを assert する。
+    a) 下書きは機能名の1本だけ読む(別画面の下書きを読まない)。機能名が無ければ止める
+    b) 断片の meta.feature_name が無い・違うと ERROR。meta は欄の担当の検査と合成に入れない
+    c) --units は機能名(--feature / FEATURE_NAME)が無ければ終了コード 2、断片の機能名が違えば 1。環境は戻す"""
+    import contextlib
+    import io
+    import os
+    import tempfile
+    import _units
+    spec = _units.load_spec()
+    saved = os.environ.pop("FEATURE_NAME", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            for name in ("A", "B"):
+                Path(td, f"{name}_react_draft.json").write_text("{}", encoding="utf-8")
+            # a) 機能名 A のとき A の下書きだけ(B を読まない)。下書きが無い機能名は []。機能名が無いと SystemExit
+            os.environ["FEATURE_NAME"] = "A"
+            assert [p.name for p in _config_loader.draft_files("react", td)] == ["A_react_draft.json"], "別画面の下書きを読んだ"
+            assert _config_loader.draft_files("backend", td) == [], "下書きが無いのに返った"
+            os.environ["FEATURE_NAME"] = "C"
+            assert _config_loader.draft_files("react", td) == [], "機能名 C に別画面の下書きを充てた"
+            del os.environ["FEATURE_NAME"]
+            try:
+                _config_loader.draft_files("react", td)
+                raise AssertionError("機能名が無いのに下書きを拾った(推測して選んだ)")
+            except SystemExit:
+                pass
+            # 実際の読み手: H2 の列の省略の検査。B の下書きにだけ列があるとき、機能名 A は列の省略を出さない
+            Path(td, "A_backend_draft.json").write_text(json.dumps({"apis": {"save": {"db_operations": [{"id": "db_op_save", "columns": []}]}}}), encoding="utf-8")
+            Path(td, "B_backend_draft.json").write_text(json.dumps({"apis": {"save": {"db_operations": [{"id": "db_op_save", "columns": [
+                {"alias": "shop_name", "kind": "alias_only", "physical_column": "shop_name", "real_column": "", "alias_name": "shop_name", "table": "shops", "column": ""}]}]}}}), encoding="utf-8")
+            h2 = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"}, "dataset": []}], "logical_names": []}
+            os.environ["FEATURE_NAME"] = "A"
+            assert not [p for p in check_unit_extras({"H2": h2}, td) if p.startswith("[列の省略]")], "機能名 A の検査が B の下書きの列を読んだ"
+            os.environ["FEATURE_NAME"] = "B"
+            assert [p for p in check_unit_extras({"H2": h2}, td) if p.startswith("[列の省略]")], "機能名 B の下書きの列を読まなかった"
+            # b) meta.feature_name: 違う(H2)・無い(H3)は ERROR、同じ(H1)は問題なし。行末の「→ 差し戻し先 <単位>」で単位へ戻す
+            os.environ["FEATURE_NAME"] = "A"
+            h1 = {"meta": {"feature_name": "A"}, "events": [{"event_code": "EV00", "trigger": "A画面の初期表示時", "content": "表示する", "classification": "サーバー"}]}
+            frags = {"H1": h1, "H2": {"meta": {"feature_name": "B"}}, "H3": {}}
+            out = _units.check_feature(frags, "A")
+            assert len(out) == 2 and out[0].startswith("[機能名の食い違い]") and out[0].endswith("差し戻し先 H2") \
+                and out[1].startswith("[機能名なし]") and out[1].endswith("差し戻し先 H3"), out
+            assert _units.check_feature({"H1": h1}, "A") == [], "同じ機能名を ERROR にした"
+            # meta は欄ではない: 担当外(範囲外)にも合成の最上位にも入れない
+            assert _units.check_fragments(spec, {"H1": h1}) == [], _units.check_fragments(spec, {"H1": h1})
+            assert "meta" not in _units.compose(spec, {"H1": h1}), "meta を合成の最上位に入れた"
+            # c) --units: 機能名が無ければ 2(推測しない)、断片の機能名が違えば 1
+            Path(td, "A_react_draft.json").unlink()  # S1 の example の WARN は screen_config(ソースの場所)を要するので、ここでは走らせない
+            Path(td, "_unit_H1.json").write_text(json.dumps({"meta": {"feature_name": "B"}, "events": h1["events"]}), encoding="utf-8")
+            del os.environ["FEATURE_NAME"]
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                assert main(["--units", td]) == 2, "機能名が無いのに --units が止まらない"
+            assert "機能名が決まらない" in err.getvalue(), err.getvalue()
+            assert "FEATURE_NAME" not in os.environ, "機能名が無いのに環境を書き換えた"
+            with contextlib.redirect_stdout(io.StringIO()) as so:
+                assert main(["--units", td, "--feature", "A"]) == 1, "断片の機能名が違うのに通した"
+            assert "[機能名の食い違い] _unit_H1.json" in so.getvalue(), so.getvalue()
+    finally:
+        if saved is None:
+            os.environ.pop("FEATURE_NAME", None)
+        else:
+            os.environ["FEATURE_NAME"] = saved
+
+
 def selftest_warn():
     """説明の要の語が出典の範囲に無いときの [WARN]、例示値の {名前} の [WARN]、日付の例示値の書式の ERROR を assert する。"""
     import tempfile
@@ -1078,12 +1170,13 @@ def main(argv=None):
     p.add_argument("--units", nargs="?", const="", default=None,
                    help="委譲の単位ごとの断片 _unit_*.json のフォルダ(省略時 target/intermediate)を検査する")
     p.add_argument("--unit", help="--units と併用。その単位に関わる問題だけを出す")
+    p.add_argument("--feature", help="--units と併用。検査する画面の機能名(省略時は環境変数 FEATURE_NAME。どちらも無いと止める)")
     args = p.parse_args(argv)
 
     if args.selftest:
         return selftest()
     if args.units is not None:
-        return main_units(args.units, args.unit)
+        return main_units(args.units, args.unit, args.feature)
     if not args.partial or not args.screen_name:
         print("[入力不正] partial と --screen-name が必要", file=sys.stderr)
         return 2

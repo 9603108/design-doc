@@ -116,8 +116,13 @@ def _compose(out, files, log):
 
 
 def fill(out, log):
-    """_run_fillers から呼ばれる入口。機能名は環境変数 FEATURE_NAME から取る(無ければ out の src だけで照合する)。"""
-    _compose(out, _source_files(out, os.environ.get("FEATURE_NAME")), log)
+    """_run_fillers から呼ばれる入口。機能名は環境変数 FEATURE_NAME から取る(無い・その機能名の screen_config が無いときは out の src だけで照合する)。
+    WHY: 下書きを機能名で選ぶため、試験は FEATURE_NAME を設定する。設定の無い試験でも落とさない。"""
+    from _config_loader import get_config_path
+    feat = os.environ.get("FEATURE_NAME")
+    if feat and not get_config_path(feat).exists():
+        feat = None  # fallback-ok: 設定の無い試験の実行。業務の値ではなく、日付の字面の照合元を out の src だけにする決まった規則
+    _compose(out, _source_files(out, feat), log)
 
 
 def selftest():

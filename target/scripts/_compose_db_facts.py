@@ -78,8 +78,9 @@ def _assign_table_names(out, terms):
 
 
 def _load_drafts(directory):
+    from _config_loader import draft_files
     out = []
-    for p in sorted(Path(directory).glob("*_backend_draft.json")):
+    for p in draft_files("backend", directory):  # 機能名の下書き1本
         try:
             out.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):

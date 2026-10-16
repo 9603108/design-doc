@@ -1680,10 +1680,12 @@ def check_initialization_dup(merged: dict) -> list:
 
 
 def _load_react_drafts() -> list:
-    """機能の react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
-    WHY: merge_partials.load_react_drafts と同じ集まりを見て、初期表示の判定の事実を揃える（merge_partials は argv を読むため import しない）。"""
+    """機能の react 下書き（<機能名>_react_draft.json）1本を target/intermediate/ から読む。読めないファイルは飛ばす。
+    WHY: merge_partials.load_react_drafts と同じ下書きを見て、初期表示の判定の事実を揃える（merge_partials は argv を読むため import しない）。
+    機能名は main が解決して環境変数 FEATURE_NAME に入れた値（別画面の下書きを読まない）。"""
+    from _config_loader import draft_files
     drafts = []
-    for p in sorted(INTERMEDIATE_DIR.glob("*_react_draft.json")):
+    for p in draft_files("react", INTERMEDIATE_DIR):
         try:
             drafts.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -2251,6 +2253,8 @@ def main():
     if warn_allow_strict:
         sys.argv.remove("--warn-allow-strict")
     feature = get_feature_name_from_argv()
+    import os as _os
+    _os.environ["FEATURE_NAME"] = feature  # 下書きの読み先(_load_react_drafts → draft_files)を、この機能名に決める
     target = INTERMEDIATE_DIR / f"{feature}.json"
     project_config = load_project_config(feature)
     # 2026-10-05 汎用化(3): 案件固有の判定の上書き（旧イベントコードの書式・参照 ID の接頭辞・

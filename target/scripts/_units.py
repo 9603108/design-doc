@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I で�
 SKILL_DIR = Path(__file__).resolve().parent.parent.parent
 UNITS_SPEC_PATH = SKILL_DIR / "prompts" / "units.json"
 UNIT_PREFIX = "_unit_"
+# 断片の最上位の meta.feature_name = 書いた画面の機能名。設計書の欄ではないので、欄の担当の検査と合成は読まない(check_feature だけが見る)
+META_KEY = "meta"
 
 # 識別子つきの一覧(汎用パス → 行の識別キー)。単位どうしは、この識別子で同じ行を指す
 IDENTITY = {
@@ -109,6 +111,23 @@ def load_fragments(directory):
     return frags, problems
 
 
+def check_feature(frags, feature):
+    """断片の meta.feature_name(書いた画面の機能名)が、検査・合成の機能名 feature と同じか。無い・違うものは ERROR。
+    WHY: 断片 _unit_*.json は機能名に依らない固定名。別の画面(POS会計レポート)の断片が残ったまま棚分析を検査・合成する取り違えを止める。
+    呼出元: verify_partials.main_units / merge_partials.compose_units。戻り: 問題の list(行末の「→ 差し戻し先 <単位>」で単位へ戻す)。"""
+    problems = []
+    for unit in sorted(frags):
+        meta = frags[unit].get(META_KEY)
+        name = meta.get("feature_name") if isinstance(meta, dict) else None
+        if not name:
+            problems.append(f"[機能名なし] {UNIT_PREFIX}{unit}.json: meta.feature_name が無い(どの画面の断片か分からない)。"
+                            f"最上位に \"meta\": {{\"feature_name\": \"{feature}\"}} を書く → 差し戻し先 {unit}")
+        elif name != feature:
+            problems.append(f"[機能名の食い違い] {UNIT_PREFIX}{unit}.json: meta.feature_name が {name} で、検査の機能名 {feature} と違う"
+                            f"(別の画面の断片が残っているか、機能名の指定違い) → 差し戻し先 {unit}")
+    return problems
+
+
 def owns(pattern, generic):
     """pattern(分担表の欄)が generic(汎用パス)を含むか。'a.b' は 'a.b'・'a.b.c'・'a.b[].c' を含む"""
     return generic == pattern or generic.startswith(pattern + ".") or generic.startswith(pattern + "[]")
@@ -145,7 +164,7 @@ def _walk(node, generic, concrete, leaves, entries):
 
 def decompose(frag):
     leaves, entries = [], []
-    _walk(frag, "", "", leaves, entries)
+    _walk({k: v for k, v in frag.items() if k != META_KEY}, "", "", leaves, entries)  # meta は欄の担当の検査に入れない
     return leaves, entries
 
 
@@ -211,9 +230,9 @@ def _backend_draft_facts():
     呼出元: compose。意味合い: 認証の掛かり方とメッセージ ID は機械抽出の下書きが正。auth の error_patterns(ソースに拒否の処理があったものだけ)も返す。
     展開 = {型文: [(ID, 呼出ごとの展開済みの文面, 検査の対象 param)]}。型文は {key} などの穴を持つソースの文面で、展開済みは呼出箇所の実引数で埋めたもの
     (下書きの text_expanded。取れなかった型文は入らない)。下書きが無ければ ("", {}, [], {})。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     fact, msgs, auth_errs, expansions = "", {}, [], {}
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+    for p in draft_files("backend"):  # 機能名の下書き1本(別画面の下書きを読まない)
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -240,9 +259,9 @@ def _draft_common_errors():
     呼出元: compose。意味合い: 入口で受ける DB 例外などの 500 系は、API ごとに書かせると抜けるため、ソースで status が決まったものだけ機械で足す。
     status が式(getattr(e, 'status', 400) or 400)のもの・via の補助関数の中で決まるもの・同じ status の2件目以降は足さない(推測しない)。
     condition は例外名だけの事実(業務の言い換えは S2 が書く)。code_default が1種類に決まるときだけ error_code を入れる。下書きが無ければ []。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     by_status = {}
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+    for p in draft_files("backend"):
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -290,9 +309,9 @@ def _react_jsx_elements():
     """react 下書きの jsx_elements(画面の要素と出典つき)を全部取る。
     呼出元: compose(_clean_message_text の前)。意味合い: 本文の先頭に付ける見出しは、ソースの強調要素(strong・b)の文言を正とする。
     下書きが無ければ []。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     els = []
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+    for p in draft_files("react"):
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -395,11 +414,10 @@ def _fill_src(out):
     error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id、calculations←react の calc_candidates の label(候補が1件のときだけ)、
     validations_frontend←下書きの error_patterns の id(kind が「API検査」で message_id を持つ行だけ)。下書きが無ければ何もしない。
     WHY(validations_frontend): run20 で H4 が src を書かず WARN が残った。画面側の行(入力検査・表示切替)は下書きに対の行が無いので機械では付けず、機械で引ける API検査の行だけ付ける。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     ev, ep, api, ri, err, dbo = {}, {}, {}, {}, {}, {}
     calc, calc_n = {}, {}
-    d = Path(INTERMEDIATE_DIR)
-    for p in sorted(d.glob("*_react_draft.json")):
+    for p in draft_files("react"):
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -412,7 +430,7 @@ def _fill_src(out):
                 calc_n[c["label"]] = calc_n.get(c["label"], 0) + 1
                 if c.get("src"):
                     calc[c["label"]] = c["src"]
-    for p in sorted(d.glob("*_backend_draft.json")):
+    for p in draft_files("backend"):
         try:
             b = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -509,9 +527,9 @@ def _fill_db_op_facts(out):
     呼出元: compose(_fill_src の後)。意味合い: 副問い合わせ・CTE はソースの SQL を機械が分解した事実なので、単位(H2)の書き写しは使わない。
     単位が書いた値は捨てる(差し戻さない。check_fragments が COMPOSED の欄を飛ばす)。下書きで結べない行は事実が無いので欄を外す。
     WHY: 欄を外すのは、単位が書いた値が下書きに無い SQL の作り話を残さないため。結び方は draft_db_op に任せ、番号振りの前後どちらでも同じ事実が入るようにする。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     drafts = []
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+    for p in draft_files("backend"):
         try:
             drafts.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -537,9 +555,9 @@ def _fill_initial_values(out):
     照合: state_initials[].bound[].label と item_name の一致。結ぶ state が無い項目(ボタン・固定の文言など)は欄を作らない。
     initial_value が既にある項目は触らない。下書きに state_initials が無ければ何もしない。
     接続: 欄を読んで初期処理の表へ写す側は merge_partials.build_initialization(少なくとも、そこが初期値を Blank 一律にしている)。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     by_label = {}
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+    for p in draft_files("react"):
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -560,9 +578,9 @@ def _react_draft_facts():
     API は、その行の event_processes の calls と、db_operations の trigger_events にその行の code を持つものの action。
     initial_fetches の関数名(fetchXxx)は API の action と綴りが違うため、照合には使わない(推測で結ばない)。
     下書きが無ければ (set(), set())。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     drafts = []
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_react_draft.json")):
+    for p in draft_files("react"):
         try:
             drafts.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -688,9 +706,9 @@ def _fill_error_codes(out):
     呼出元: compose(_run_fillers の前)。意味合い: API ごとに code を書かせると食い違うため、入口の except 節でソースが決めた code を機械で入れる。
     一致: 行の status_code(数値)が、下書きの status_code と等しい、または下書きの status の式にある数値リテラルと等しい(getattr(e, 'status', 400) or 400 → 400)。
     候補の code_default が2種類以上になる status は、どれも入れない(推測しない)。行に既に error_code があれば触らない。下書きが無ければ何もしない。"""
-    from _config_loader import INTERMEDIATE_DIR
+    from _config_loader import draft_files
     codes_by_status = {}
-    for p in sorted(Path(INTERMEDIATE_DIR).glob("*_backend_draft.json")):
+    for p in draft_files("backend"):
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -746,7 +764,7 @@ def compose(spec, frags, project_config=None, log=None):
     keys = []
     for frag in frags.values():
         for k in frag:
-            if k not in keys:
+            if k not in keys and k != META_KEY:  # meta は断片の持ち主の印で、設計書の欄ではない
                 keys.append(k)
     for k in keys:
         first = creators.get(k)

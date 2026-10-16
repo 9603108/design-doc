@@ -31,6 +31,7 @@ from _compose_fixed_example import literal_screen_text
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,
+    resolve_feature_name,
     load_project_config,
     get_source_html_path,
     load_screen_config,
@@ -39,7 +40,23 @@ from _config_loader import (
 # 2026-10-05 汎用化: 機能名はモジュール先頭で1回だけ解決する（第1引数 > 環境変数 FEATURE_NAME）。
 #   意味合い: 特定案件の機能名・絶対パスの直書きを廃止。未指定時は _config_loader 側が SystemExit で止める。
 #   接続情報: OUTPUT と main() の meta 組立（screen_config 読込）がこの値を使う。
-FEATURE_NAME = get_feature_name_from_argv()
+def _resolve_feature_name() -> str:
+    """機能名を決める。第1引数 > 環境変数 FEATURE_NAME。どちらも無ければ SystemExit で止める(推測しない)。
+    第1引数が -h/--help/--selftest のときは機能名を要しない実行(従来どおりその文字列を返す)。
+    第1引数がその他のオプション(--compose-units など)のときは、オプションを機能名と取り違えず、環境変数から取る。"""
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg in ("-h", "--help", "--selftest"):
+        return arg
+    if arg.startswith("-"):
+        return resolve_feature_name()
+    return get_feature_name_from_argv()
+
+
+FEATURE_NAME = _resolve_feature_name()
+if not FEATURE_NAME.startswith("-"):
+    # 下書き・設定を読む側(_config_loader.draft_files と _compose_*.py)もこの機能名を使う(別画面の下書きを読まない)
+    import os as _os
+    _os.environ["FEATURE_NAME"] = FEATURE_NAME
 
 # 入出力パス（design-doc/target/intermediate/）。partial 4本は機能名に依存しない固定名
 PARTIALS = {
@@ -99,11 +116,13 @@ def _selftest_steps() -> int:
 
 
 def load_react_drafts() -> list:
-    """react 下書き（<画面>_react_draft.json）を target/intermediate/ から全部読む。読めないファイルは飛ばす。
+    """react 下書き（<機能名>_react_draft.json）1本を target/intermediate/ から読む。読めないファイルは飛ばす。
     呼出元: build_initialization。意味合い: 初期値（useState の初期値）と初期表示の API は下書きの事実が正。
     partial の events には action が無い形（run7 の形）があるため、初期表示の判定もここの下書きから取る。下書きが無ければ []。"""
     drafts = []
-    for p in sorted(INTERMEDIATE_DIR.glob("*_react_draft.json")):
+    for p in [INTERMEDIATE_DIR / f"{FEATURE_NAME}_react_draft.json"]:  # 機能名の下書き1本(別画面の下書きを読まない)
+        if not p.exists():
+            continue
         try:
             drafts.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -544,7 +563,8 @@ def compose_units() -> int:
         print(f"[入力不正] {INTERMEDIATE_DIR} に _unit_*.json が無い", file=sys.stderr)
         return 2
     problems += _units.check_all(spec, frags)
-    composed = _units.compose(spec, frags, load_project_config())
+    problems += _units.check_feature(frags, FEATURE_NAME)  # 別画面の断片を合成しない(meta.feature_name が無い・違うと ERROR)
+    composed = _units.compose(spec, frags, load_project_config(FEATURE_NAME))
     parts, unknown = _units.split_partials(composed)
     problems += [f"[範囲外] 最上位キー {k}: partial に入口が無い" for k in unknown]
     if problems:
@@ -576,6 +596,47 @@ def apply_unit_details(event_processes: list, unit_eps: list) -> None:
             ep["details_none_reason"] = src["details_none_reason"]
         if src.get("src"):
             ep["src"] = list(src["src"])
+
+
+def _selftest_feature() -> int:
+    """機能名の取り違えを防ぐ仕組み。(a) 機能名の決め方: 第1引数 > 環境変数 FEATURE_NAME。--compose-units だけなら環境変数。どちらも無ければ止める
+    (b) 別の画面の断片(meta.feature_name が違う)は合成せず、[機能名の食い違い] の ERROR で終了コード 1。終了コード 0=OK / 1=NG。"""
+    import contextlib
+    import io
+    import os
+    import tempfile
+    global INTERMEDIATE_DIR, FEATURE_NAME
+    argv0, env0, inter0, feat0 = sys.argv, os.environ.get("FEATURE_NAME"), INTERMEDIATE_DIR, FEATURE_NAME
+    try:
+        sys.argv = ["merge_partials.py", "--compose-units"]
+        os.environ.pop("FEATURE_NAME", None)
+        try:
+            _resolve_feature_name()
+            raise AssertionError("機能名が無いのに止まらない(推測した)")
+        except SystemExit:
+            pass
+        os.environ["FEATURE_NAME"] = "A"
+        assert _resolve_feature_name() == "A", "オプションだけのとき環境変数 FEATURE_NAME を取らない"
+        sys.argv = ["merge_partials.py", "B", "--compose-units"]
+        assert _resolve_feature_name() == "B", "第1引数が環境変数に負けた"
+        sys.argv = ["merge_partials.py", "--selftest"]
+        assert _resolve_feature_name() == "--selftest", "--selftest を機能名として扱わなかった"
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "_unit_H1.json").write_text(json.dumps({"meta": {"feature_name": "B"}, "events": []}), encoding="utf-8")
+            INTERMEDIATE_DIR, FEATURE_NAME = Path(td), "A"
+            with contextlib.redirect_stdout(io.StringIO()) as so:
+                rc = compose_units()
+            assert rc == 1 and "[機能名の食い違い] _unit_H1.json" in so.getvalue(), (rc, so.getvalue())
+    except AssertionError as e:
+        print(f"[selftest NG] merge_partials 機能名: {e}")
+        return 1
+    finally:
+        sys.argv, INTERMEDIATE_DIR, FEATURE_NAME = argv0, inter0, feat0
+        if env0 is None:
+            os.environ.pop("FEATURE_NAME", None)
+        else:
+            os.environ["FEATURE_NAME"] = env0
+    return 0
 
 
 def _selftest_initialization() -> int:
@@ -884,7 +945,7 @@ def main():
         return
     # --selftest: 組込みの検査だけ走らせる（partial・機能名は不要。機能名の解決は先頭で済んでいて、ここでは使わない）
     if "--selftest" in sys.argv[1:]:
-        sys.exit(_selftest_initialization() or _selftest_steps())
+        sys.exit(_selftest_initialization() or _selftest_steps() or _selftest_feature())
     if "--compose-units" in sys.argv[1:]:
         sys.exit(compose_units())
     se = load_partial("screen_events")

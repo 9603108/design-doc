@@ -156,9 +156,9 @@ def _fill_screen_nth(api, specs, log):
 
 def _load_drafts(directory):
     """下書きを読む。戻り: (action → backend 下書きの api の辞書, 表示行の specs の list)。読めないファイルは無いものとして飛ばす。"""
+    from _config_loader import draft_files
     backend, specs = {}, []
-    d = Path(directory)
-    for p in sorted(d.glob("*_backend_draft.json")):
+    for p in draft_files("backend", directory):  # 機能名の下書き1本
         try:
             b = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -166,7 +166,7 @@ def _load_drafts(directory):
         for act, a in (b.get("apis") or {}).items():
             if isinstance(a, dict):
                 backend.setdefault(act, a)
-    for p in sorted(d.glob("*_react_draft.json")):
+    for p in draft_files("react", directory):
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -458,6 +458,8 @@ def _selftest():
     import json as _json
     orig = _config_loader.INTERMEDIATE_DIR
     with tempfile.TemporaryDirectory() as td:
+        import os
+        os.environ["FEATURE_NAME"] = "X"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "X_backend_draft.json").write_text(_json.dumps({"apis": {"get_y": {"db_operations": [
             {"columns": [{"alias": "amount", "source_columns": ["sales.amt"]}]}]}}}, ensure_ascii=False), encoding="utf-8")
         Path(td, "X_react_draft.json").write_text(_json.dumps({"display_rows": [{"specs": specs}]}, ensure_ascii=False), encoding="utf-8")

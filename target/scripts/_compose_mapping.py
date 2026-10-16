@@ -34,8 +34,9 @@ _NOTE_DERIVED = "{name}を出すかどうかの判定に使う(条件: {expr})"
 
 def _drafts(directory):
     """react 下書きを全部読む。読めないファイルは無いものとして飛ばす(_compose_response と同じ読み方)。"""
+    from _config_loader import draft_files
     out = []
-    for p in sorted(Path(directory).glob("*_react_draft.json")):
+    for p in draft_files("react", directory):  # 機能名の下書き1本
         try:
             out.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -592,6 +593,8 @@ def _selftest():
             "derived_arrays": [{"name": "w", "source": "rows", "op": "filter", "fields": ["days"],
                                 "lambda_expr": "r.days > 0", "src": sp(3)}],
         }
+        import os
+        os.environ["FEATURE_NAME"] = "S"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "S_react_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
         items = [{"item_name": "件数表示", "screen_no": "1", "src": sp(7)},
                  {"item_name": "店名", "screen_no": "2", "src": sp(9)},
@@ -877,6 +880,8 @@ def _selftest_fixed_title():
                  "failure_effects": [{"event": "EV1", "on_success": ["rows"], "on_success_from": {"rows": "rows"}}],
                  "field_usage": [{"path": "rows[].shop_name", "uses": [{"element": "Card の subtitle", "src": use}]},
                                  {"path": "rows[].days", "uses": [{"element": "Card の subtitle", "src": use}]}]}
+        import os
+        os.environ["FEATURE_NAME"] = "S"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "S_react_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
         import _config_loader
         orig = _config_loader.INTERMEDIATE_DIR

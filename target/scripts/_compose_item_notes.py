@@ -53,8 +53,9 @@ def contains(remarks, note) -> bool:
 
 def _drafts(directory):
     """react 下書きを全部読む。読めないファイルは無いものとして飛ばす(_compose_row_notes と同じ読み方)。"""
+    from _config_loader import draft_files
     out = []
-    for p in sorted(Path(directory).glob("*_react_draft.json")):
+    for p in draft_files("react", directory):  # 機能名の下書き1本
         try:
             out.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -210,6 +211,8 @@ def _selftest():
 
     old = _config_loader.INTERMEDIATE_DIR
     with tempfile.TemporaryDirectory() as td:
+        import os
+        os.environ["FEATURE_NAME"] = "x"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "x_react_draft.json").write_text(json.dumps({"display_rows": rows}, ensure_ascii=False), encoding="utf-8")
         _config_loader.INTERMEDIATE_DIR = Path(td)
         try:

@@ -21,6 +21,7 @@ run の保存(save-run)も /private/tmp の片付けで消えないよう target
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -42,10 +43,15 @@ DIAGRAM_MARK = "(構成図)"
 # WHY: 欄を書く担当は専用の型 design-doc-unit で起動する(general-purpose は使わない)。起動できるのはメインだけ。出力の JSON に型を入れ、Agent の subagent_type へそのまま渡せるようにする。
 SUBAGENT_TYPE = "design-doc-unit"
 
+
+def _run_env(feat):
+    """後段・検査の子プロセスに渡す環境。FEATURE_NAME をこの機能名に固定する(親の環境に別画面の名があっても引き継がない)。"""
+    return {**os.environ, "FEATURE_NAME": feat}
+
 # 後段コマンド列。順序は SKILL.md「実行順序」と units_prompts.json の after に従う。
 # {feat} は機能名に置き換える。構成図の行は DIAGRAM_MARK で展開する(ipo_flowchart 以外の id を回す)。
 AFTER = [
-    "python3 target/scripts/verify_partials.py --units",
+    "python3 target/scripts/verify_partials.py --units --feature {feat}",  # 断片は機能名に依らない固定名。機能名を必ず渡す(推測しない)
     "FEATURE_NAME={feat} python3 target/scripts/merge_partials.py {feat} --compose-units",
     "python3 target/scripts/apply_react_draft.py {feat} --stage partial --backend-draft "
     "target/intermediate/{feat}_backend_draft.json",
@@ -122,9 +128,11 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 書くのは {inter}/_unit_{u}.json の1ファイルだけ。他のファイル(partial・中間 JSON・他の単位の _unit_*.json・screen_config)は書かない。"
         f"書いてよい欄は units.json の {u} の owns だけ: {owns}",
         "- 前回の設計書や過去の partial の中身は参照しない(ソースと下書きから書く)。",
+        # WHY: 断片 _unit_*.json は機能名に依らない固定名。別の画面の断片を取り違えないよう、書いた画面の機能名を断片に持たせる(無い・違うと検査と合成が ERROR)
+        f"- 断片の最上位に `\"meta\": {{\"feature_name\": \"{feat}\"}}` を必ず書く(どの画面の断片かを示す印。設計書の欄ではないので owns には入らない)。機能名は上の {feat} をそのまま使う。",
         # WHY: run20 で H4 が「合成が付ける」を validations_frontend にも当てはめ、14行とも src を書かなかった(H4 手順書は全行に書けと決めており矛盾していた)。
         "- 【出典】下書きから合成が付ける行(events・event_processes・db_operations・api_spec・messages_backend・calculations)の src は書かない。validations_frontend の行は合成が付けないので、全行に、その検査・切替・絞り込みを実際に書いているソースの行範囲 {file,line_start,line_end} の配列を src に書く(手順書 H4 のとおり)。下書きに無い行(ソースを読んで足した行)も同様に、読んだ範囲を src に書く。",
-        f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u}` を流し、"
+        f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u} --feature {feat}` を流し、"
         f"行末が「→ 差し戻し先 {u}」の問題を直してから、3行以内で報告する(書いた行数・残った問題・判断できなかった所)。",
     ]
     # WHY: S1 と S2 は並行に書くため、S2 が画面項目名を推測して S1 と食い違い差し戻しになる(run3 で52件)。
@@ -238,7 +246,7 @@ def diagram_commands(feat):
         "import sys; sys.path.insert(0, 'target/scripts'); import _config_loader as c; "
         f"print('\\n'.join(c.get_all_diagram_ids('{feat}')))"
     )
-    p = subprocess.run([sys.executable, "-c", probe], cwd=SKILL, capture_output=True, text=True)
+    p = subprocess.run([sys.executable, "-c", probe], cwd=SKILL, capture_output=True, text=True, env=_run_env(feat))
     if p.returncode != 0:
         raise RuntimeError("get_all_diagram_ids failed: " + p.stderr[-400:])
     return diagram_steps(feat, p.stdout.split())
@@ -264,7 +272,7 @@ def run_after(feat):
             steps.append(tmpl.replace("{feat}", feat))
     for i, cmd in enumerate(steps, 1):
         print(f"[{i}/{len(steps)}] {cmd[:80]}", file=sys.stderr)
-        p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True)
+        p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True, env=_run_env(feat))
         out = p.stdout + p.stderr
         # WHY: 成功時にも「ERROR 0 件」と出力する検査があるため、出力の文字では判定せず終了コードだけで判定する。
         # 各検査は ERROR があれば exit 1 を返す(verify_call_graph.py・verify_docx_layout.py で確認)。
@@ -321,7 +329,7 @@ def run_gate(feat):
             unallowed_warn.append(f"許可リストが不正: {e}")
         for script in (("verify_vs_source.py", "verify_intermediate.py") if allow is not None else ()):
             cmd = f"python3 target/scripts/{script} {feat} --warn-allow-strict"
-            p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True)
+            p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True, env=_run_env(feat))
             out = p.stdout + p.stderr
             all_warns += _warn_allow.split_warns(out.splitlines())
             if p.returncode != 0:
@@ -429,6 +437,20 @@ def selftest():
     assert "_unit_S1.json" in text and "ERROR 欄 → 差し戻し先 S1" in text, text
     assert "【差し戻し】" not in build_prompt(units, "テスト機能", "S1")
     assert "【出典】" in build_prompt(units, "テスト機能", "S1"), "A3: 指示文に出典の1行"
+    # 機能名の取り違えを防ぐ: 依頼文は断片の meta.feature_name を書かせ、検査のコマンドに機能名(--feature)を渡す。後段の子プロセスの FEATURE_NAME はこの機能名に固定する
+    pf = build_prompt(units, "テスト機能", "H2")
+    assert '"meta": {"feature_name": "テスト機能"}' in pf, "依頼文に meta.feature_name の指示が無い"
+    assert "verify_partials.py --units --unit H2 --feature テスト機能" in pf, "依頼文の検査のコマンドに機能名が無い"
+    assert AFTER[0] == "python3 target/scripts/verify_partials.py --units --feature {feat}", AFTER[0]
+    old_env = os.environ.get("FEATURE_NAME")
+    os.environ["FEATURE_NAME"] = "別画面"
+    try:
+        assert _run_env("テスト機能")["FEATURE_NAME"] == "テスト機能", "子プロセスに親の別画面の機能名を引き継いだ"
+    finally:
+        if old_env is None:
+            os.environ.pop("FEATURE_NAME", None)
+        else:
+            os.environ["FEATURE_NAME"] = old_env
     # A3: .src の欄は _merge で和集合(同じ要素は1つ)。.src でない list は従来どおり上書き
     from _units import _merge
     a, b, c = {"file": "a", "line_start": 1, "line_end": 2}, {"file": "b", "line_start": 3, "line_end": 4}, {"file": "a", "line_start": 1, "line_end": 2}
@@ -993,7 +1015,7 @@ def main(argv=None):
             print(f"中間JSONが無いので判定項目を作れない: {INTER / (a.feature + '.json')}", file=sys.stderr)
             return 1
         p = subprocess.run([sys.executable, str(SKILL / "target" / "scripts" / "build_audit_claims.py"), a.feature],
-                           cwd=SKILL, capture_output=True, text=True)
+                           cwd=SKILL, capture_output=True, text=True, env=_run_env(a.feature))
         print(p.stdout + p.stderr, file=sys.stderr, end="")
         claims_p = INTER / f"{a.feature}_audit_claims.json"
         if p.returncode != 0 or not claims_p.exists():

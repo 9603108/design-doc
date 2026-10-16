@@ -232,6 +232,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 - 単位どうしは互いの出力を待たない。同じ行（api_spec の action、db_operations の id など）は識別子をソースから同じ規則で導いて指す（`prompts/_共通.md`）。食い違いは順2の検査が `[参照]` で拾う
 - 断片は単位ごとに別ファイルで、同じ行の別の欄を書く。合成は `merge_partials.py --compose-units` が識別子で突き合わせて行い、partial 4本（従来と同じ形）を書く。partial に入口の無かった details は、断片の `event_processes` から `merge_partials.py` が `event_processes[].details` へ写すので、Phase 4 の前の手作業は要らない
 - 書く範囲が重ならないことは `verify_partials.py --units` が検査する（分担表の重なり・担当外の欄 `[範囲外]`・2単位が同じ欄 `[重複]`）
+- 断片 `_unit_*.json` は機能名に依らない固定名。別の画面の下書き・断片を読まないよう、検査と合成は機能名を `--feature`(か環境変数 FEATURE_NAME)で必ず受け(無いと終了コード 2 で止める)、下書き・設定はその機能名の1本だけ読む。断片は最上位 `meta.feature_name` に書いた画面の機能名を持ち、無い・違うと `[機能名なし]`・`[機能名の食い違い]` の ERROR（差し戻し先 = その単位）
 - HTML の画面（下書きが無い）: 同じ単位で回し、H1〜H3 は model を sonnet にする（下書きが無いので haiku の条件を満たさない）。従来どおり1体の Agent（型 design-doc-unit）で作る流れ（Step 3 のプロンプト）も使える。この場合 `_unit_*.json` を置かず、`--compose-units` も流さない
 
 **Agent 呼び出しの雛形（順1。7体を同じメッセージで起動する）:**
@@ -244,8 +245,8 @@ Agent({
   prompt: "design-doc スキルの委譲の単位 {単位} を行う。\n
 スキルのフォルダ: {絶対パス}（コマンドはここで流す）。機能名: {機能名}（FEATURE_NAME）。\n
 読むのは prompts/_共通.md と prompts/{単位}_*.md と、手順書が挙げた入力だけ。SKILL.md は読まない。\n
-出力: target/intermediate/_unit_{単位}.json の1ファイル。書いてよい欄は prompts/units.json の {単位} の owns だけ。\n
-終わったら python3 target/scripts/verify_partials.py --units --unit {単位} を流し、自分を指す問題を直してから3行で報告する。"
+出力: target/intermediate/_unit_{単位}.json の1ファイル。書いてよい欄は prompts/units.json の {単位} の owns だけ。最上位に \"meta\": {\"feature_name\": \"{機能名}\"} を必ず書く(どの画面の断片か。owns には入らない)。\n
+終わったら python3 target/scripts/verify_partials.py --units --unit {単位} --feature {機能名} を流し、自分を指す問題を直してから3行で報告する。"
 })
 ```
 
@@ -510,7 +511,7 @@ export FEATURE_NAME="受注入力"   # 例: 受注入力 / 受注照会 / 顧客
 
 # === Phase 1: ソース解析（Agent 並列） ===
 # 委譲の単位で作るとき（「委譲の分担」の節）: 下書きのスクリプト（下の2本。tool-worker が流す）→ 単位7体を並行に起動（型 design-doc-unit。メインが起動）→ 断片を検査・合成する（tool-worker が流す）
-#   python3 target/scripts/verify_partials.py --units                          # 問題の行末の「→ 差し戻し先 <単位>」へ戻す
+#   python3 target/scripts/verify_partials.py --units --feature {機能名}  # 問題の行末の「→ 差し戻し先 <単位>」へ戻す(機能名は必須。無いと止まる)
 #   python3 target/scripts/merge_partials.py "${FEATURE_NAME}" --compose-units # _unit_*.json → partial 4本（この後、下の apply_react_draft --stage partial へ）
 # 従来の形: Agent 4本並列で _partial_*.json 生成（Step 3）。出力先: target/intermediate/_partial_*.json
 # partial 4本の名前とキーは Step 3「Phase 1 の成果物の渡し方」を参照。partial は機能名に依らない固定名なので、1画面ずつ処理する

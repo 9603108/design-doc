@@ -85,6 +85,20 @@ def get_feature_name_from_argv() -> str:
         return sys.argv[1]
     return resolve_feature_name()
 
+
+def draft_files(kind: str, directory=None) -> list:
+    """機能名の下書き <機能名>_<kind>_draft.json(kind は react か backend)を、あれば [Path] で返す。無ければ []。
+
+    WHY: 「*_react_draft.json」と glob すると、target/intermediate に別の画面の下書きがあるとき、それも読んでしまう
+         (棚分析の検査が POS会計レポートの下書きを読んだ事故)。下書きは機能名で1本に決める。
+    機能名は resolve_feature_name() で決める(環境変数 FEATURE_NAME。無ければ SystemExit で止める。推測して選ばない)。
+    directory を省略すると INTERMEDIATE_DIR(呼出時の値)。
+    """
+    d = Path(directory) if directory else Path(INTERMEDIATE_DIR)
+    p = d / f"{resolve_feature_name()}_{kind}_draft.json"
+    return [p] if p.exists() else []
+
+
 # キャッシュ（同一プロセス内で複数回読まれても1回で済むよう）
 _CACHE: dict = {}
 

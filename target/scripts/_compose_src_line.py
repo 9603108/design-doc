@@ -82,8 +82,9 @@ def _fix_param(s, rx, cache):
 
 def _draft_src(directory):
     """下書きの {action: src の配列}。読めないファイルは無いものとして飛ばす。"""
+    from _config_loader import draft_files
     out = {}
-    for p in sorted(Path(directory).glob("*_backend_draft.json")):
+    for p in draft_files("backend", directory):  # 機能名の下書き1本
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -98,8 +99,9 @@ def _draft_field_src(directory):
     """下書きの {action: {response_fields の path: src の配列}}(契約 i3.k1)。src を持つ欄だけ。読めないファイルは飛ばす。
     WHY: response_items の src(出典の行)は backend と frontend のどちらを指すかが run ごとに揺れたため、SQL の出典を持つ下書きの値に固定する。
     接続: fill が response_items の key と path を突き合わせて src を置き換える。"""
+    from _config_loader import draft_files
     out = {}
-    for p in sorted(Path(directory).glob("*_backend_draft.json")):
+    for p in draft_files("backend", directory):  # 機能名の下書き1本
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -177,6 +179,8 @@ def _selftest():
     # G20: response_items の src は、下書きの response_fields に src がある欄だけ置き換わる。src の無い欄と、response_items の src 以外の欄(display_name 等)は残る
     with tempfile.TemporaryDirectory() as gd:
         gs = {"file": "q.py", "line_start": 3, "line_end": 9}
+        import os
+        os.environ["FEATURE_NAME"] = "G"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(gd, "G_backend_draft.json").write_text(json.dumps({"apis": {"ga": {"response_fields": [
             {"path": "rows[].t", "src": [gs]}, {"path": "rows[].u"}]}}}), encoding="utf-8")
         assert _draft_field_src(gd) == {"ga": {"rows[].t": [gs]}}, _draft_field_src(gd)
@@ -205,6 +209,8 @@ def _selftest():
         def sp(f, a, b=None):
             return {"file": f, "line_start": a, "line_end": b or a}
         draft = {"apis": {"list_a": {"src": [sp(qf, 1, 7)]}}}
+        import os
+        os.environ["FEATURE_NAME"] = "S"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "S_backend_draft.json").write_text(json.dumps(draft), encoding="utf-8")
         rows = [
             {"action": "list_b", "src": [sp(hf, 5), sp(hf, 8, 9)], "request_params": []},        # 5(0始まり)→6。dispatch(8-9)は名前が無いので触らない

@@ -28,7 +28,8 @@ NOTE = "画面側だけで使い、CSV 出力では呼ばない"
 def _drafts(directory):
     """react 下書きを全部読む。読めないファイルは無いものとして飛ばす(_compose_mapping と同じ読み方)。"""
     out = []
-    for p in sorted(Path(directory).glob("*_react_draft.json")):
+    from _config_loader import draft_files
+    for p in draft_files("react", directory):  # 機能名の下書き1本
         try:
             out.append(json.loads(p.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -94,6 +95,8 @@ def _selftest():
         {"name": "手順なし", "expression": "z", "src": span(90, 95)}]
     orig = _config_loader.INTERMEDIATE_DIR
     with tempfile.TemporaryDirectory() as td:
+        import os
+        os.environ["FEATURE_NAME"] = "S"  # 下書きは機能名の1本だけ読む(draft_files)。試験の下書きの名前に合わせる
         Path(td, "S_react_draft.json").write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
         try:
             _config_loader.INTERMEDIATE_DIR = Path(td)
