@@ -9,8 +9,11 @@ WHY: メインが手で組んでいた「単位ごとの依頼文」「検査後
   after <機能名>                                    検査→後段を順に流し、ERROR で止めて差し戻しを JSON で出す
   retry <機能名> <単位> --issues <json>             差し戻しの文面を足した依頼文を出す
 
-接続: prompts の出力は呼出元(メイン)が Agent の prompt に渡す。after は単位の書込みが
-終わった後にメインが呼ぶ。retry は after が出した sendbacks を受けて、その単位だけ呼び直す。
+接続: メインは Bash を使わないので、この script は tool-worker に流させる(メインが直に流さない)。
+prompts の出力は呼出元(メイン)が Agent の prompt に渡し、担当は型 design-doc-unit で起動する
+(model は units.json の値を Agent の model に明示する)。after は単位の書込みが終わった後に
+tool-worker が流す。retry は after が出した sendbacks を受けて、その単位だけ呼び直す。
+出力先(--out など)は target/ の配下に置く(/private/tmp の外)。
 標準ライブラリのみ。
 """
 import argparse
@@ -30,6 +33,8 @@ COMMON = SKILL / "prompts" / "_共通.md"
 SENDBACK_RE = re.compile(r"→ 差し戻し先 (\S+)")
 UNIT_LIST_RE = re.compile(r"[A-Za-z0-9_,、/]+")  # 差し戻し先の直後の単位名の並び(説明の括弧は含めない)
 DIAGRAM_MARK = "(構成図)"
+# WHY: 欄を書く担当は専用の型 design-doc-unit で起動する(general-purpose は使わない)。起動できるのはメインだけ。出力の JSON に型を入れ、Agent の subagent_type へそのまま渡せるようにする。
+SUBAGENT_TYPE = "design-doc-unit"
 
 # 後段コマンド列。順序は SKILL.md「実行順序」と units_prompts.json の after に従う。
 # {feat} は機能名に置き換える。構成図の行は DIAGRAM_MARK で展開する(ipo_flowchart 以外の id を回す)。
@@ -86,8 +91,7 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     lines = [
         f"design-doc スキルの委譲の単位 {u}({spec['title']})を行う。機能名(FEATURE_NAME): {feat}。",
         "",
-        "【あなたの道具】cbm-serena(codeflow の find・refs・view・edit・create と Bash を持ち、Read/Write は無い)。"
-        "最初に mcp__codebase-memory-mcp__list_projects を1回呼ぶこと。"
+        "【あなたの道具】型 design-doc-unit(codeflow の find・view・edit・create と Bash と Write を持つ)。"
         "ファイルの読み書きは codeflow(mcp__codeflow__find / view / edit / create)で、絶対パスで行う。"
         "Bash は検査の python3 実行だけに使い、grep/cat/sed でソースを読まない。",
         "",
@@ -455,7 +459,7 @@ def build_audit_prompts(feat, claims):
             "- 判定項目:",
             json.dumps([_audit_item(c) for c in batch], ensure_ascii=False, indent=1),
         ]) + "\n"
-        prompts.append({"part": n, "model": "haiku", "out": str(out), "first_id": first, "last_id": last,
+        prompts.append({"part": n, "subagent_type": SUBAGENT_TYPE, "model": "haiku", "out": str(out), "first_id": first, "last_id": last,
                         "ids": [c["id"] for c in batch], "claims": batch, "prompt": prompt})
     return prompts
 
@@ -528,7 +532,7 @@ def main(argv=None):
     if a.cmd == "prompts":
         units = load_units()
         data = {"units": [
-            {"unit": u, "model": units[u]["model"], "prompt": build_prompt(units, a.feature, u, a.src)}
+            {"unit": u, "subagent_type": SUBAGENT_TYPE, "model": units[u]["model"], "prompt": build_prompt(units, a.feature, u, a.src)}
             for u in units
         ]}
         Path(a.out).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -551,7 +555,7 @@ def main(argv=None):
         if not lines:
             print(f"差し戻しの文面が無い: {a.unit}", file=sys.stderr)
             return 1
-        print(json.dumps({"unit": a.unit, "model": units[a.unit]["model"],
+        print(json.dumps({"unit": a.unit, "subagent_type": SUBAGENT_TYPE, "model": units[a.unit]["model"],
                           "prompt": build_prompt(units, a.feature, a.unit, sendbacks=lines)},
                          ensure_ascii=False, indent=1))
         return 0
@@ -666,7 +670,7 @@ def main(argv=None):
                 "- 判定項目:",
                 json.dumps(items, ensure_ascii=False, indent=1),
             ]) + "\n"
-            out["retry"] = {"model": "sonnet", "out": str(retry_out), "unknown": len(unknown), "prompt": prompt}
+            out["retry"] = {"subagent_type": SUBAGENT_TYPE, "model": "sonnet", "out": str(retry_out), "unknown": len(unknown), "prompt": prompt}
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 1 if sendbacks else 0
     ap.print_help()

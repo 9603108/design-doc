@@ -468,7 +468,7 @@ CL（共通ビジネスロジック）は **システム全体スコープ** で
 
 ### 機械検証（verify_intermediate.py）
 
-`check_screen_item_remarks_dynamic_behavior()` 関数が動的キーワード混入を **ERROR** として検出する（v51 以降、v49 までは WARN）。中間 JSON 修正後は以下を必ず実行：
+`check_screen_item_remarks_dynamic_behavior()` 関数が動的キーワード混入を **ERROR** として検出する（v51 以降、v49 までは WARN）。中間 JSON 修正後は以下を必ず実行（メインが tool-worker に流させる。欄を直す担当である design-doc-unit は自分で流す）：
 
 ```bash
 python3 target/scripts/verify_intermediate.py
