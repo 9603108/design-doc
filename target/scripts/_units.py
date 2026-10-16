@@ -417,6 +417,9 @@ def _fill_src(out):
     from _config_loader import draft_files
     ev, ep, api, ri, err, dbo = {}, {}, {}, {}, {}, {}
     calc, calc_n = {}, {}
+    # WHY: message_id の無い error_patterns の行(401・404 など)は id で引けないので、同じ action の下書きと認証の行から status_code で引く。
+    # {(action, status): [src...]} と認証の {status: [src...]}。候補が1つに決まるときだけ付ける(推測しない)。
+    st_src, auth_st_src = {}, {}
     for p in draft_files("react"):
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
@@ -441,6 +444,13 @@ def _fill_src(out):
             ri.update({(act, x["key"]): x["src"] for x in a.get("response_items") or [] if x.get("src") and x.get("key")})
             dbo.update({o["id"]: o["src"] for o in a.get("db_operations") or [] if o.get("src") and o.get("id")})
             err.update({e["id"]: e["src"] for e in a.get("error_patterns") or [] if e.get("src") and e.get("id")})
+            for e in a.get("error_patterns") or []:
+                if e.get("src") and e.get("status_code") is not None:
+                    st_src.setdefault((act, str(e["status_code"])), []).append(e["src"])
+        for au in b.get("auth") or []:
+            for e in au.get("error_patterns") or []:
+                if e.get("src") and e.get("status_code") is not None:
+                    auth_st_src.setdefault(str(e["status_code"]), []).append(e["src"])
         err.update({e["id"]: e["src"] for au in b.get("auth") or [] for e in au.get("error_patterns") or [] if e.get("src") and e.get("id")})
 
     def put(row, src):
@@ -467,7 +477,16 @@ def _fill_src(out):
                 put(x, ri.get((a.get("action"), x.get("key"))) or ri.get((a.get("action"), re.split(r"[\[.]", str(x.get("key")))[0])))
         for x in a.get("error_patterns") or []:
             if isinstance(x, dict):
-                put(x, err.get(x.get("message_id")))
+                if x.get("message_id"):
+                    put(x, err.get(x.get("message_id")))
+                elif x.get("status_code") is not None:
+                    sc = str(x["status_code"])
+                    cands = []
+                    for s in st_src.get((a.get("action"), sc), []) + auth_st_src.get(sc, []):
+                        if s not in cands:
+                            cands.append(s)
+                    if len(cands) == 1:
+                        put(x, cands[0])
     for r in _rows(out, "validations_frontend"):
         if r.get("kind") == "API検査" and r.get("message_id"):
             put(r, err.get(r.get("message_id")))
@@ -1096,6 +1115,29 @@ def _selftest_calc_src():
     assert vf[0]["src"] == be_src, vf[0]
     assert "src" not in vf[1], vf[1]
     assert vf[2]["src"] == keep, vf[2]
+    # message_id の無い行: 同じ action の下書きと認証から status_code で引く。候補が1つなら付き、2つなら付かない
+    s401 = [{"file": "q.py", "line_start": 20, "line_end": 20}]
+    s404a, s404b = [{"file": "q.py", "line_start": 30, "line_end": 30}], [{"file": "q.py", "line_start": 40, "line_end": 40}]
+    s403 = [{"file": "q.py", "line_start": 50, "line_end": 50}]
+    backend = {"apis": {"act": {"error_patterns": [{"id": "MSE00001", "status_code": 400, "src": be_src}, {"status_code": 401, "src": s401},
+                                                 {"status_code": 404, "src": s404a}]},
+                        "act2": {"error_patterns": [{"status_code": 404, "src": s404a}]}},
+               "auth": [{"error_patterns": [{"status_code": 404, "src": s404b}, {"status_code": 403, "src": s403}]}]}
+    out = {"api_spec": [{"action": "act", "error_patterns": [{"message_id": "MSE00001"}, {"status_code": 401}, {"status_code": 404}, {"status_code": 409},
+                                                         {"status_code": 403}, {"status_code": 401, "src": keep}]},
+                        {"action": "act2", "error_patterns": [{"status_code": 404}]}]}
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_backend_draft.json").write_text(json.dumps(backend, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            _fill_src(out)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    ep0, ep1 = out["api_spec"][0]["error_patterns"], out["api_spec"][1]["error_patterns"]
+    assert ep0[0]["src"] == be_src and ep0[1]["src"] == s401, ep0
+    assert "src" not in ep0[2] and "src" not in ep0[3], ep0  # 404 は候補が2つ(下書きと認証)・409 は候補無し
+    assert ep0[4]["src"] == s403 and ep0[5]["src"] == keep, ep0  # 403 は認証の候補だけ・既存の src は触らない
+    assert "src" not in ep1[0], ep1  # act2 の 404 も下書き s404a と認証 s404b の2候補
     print("[selftest OK] _units._fill_src (calculations の src は calc_candidates の label が1件のとき)")
 
 

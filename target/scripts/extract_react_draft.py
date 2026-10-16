@@ -228,7 +228,20 @@ def _resolve(span, ctx, seen, acc):
     path, text, s, e = span
     # 目的: 失敗時・連続操作・0件の目印を拾うため、辿った本体の文字を acc に積む(_robust_lines が使う)
     acc["texts"].append(text[s:e])
-    for name, i in _idents(text, s, e):
+    # 目的: action を文字の出現順でなく実行順に積む。呼出 f(引数) の引数の中の呼出(refresh(await save(x)) の save)は f 自身より先に評価されるので、
+    # この呼出は「閉じ括弧の位置」を並べる鍵にする(引数の中の識別子の鍵はそれより小さい)。引数に関数式(=> ・ function)を含む呼出は
+    # コールバックを後で呼ぶ形(then(cb)・ラッパー)なので、従来どおり文字の順のままにする。Promise の連鎖は文字の順が実行順。
+    order = {}
+    idents = list(_idents(text, s, e))
+    for name, i in idents:
+        k = i + len(name)
+        while k < e and text[k] in " \t\r\n":
+            k += 1
+        if k < e and text[k] == "(":
+            c = _close(text, k)
+            if not re.search(r"=>|\bfunction\b", text[k:c]):
+                order[i] = c
+    for name, i in sorted(idents, key=lambda t: order.get(t[1], t[1])):
         # 目的: 画面が使う API 関数の定義(api.ts 側)を、excerpt に抜くために覚える。接続: _excerpt_chunks()
         if name in ctx["funcs"] and ctx["funcs"][name][0].suffix not in (".tsx", ".jsx"):
             ctx["used"].add(name)
@@ -294,6 +307,64 @@ def _excerpt_chunks(used, funcs):
     return "\n\n".join(parts) + "\n"
 
 
+# 目的: 親の JSX が子の部品タグへ props で渡す属性(<Child onSave={fn} />)と、位置を含む最上位コンポーネント名を引く。
+# 接続: analyze_sources() が、子のイベント属性の式が props 経由のとき(onChange={onChange} など)親の式へ辿るのに使う。
+_COMP_DEF = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+([A-Z][\w$]*)\s*(?:<[^>(]*>)?\s*\(|const\s+([A-Z][\w$]*)\s*(?::[^=;]+)?=(?![=>]))", re.M)
+_ATTR_NAME = re.compile(r"[A-Za-z_$][\w$:.-]*")  # _EVENT_ATTR は on で始まる名前だけなので、全属性用に別に持つ
+
+
+def _enclosing_component(text, pos):
+    """位置 pos を含む最上位(行頭から始まる)のコンポーネント関数名を返す。無ければ空文字。
+
+    呼出元: analyze_sources()。WHY: 子のイベントの props 名を、どの子の部品の属性として親が渡したかへ結ぶ鍵にする。
+    """
+    name = ""
+    for m in _COMP_DEF.finditer(text, 0, pos):
+        name = m.group(1) or m.group(2)
+    return name
+
+
+def _collect_prop_bindings(texts):
+    """親の TSX の JSX で、定義が読んだ TSX にある大文字始まりのタグの 属性={式} を全部拾う。
+
+    戻り値: {(コンポーネント名, 属性名): [(path, text, 式の開始, 式の終了)]}。span の形は _resolve が取るものと同じ。
+    WHY: 外部ライブラリのタグ(読んだ TSX に定義が無い)は子の中を辿れないので入れない。
+    """
+    tsx = {p: t for p, t in texts.items() if p.suffix in (".tsx", ".jsx")}
+    defined = {g for t in tsx.values() for m in _COMP_DEF.finditer(t) for g in m.groups() if g}
+    table = {}
+    for p, t in tsx.items():
+        for tm in re.finditer(r"<([A-Z][\w$]*)", t):
+            if tm.group(1) not in defined:
+                continue
+            i = tm.end()
+            while i < len(t):
+                while i < len(t) and t[i].isspace():
+                    i += 1
+                if i >= len(t) or t[i] in "/>":
+                    break
+                if t[i] == "{":  # {...spread}
+                    i = _close(t, i) + 1
+                    continue
+                am = _ATTR_NAME.match(t, i)
+                if not am:
+                    break
+                i = am.end()
+                if t[i:i + 1] != "=":
+                    continue
+                i += 1
+                if t[i:i + 1] == "{":
+                    be = _close(t, i)
+                    table.setdefault((tm.group(1), am.group(0)), []).append((p, t, i + 1, be))
+                    i = be + 1
+                elif t[i:i + 1] in ("\"", "'"):
+                    j = t.find(t[i], i + 1)
+                    i = len(t) if j < 0 else j + 1
+                else:
+                    break
+    return table
+
+
 def analyze_sources(source_files, api_call_functions, info=None):
     """TSX を解析し、(links, unresolved, excerpt) を返す。
 
@@ -308,10 +379,13 @@ def analyze_sources(source_files, api_call_functions, info=None):
       excerpt: 画面が使う API 関数と参照する型の断片(TS の文字列。無ければ空文字)。main() が書き出す
     辿り方: イベント属性の式 → 局所関数(useCallback を含む)・api_call_functions の直接呼出 → setter で変わる状態
             → その状態に依存する派生値(const・useCallback/useMemo の依存配列)を閉包 → 依存配列が交わる useEffect の本体。
-    参照先を1つも解決できないイベント属性(子の props 経由の呼出など)は links に入れず unresolved に出す。
+    子の部品の props 経由(onChange={onChange}・props.onSave)は、親が同名の属性で式を渡していれば親の式まで辿って links に入れる
+    (親側の <Child onSave={...}> は重ねて入れない)。親が渡していない等で参照先を1つも解決できないイベント属性は links に入れず unresolved に出す。
     """
     texts = {p: p.read_text(encoding="utf-8") for p in source_files
              if p.suffix in (".ts", ".tsx", ".js", ".jsx")}
+    # 目的: 子の部品のイベントが props 経由のとき親の式へ辿る表と、子で解決できた (部品名, 属性名)。接続: 下のイベント属性のループ
+    prop_table, child_resolved, parent_links = _collect_prop_bindings(texts), set(), []
     funcs, setters, derived, effects, unresolved = {}, {}, {}, [], []
     for p, t in texts.items():
         _collect_defs(p, t, funcs, setters, derived, effects, unresolved)
@@ -333,6 +407,15 @@ def analyze_sources(source_files, api_call_functions, info=None):
             acc = {"actions": [], "states": set(), "hit": False, "texts": [], "fetch": False, "calls": []}
             _resolve((p, t, bo + 1, be), ctx, set(), acc)
             expr = " ".join(t[bo + 1:be].split())[:80]
+            # 目的: 式が名前だけ(または props.名前)で、位置を含む部品へ親が同名の属性を渡していれば、親の式を全部辿る。
+            #       局所関数・API 直呼びを先に試し、解決できなかったときだけ表を引く。
+            pm = re.fullmatch(r"(?:props\.)?([A-Za-z_$][\w$]*)", t[bo + 1:be].strip())
+            if pm and not acc["hit"] and not acc["actions"]:
+                pkey = (_enclosing_component(t, m.start()), pm.group(1))
+                for pspan in prop_table.get(pkey, []):
+                    _resolve(pspan, ctx, set(), acc)
+                if acc["hit"] or acc["actions"]:
+                    child_resolved.add(pkey)
             if not acc["hit"] and not acc["actions"]:
                 unresolved.append({"file": str(p), "line": _line(t, m.start()),
                                    "reason": f"{m.group(1)} の参照先を解決できない: {expr}"})
@@ -365,6 +448,10 @@ def analyze_sources(source_files, api_call_functions, info=None):
                 # 目的: イベント属性の式の出典(下書きの events[].src の元)。接続: build_draft()
                 "src": [_span(p, t, bo + 1, be)],
             })
+            parent_links.append((links[-1], tags[-1].group(1) if tags else "", m.group(1)))
+    # 目的: 親の <Child onSave={fn} /> は、子の中で同じ属性のイベントが解決できたとき重ねて links に入れない(同じ操作が EV で2つ立たない)。
+    dup_ids = {id(lk) for lk, tag, attr in parent_links if (tag, attr) in child_resolved}
+    links = [lk for lk in links if id(lk) not in dup_ids]
     # EV00(初期表示): マウント時には全ての useEffect が走るので、その呼出を出現順に集めて links の先頭に置く。
     # 意味合い: パイプラインの決まり(EV00 = 初期表示)に合わせる。接続: build_draft が attr="mount" を EV00 にする。
     # ponytail: effect 内の条件分岐(if で呼ばない場合)は見ない。呼ぶ可能性のある action を全部出す。
@@ -1064,7 +1151,9 @@ def build_draft(links, unresolved, screen_name, failure_effects=(), state_names=
             "src": ev["src"],
             # 目的: このイベントが呼ぶ API 呼出の位置(action と出典)。接続: 合成側が details の行と照合する
             "calls": link["calls"],
-            "details": todo + [f"・{act} をリクエストする" for act in op_order if act in called]
+            # 目的: このイベント自身の実行の順(link["actions"]。_resolve が実行順に積む)で並べる。op_order は全イベントでの初出順なので、
+            # 別のイベントが先に load を呼ぶと「保存してから再取得(save→load)」が逆順になった
+            "details": todo + [f"・{act} をリクエストする" for act in link["actions"]]
             + _detail_lines(link, called, [f for f in failure_effects if f["event"] == ev["event_code"]]),
             # 目的: 開始時・成功時・失敗時・0件の事実の行(案 B5)。接続: B6 が position どおりに強制する
             "fact_lines": _event_facts(link, [f for f in failure_effects if f["event"] == ev["event_code"]],
@@ -2349,6 +2438,38 @@ def selftest():
         assert "Screen.tsx" not in _excerpt, "画面の関数が excerpt に混ざった"
         assert re.search(r"// 出典: \S*api\.ts:\d+-\d+", _excerpt), "excerpt の見出しが 出典: path:行-行 になっていない"
         assert len(unresolved) == 1 and "props.onSave" in unresolved[0]["reason"], f"unresolved: {unresolved}"
+        # 目的(G27): 親が props で渡したハンドラを子の JSX のイベント属性まで辿る。親の <Child onSave=...> は重ねて立たない。
+        #       親が無い子(上の Screen の props.onSave)は従来どおり unresolved 1件のまま(上の assert)。
+        parent_src = (
+            'import { useState } from "react";\n'
+            'import { call } from "./api";\n'
+            'export default function Parent() {\n'
+            '  const [name, setName] = useState("");\n'
+            '  const handleSave = () => { call("save"); };\n'
+            '  return <Child onSave={handleSave} onChange={setName} />;\n'
+            '}\n'
+        )
+        child_src = (
+            'function Child(props: any) {\n'
+            '  const { onChange } = props;\n'
+            '  return (\n'
+            '    <div>\n'
+            '      <input placeholder="名前" onChange={onChange} />\n'
+            '      <button onClick={props.onSave}>保存</button>\n'
+            '    </div>\n'
+            '  );\n'
+            '}\n'
+        )
+        with tempfile.TemporaryDirectory() as d2:
+            dp2 = Path(d2)
+            (dp2 / "api.ts").write_text(api_src, encoding="utf-8")
+            (dp2 / "Parent.tsx").write_text(parent_src, encoding="utf-8")
+            (dp2 / "Child.tsx").write_text(child_src, encoding="utf-8")
+            links2, unresolved2, _ex2 = analyze_sources([dp2 / "api.ts", dp2 / "Parent.tsx", dp2 / "Child.tsx"], ["call"])
+        assert unresolved2 == [], f"親子: unresolved が残った: {unresolved2}"
+        assert [k["attr"] for k in links2] == ["mount", "onChange", "onClick"], f"親子: links の attr(親の <Child on*> が重ならない): {[k['attr'] for k in links2]}"
+        assert links2[1]["ui_label"] == "名前", f"親子: 子の入力欄の ui_label: {links2[1]['ui_label']}"
+        assert links2[2]["ui_label"] == "保存" and links2[2]["actions"] == ["save"], f"親子: 保存ボタン: {links2[2]}"
         draft = build_draft(links, unresolved, "テスト画面")
         assert [e["event_code"] for e in draft["events"]] == ["EV00", "EV01", "EV02"], "event_code(EV00 = 初期表示、以降 EV01…)"
         assert draft["events"][0]["trigger"] == "テスト画面の初期表示時", "EV00 の trigger"
@@ -2366,6 +2487,37 @@ def selftest():
         assert draft["event_processes"][0]["details"] == ["・load をリクエストする", "・init をリクエストする"], "EV00 の details"
         assert draft["event_processes"][1]["details"] == [DETAIL_TODO, "・load をリクエストする"], "EV01 の details"
         assert draft["event_processes"][2]["details"] == [DETAIL_TODO, "・wrapped をリクエストする"], "EV02 の details"
+        # 目的(G28): details はこのイベント自身の実行順。先のイベントが load だけで op_order が [load, save] でも、「保存してから再取得」は save→load。
+        #       (a) .then の連鎖と await の連続 (b) 引数の中の呼出 refresh(await save(x)) は save が refresh(load) より先。
+        order_src = (
+            'import { call } from "./api";\n'
+            'export default function Order() {\n'
+            '  const refresh = (x) => { call("load"); };\n'
+            '  const onLoad = () => { call("load"); };\n'
+            '  const onThen = () => { call("save").then(() => call("load")); };\n'
+            '  const onAwait = async () => { await call("save"); await call("load"); };\n'
+            '  const onNest = async () => { refresh(await call("save")); };\n'
+            '  return (\n'
+            '    <div>\n'
+            '      <button onClick={onLoad}>a</button>\n'
+            '      <button onClick={onThen}>b</button>\n'
+            '      <button onClick={onAwait}>c</button>\n'
+            '      <button onClick={onNest}>d</button>\n'
+            '    </div>\n'
+            '  );\n'
+            '}\n'
+        )
+        with tempfile.TemporaryDirectory() as d3:
+            dp3 = Path(d3)
+            (dp3 / "api.ts").write_text(api_src, encoding="utf-8")
+            (dp3 / "Order.tsx").write_text(order_src, encoding="utf-8")
+            links3, _un3, _ex3 = analyze_sources([dp3 / "api.ts", dp3 / "Order.tsx"], ["call"])
+        clicks = [k["actions"] for k in links3 if k["attr"] == "onClick"]
+        assert clicks == [["load"], ["save", "load"], ["save", "load"], ["save", "load"]], f"実行順の actions: {clicks}"
+        draft3 = build_draft(links3, _un3, "順序画面")
+        for p in draft3["event_processes"][-3:]:
+            assert p["details"][:3] == [DETAIL_TODO, "・save をリクエストする", "・load をリクエストする"], f"save→load の details: {p['details']}"
+        assert [o["api_endpoint"]["action"] for o in draft3["db_operations"]] == ["load", "save"], "db_operations は全イベントの初出順のまま"
     except AssertionError as e:
         print(f"[selftest NG] {e}")
         return 1

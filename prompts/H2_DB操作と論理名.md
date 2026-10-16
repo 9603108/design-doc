@@ -7,6 +7,7 @@
 
 ## 列の骨組みは1列も省かない
 - 下書きの columns は**全部** dataset に書く(columns が 63 列なら dataset も 63 行)。「ソースに根拠が無い」「画面に出ない」を理由に省かない
+- 下書きの expanded:true の行(column が 'f_*' の形。実行時に展開される列)は、dataset に1行で写す(physical_column は 'f_*'、expanded:true、rule・type も写す)。展開後の列に分けて書かない
 - logical_names にも columns の列を全部書く(同じ表・同じ列は1行にまとめてよい)
 - dataset の physical_column は columns[].real_column の列の部分(表.列 の列)を写す。kind が alias_only の列は real_column が空で、下書きの physical_column に入っている値は別名なので、physical_column に書かない(空にし、別名は logical_column と alias_name で示す)。**logical_names にも同じ別名の行を書き、physical_column は空・alias_name に別名を入れる(dataset の行と同じ書き方。logical_names でも alias_name を落とさない)**。physical_table は columns[].real_column の表の部分(空なら table)。logical_names は (physical_table, physical_column) ごとに1行。並びは columns の no の順
 - 論理名は logical_name の候補があれば使う。出所が guess(列名からの推定)・ui_label_guess(画面の語からの推定)の候補は、論理名の末尾に「(推定)」を付けて書く

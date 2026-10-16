@@ -211,6 +211,7 @@ def check_h2_columns(h2, draft):
     写しに当ててから数える(verify_vs_source の [別名] とは、直した形で食い違わない)。
     呼出元: check_unit_extras。"""
     import copy
+    import re
     from collections import Counter
     import _compose_db_facts
     h2 = copy.deepcopy(h2)  # 検査は断片を書き換えない
@@ -233,6 +234,16 @@ def check_h2_columns(h2, draft):
     def label(c):
         return c.get("alias") or c.get("column") or c.get("expression")
 
+    def xprefix(c):  # 実行時に展開される列(下書きの expanded:true・column '<接頭辞>*'、または展開の目印の別名)なら、その接頭辞。そうでなければ None
+        # WHY: f_<種別> のように列の数が実行時に決まる列は、H2 に1行('<接頭辞>*')でも展開後の複数行でも書ける。名前の完全一致では前者・後者のどちらかが [列の省略] になる
+        if c.get("expanded") and str(c.get("column") or "").endswith("*"):
+            return c["column"][:-1]
+        m = re.match(r"__expand_(\w+?)__from__", c.get("alias") or "")
+        return m.group(1) if m else None
+
+    def has_prefix(p, names):  # 接頭辞 p で始まる照合名(または '<p>*' の1行)が1つでもあるか
+        return any(isinstance(n, str) and n.startswith(p) for n in names)
+
     problems, keys = [], {}
     ops = [o for o in (h2.get("db_operations") or []) if isinstance(o, dict)]
     for action, api in (draft.get("apis") or {}).items():
@@ -246,6 +257,11 @@ def check_h2_columns(h2, draft):
         pool = Counter(h2_name(r) for o in mine for r in o.get("dataset") or [] if isinstance(r, dict))
         lack = []
         for c in cols:
+            p = xprefix(c)
+            if p is not None:  # 展開列は、その接頭辞の行が1行以上あれば足りる(行は数え減らさない)
+                if not has_prefix(p, [n for n, k in pool.items() if k > 0]):
+                    lack.append(label(c))
+                continue
             hit = next((n for n in accepted(c) if pool[n] > 0), None)
             if hit is None:
                 lack.append(label(c))
@@ -258,7 +274,8 @@ def check_h2_columns(h2, draft):
     names = [n for n in h2.get("logical_names") or [] if isinstance(n, dict)]
     if keys:
         have = {h2_name(n) for n in names}  # 別名だけの行(alias_only)も alias_name で数える(dataset と同じ照合名)
-        lack = [name for (_table, name), c in keys.items() if not any(n in have for n in accepted(c))]
+        lack = [name for (_table, name), c in keys.items()
+                if not (has_prefix(xprefix(c), have) if xprefix(c) is not None else any(n in have for n in accepted(c)))]
         if lack:
             problems.append(f"[列の省略] logical_names: 下書きの列 {len(keys)} 種のうち H2 に無い: "
                             f"{', '.join(lack)} → 差し戻し先 H2")
@@ -416,17 +433,20 @@ def check_cl_src(frags):
 
 
 def _bad_error_rows(frags):
-    """S2 の error_patterns で根拠の無い行を (action, 番号, 行) で返す。message_id が無く、(a) status_code が無い、
-    または (b) 同じ API に同じ status_code で message_id のある行がある。呼出元: check_error_rows。"""
+    """S2 の error_patterns で根拠の無い行を (action, 番号, 行) で返す。message_id が無い行は status_code(整数)と condition(非空)が
+    根拠(契約 i4.k1。401・404 など番号の無いエラーを書けるように)。ERROR は (a) status_code が整数でない、(b) condition が空、
+    (c) 同じ API の message_id つき行と status_code・condition の両方が同じ(注記の重複)。呼出元: check_error_rows。"""
     for a in ((frags.get("S2") or {}).get("api_spec") or []):
         if not isinstance(a, dict):
             continue
         rows = [e for e in a.get("error_patterns") or [] if isinstance(e, dict)]
-        with_mid = {str(e.get("status_code")) for e in rows if e.get("message_id") and e.get("status_code") is not None}
+        with_mid = {(str(e.get("status_code")), str(e.get("condition") or "").strip()) for e in rows if e.get("message_id")}
         for i, e in enumerate(rows):
             if e.get("message_id"):
                 continue
-            if e.get("status_code") is None or str(e.get("status_code")) in with_mid:
+            sc = e.get("status_code")
+            cond = str(e.get("condition") or "").strip()
+            if not isinstance(sc, int) or isinstance(sc, bool) or not cond or (str(sc), cond) in with_mid:
                 yield a.get("action"), i, e
 
 
@@ -434,9 +454,26 @@ def check_error_rows(frags):
     """S2 の error_patterns の、出典(message_id)の無い注記の行を ERROR にする(W1 c)。差し戻し先 S2。
     WHY: S2 が処理の無いことの注記に status_code=400 を付けて行にし、合成が error_code を補って本物のエラー行に見えた(run12 の新6)。
     共通エラー(500 など)は合成が足すので S2 の断片に無く、対象外。呼出元: main_units。"""
-    return [f"[根拠] api_spec[{act}].error_patterns[{i}]「{str(e.get('condition') or '')[:30]}」: 出典(message_id)が無い。"
-            "起きる条件と返るステータスの行だけを書き、注記は api_spec の description へ → 差し戻し先 S2"
+    return [f"[根拠] api_spec[{act}].error_patterns[{i}]「{str(e.get('condition') or '')[:30]}」: 根拠が足りない。"
+            "message_id が無いときは status_code と condition を書く。注記は api_spec の description へ → 差し戻し先 S2"
             for act, i, e in _bad_error_rows(frags)]
+
+
+def check_request_defaults(frags):
+    """H3 の request_params[].default が「なし」などの語(契約 i6.k1)のとき ERROR にする(G32)。差し戻し先 H3。
+    WHY: 既定値が無いときの書き方が「なし」「なし(全店)」と空文字で揺れた。空文字の1つにそろえる。判定は _compose_request_default.is_no_default の
+    1か所(合成 fill と同じ語)。既定が実際の値の行・default が無い行は見ない。呼出元: main_units。"""
+    from _compose_request_default import is_no_default
+    out = []
+    for a in ((frags.get("H3") or {}).get("api_spec") or []):
+        if not isinstance(a, dict):
+            continue
+        for p in a.get("request_params") or []:
+            if isinstance(p, dict) and is_no_default(p.get("default")):
+                out.append(f"[既定値] api_spec[{a.get('action')}].request_params[{p.get('name')}].default: "
+                           "既定値が無いときは空欄にする(「なし」と書かない) → 差し戻し先 H3")
+    return out
+
 
 def check_composed_gaps(composed, frags):
     """合成した形の穴を、verify_intermediate(最後の検査)より前の単位の検査で拾う(ERROR)。呼出元: main_units。
@@ -797,6 +834,7 @@ def main_units(directory, only=None, feature=None):
     # W1 b)(c): S1 の CL の src 無し・S2 の根拠の無いエラー行は ERROR。WARN には重ねない(skip に入れる)
     cl_errs, err_errs = check_cl_src(frags), check_error_rows(frags)
     extra += cl_errs + err_errs
+    extra += check_request_defaults(frags)  # G32: H3 の default に「なし」を書いた行を H3 へ戻す
     skip = {("common_logic", _row_label(r)) for r in ((frags.get("S1") or {}).get("common_logic") or []) if isinstance(r, dict) and not r.get("src")}
     skip |= {("error_patterns", str(e.get("condition"))) for _a, _i, e in _bad_error_rows(frags)}
     problems += [p for p in extra if not only or f"差し戻し先 {only}" in p]
@@ -940,6 +978,15 @@ def selftest_units():
     h2a["logical_names"] = [{"physical_table": "shops", "logical_column": "別の名前", "physical_column": ""}]
     out = check_h2_columns(h2a, draft_alias)
     assert len(out) == 1 and out[0].startswith("[列の省略] logical_names") and "H2 に無い: shop_name" in out[0], out
+    # G29: 実行時に展開される列(expanded:true・column 'f_*')は、H2 が「f_*」の1行でも展開後の2行(f_a・f_b)でも問題0件。接頭辞の行が無ければ省略として出す
+    draft_x = {"apis": {"get": {"db_operations": [{"id": "db_op_get", "columns": [
+        {"alias": "id", "column": "id", "table": "t"}, {"alias": "f_*", "column": "f_*", "table": "t", "expanded": True}]}]}}}
+    for cols_x in (({"physical_column": "id"}, {"physical_column": "f_*"}), ({"physical_column": "id"}, {"physical_column": "f_a"}, {"physical_column": "f_b"})):
+        h2x = {"db_operations": [{"id": "db_op_get", "api_endpoint": {"action": "get"}, "dataset": [dict(r) for r in cols_x]}],
+               "logical_names": [dict(r) for r in cols_x]}
+        assert check_h2_columns(h2x, draft_x) == [], check_h2_columns(h2x, draft_x)
+    h2x["db_operations"][0]["dataset"] = [{"physical_column": "id"}]
+    assert len(check_h2_columns(h2x, draft_x)) == 1 and "H2 に無い: f_*" in check_h2_columns(h2x, draft_x)[0], check_h2_columns(h2x, draft_x)
     # 下書きの集計・ウィンドウの別名が H2 の aggregate に無ければ ERROR(C4)
     draft3 = {"apis": {"save": {"features": {"aggregates": [{"alias": "total"}], "windows": [{"alias": "nz"}]}}}}
     h2f = {"db_operations": [{"id": "db_op_save", "api_endpoint": {"action": "save"}, "aggregate": [{"alias": "total"}]}]}
@@ -1018,11 +1065,24 @@ def selftest_units():
     def s2(*rows):
         return {"S2": {"api_spec": [{"action": "a", "error_patterns": list(rows)}]}}
     ok_row = {"condition": "形式が違う", "status_code": 400, "message_id": "MSE00001"}
-    out = check_error_rows(s2(ok_row, {"condition": "注記", "status_code": 400}))
+    out = check_error_rows(s2(ok_row, {"condition": "形式が違う", "status_code": 400}))
     assert len(out) == 1 and "error_patterns[1]" in out[0] and out[0].endswith("差し戻し先 S2"), out
     assert check_error_rows(s2(ok_row, {"condition": "別の status", "status_code": 404})) == [], "status が一意の行を ERROR にした"
     assert len(check_error_rows(s2(ok_row, {"condition": "status 無し"}))) == 1, "status 無しを ERROR にしない"
     assert check_error_rows(s2(ok_row)) == [], "message_id のある行を ERROR にした"
+    # i4.k1: 番号の無い 401・404・409 の行は status_code と condition があれば通る(display は有無どちらでも)
+    assert check_error_rows(s2(ok_row, {"condition": "未ログイン", "status_code": 401, "display": "ログインしてください"},
+                               {"condition": "対象が無い", "status_code": 404}, {"condition": "同時更新", "status_code": 409})) == [], "番号の無い行を ERROR にした"
+    assert check_error_rows(s2(ok_row, {"condition": "別の条件", "status_code": 400})) == [], "condition が違う 400 を ERROR にした"
+    assert len(check_error_rows(s2({"condition": "", "status_code": 401}))) == 1, "condition 空を ERROR にしない"
+    assert len(check_error_rows(s2({"status_code": 401}))) == 1, "condition 無しを ERROR にしない"
+    # G32(i6.k1): H3 の default に「なし」「なし(全店)」を書くと ERROR。空文字・'0'・default 無しは通る
+    def h3(*defaults):
+        return {"H3": {"api_spec": [{"action": "a", "request_params": [{"name": f"p{i}", "default": d} if d is not None else {"name": f"p{i}"}
+                                                                       for i, d in enumerate(defaults)]}]}}
+    out = check_request_defaults(h3("なし", "なし(全店)"))
+    assert len(out) == 2 and out[0].startswith("[既定値] api_spec[a].request_params[p0].default") and out[0].endswith("差し戻し先 H3"), out
+    assert check_request_defaults(h3("", "0", "register", None)) == [], "空文字・実際の値・default 無しを ERROR にした"
 
 
 def selftest_feature():

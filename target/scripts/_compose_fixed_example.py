@@ -255,12 +255,53 @@ def _tsx_src(item):
     return cands[0]
 
 
+# G31: ソースに根拠の無い例示値(店名・担当者名・金額など実行時のデータで決まる欄)の決まった見本値。
+# WHY: 担当が「A店」「佐藤」「38,500」と思い思いに作り、回ごとに例示値が揺れた(POS では金額が38件)。型ごとに1つに固定して揺れを消す。
+# 手順書(i5.4)の表と同じ字面。呼出元: _runtime_example(→ fill)。
+EXAMPLE_BY_TYPE = {"date": "2026-10-01", "amount": "1,234 円", "count": "123", "ratio": "12.3%", "code": "1", "name": "実行時の値"}
+
+# 項目名・format・data_type の語から型を決める語彙。上から順に当て、当たらなければ型が取れない(None=触らない)
+_TYPE_WORDS = (
+    ("ratio", re.compile(r"率|割合|比率|%|％")),
+    ("count", re.compile(r"数$|件数|点数|枚数|人数|数量")),
+    ("amount", re.compile(r"金額|売上|単価|価格|原価|利益|税|残高|円")),
+    ("date", re.compile(r"日付|年月|日$|yyyy|YYYY")),
+    ("code", re.compile(r"コード|番号|ID|code")),
+    ("name", re.compile(r"名$|名称|氏名|担当者|店舗|店名|顧客|得意先|取引先")),
+)
+_UNIT = re.compile(r"単位[:：=]?\s*([^\s,、。)）]+)")
+
+
+def _runtime_example(item):
+    """項目1件の、ソースに根拠が無い例示値の見本値(EXAMPLE_BY_TYPE)。根拠がある・型が取れない・Label・固定文言は None(触らない)。
+    根拠の有無は screen_text 系の既存の判定(literal_screen_text が字面を決められたか)で決め、新しい判定を重ねない。
+    呼出元: fill。個数の単位は項目の format・remarks の「単位: ○」から付ける(無ければ数値だけ)。"""
+    if item.get("item_type") == "Label" or item.get("format") == "固定文言":
+        return None  # 画面のソースが描く固定の文字(ラベル・見出し)は対象外
+    s = _tsx_src(item)
+    if s is not None and literal_screen_text(s["file"], s["line_start"], s.get("line_end") or s["line_start"]):
+        return None  # 出典の JSX が字面を決める欄はソースが正
+    hay = " ".join(str(item.get(k) or "") for k in ("item_name", "format", "data_type"))
+    kind = next((k for k, rx in _TYPE_WORDS if rx.search(hay)), None)
+    if kind is None:
+        return None
+    if kind == "count":
+        u = _UNIT.search(f"{item.get('format') or ''} {item.get('remarks') or ''}")
+        return EXAMPLE_BY_TYPE["count"] + (f" {u.group(1)}" if u else "")
+    return EXAMPLE_BY_TYPE[kind]
+
+
 def fill(out, log):
     """screen_layout.items のうち Label の example を、出典 src の JSX が描く字面に直す。決まらない項目は触らない。"""
     items = [x for x in ((out.get("screen_layout") or {}).get("items") or []) if isinstance(x, dict)]  # fallback-ok: 画面項目を持たない断片の合成では何もしない
     cache, done, skipped = {}, [], []
     for it in items:
         if it.get("item_type") != "Label":
+            new = _runtime_example(it)  # G31: Label 以外の、実行時のデータが入る欄を型ごとの見本値にそろえる
+            old = str(it.get("example") or "")
+            if new is not None and old != new:
+                it["example"] = new
+                log.append(f"[例示値] {it.get('item_name')} の例示値「{old}」を「{new}」に揃える(ソースに根拠が無い)")
             continue
         s = _tsx_src(it)
         if s is None:
@@ -360,6 +401,15 @@ def _selftest():
             {"item_name": "文の切れ目", "item_type": "Label", "example": "旧", "src": src(at("m4"), at("前半の文"))},
             {"item_name": "文の途中", "item_type": "Label", "example": "旧", "src": src(at("m4"), at("後半は"))},
             {"item_name": "強調と続き", "item_type": "Label", "example": "旧", "src": src(at("<strong>見出し"), at("<strong>見出し"))},
+            # G31: 実行時のデータが入る欄(Label 以外で出典の字面が決まらない)は、型ごとの見本値にそろえる
+            {"item_name": "店名", "item_type": "TextBox", "example": "A店"},
+            {"item_name": "担当者名", "item_type": "TextBox", "example": "佐藤"},
+            {"item_name": "売上金額", "item_type": "TextBox", "example": "500 円"},
+            {"item_name": "対象日付", "item_type": "Calendar", "example": "2025/1/1"},
+            {"item_name": "点数", "item_type": "TextBox", "example": "9 点", "format": "単位: 点"},
+            {"item_name": "備考", "item_type": "TextBox", "example": "自由記述"},                      # 型が取れない欄は触らない
+            {"item_name": "店舗名(出典あり)", "item_type": "TextBox", "example": "店舗", "src": src(at("<label>"), at("<label>"))},  # 出典が字面を決める欄は触らない
+            {"item_name": "担当者名ラベル", "item_type": "Label", "example": "店舗", "src": src(at("<label>"), at("<label>"))},  # Label は対象外
         ]}}
         log = []
         fill(out, log)
@@ -382,6 +432,10 @@ def _selftest():
         assert ex["文の切れ目"] == "前半の文。", ex["文の切れ目"]   # 範囲の終わりの次が <br /> なら文の切れ目
         assert ex["文の途中"] == "旧", ex["文の途中"]               # 次の行が {式} で続く文の途中で切れた範囲は触らない
         assert ex["強調と続き"] == "旧", ex["強調と続き"]            # 強調要素で始まる範囲の後ろに文字が続くと、見出しの項目か本文の項目か決まらない
+        assert ex["店名"] == "実行時の値" and ex["担当者名"] == "実行時の値", (ex["店名"], ex["担当者名"])
+        assert ex["売上金額"] == "1,234 円" and ex["対象日付"] == "2026-10-01" and ex["点数"] == "123 点", ex
+        assert ex["備考"] == "自由記述" and ex["店舗名(出典あり)"] == "店舗" and ex["担当者名ラベル"] == "店舗", ex
+        assert any("[例示値] 店名 の例示値「A店」を「実行時の値」に揃える(ソースに根拠が無い)" in x for x in log), log
         assert any("固定文の例示値を出典の JSX が描く字面に直した: 5 件" in x and "注記" in x for x in log), log
         assert any("字面がソースで決まらず例示値を触らない固定文 5 件" in x and "{shops.length}" in x and "<Badge>" in x and "文の途中" in x and "強調要素" in x for x in log), log
         # 2回目は何も変えない(冪等)

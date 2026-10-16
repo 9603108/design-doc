@@ -94,8 +94,56 @@ class Module:
                 except ValueError:
                     pass  # 定数でないものは評価しない(f 文字列の穴は下の _eval が失敗して X になる)
 
+    def _expand(self, f):
+        """引数ありの補助関数 f が「for 変数 in 反復元: cols.append(... AS 接頭辞%s / AS 接頭辞{変数} ...)」で列を組み join して返すとき、
+        {prefix, values, source, type} を返す(違えば None)。実行時に展開される SELECT 列(棚分析の f_<種別>)を1列 X に潰さないため。
+        values は反復元が同じファイルの定数、または from X import 名 で辿れる同じフォルダの X.py の定数(str の list/tuple)なら値の配列、決められなければ None。
+        呼出元: env(i3.1)。結果は _render(i3.2)と _dataset(i3.3)が読む。"""
+        rets = [n for n in ast.walk(f) if isinstance(n, ast.Return)]
+        if not f.args.args or len(rets) != 1:
+            return None
+        r = rets[0].value
+        if not (isinstance(r, ast.Call) and isinstance(r.func, ast.Attribute) and r.func.attr == "join" and isinstance(r.func.value, ast.Constant)):
+            return None
+        for loop in ast.walk(f):
+            if not (isinstance(loop, ast.For) and isinstance(loop.target, ast.Name) and isinstance(loop.iter, ast.Name)):
+                continue
+            for c in ast.walk(loop):
+                if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "append" and c.args):
+                    continue
+                txt = ast.unparse(c.args[0])
+                m = re.search(r"\bAS\s+([A-Za-z_]\w*?)(?:%s|\{" + re.escape(loop.target.id) + r"\})", txt)
+                if not m:
+                    continue
+                prefix, src = m.group(1), loop.iter.id
+                ty = re.search(r"::(\w+)\s+AS\s+" + re.escape(prefix), txt)
+                v = self.consts.get(src)
+                imp = self.from_imports.get(src)
+                for n in ast.walk(f):  # 関数の中の from X import 名(棚分析の FACE_TYPES はこの形)
+                    if isinstance(n, ast.ImportFrom) and n.module and not n.level:
+                        imp = next(((n.module, a.name) for a in n.names if (a.asname or a.name) == src), imp)
+                if v is None and imp:
+                    try:
+                        for _ in range(3):  # 定数をさらに別モジュールから取り込んでいる(queries_fo_face の FACE_TYPES は fo_prompt_pack から)ときも、数段だけ辿る
+                            tree = ast.parse((self.path.parent / (imp[0].replace(".", "/") + ".py")).read_text(encoding="utf-8"))
+                            nxt = None
+                            for n in tree.body:
+                                if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == imp[1]:
+                                    v = ast.literal_eval(n.value)
+                                elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+                                    nxt = next(((n.module, a.name) for a in n.names if (a.asname or a.name) == imp[1]), nxt)
+                            if v is not None or not nxt:
+                                break
+                            imp = nxt
+                    except (OSError, SyntaxError, ValueError):
+                        v = None  # 辿れない・定数でない = 決められない(values None)
+                ok = isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v)
+                return {"prefix": prefix, "values": list(v) if ok else None, "source": src, "type": ty.group(1) if ty else ""}
+        return None
+
     def env(self):
-        """f 文字列の穴を評価する名前空間。定数 + 引数なし・return 1 つの関数(例: SELECT 列を組む補助)。"""
+        """f 文字列の穴を評価する名前空間。定数 + 引数なし・return 1 つの関数(例: SELECT 列を組む補助)。
+        __expand__ に、実行時に列が展開される引数ありの補助関数の情報(_expand)を {関数名: {prefix, values, source, type}} で持つ。"""
         env = dict(self.consts)
         for name, f in self.funcs.items():
             rets = [n for n in ast.walk(f) if isinstance(n, ast.Return)]
@@ -103,6 +151,7 @@ class Module:
                 expr = ast.Expression(rets[0].value)
                 ast.fix_missing_locations(expr)
                 env[name] = lambda e=expr, s=self: eval(compile(e, "<f>", "eval"), {"__builtins__": {}}, s.consts)
+        env["__expand__"] = {name: x for name, f in self.funcs.items() if (x := self._expand(f))}
         return env
 
 
@@ -125,7 +174,17 @@ def _render(node, env, sql):
                 ast.fix_missing_locations(expr)
                 out.append(str(eval(compile(expr, "<f>", "eval"), {"__builtins__": {}}, env)))
             except Exception:  # noqa: BLE001 - 評価不能は placeholder にする(推測しない)
-                out.append("X" if sql else "{" + ast.unparse(v.value) + "}")
+                # 実行時に列が展開される補助関数の呼出(Module._expand が env['__expand__'] に載せたもの)は、X に潰さず SELECT 項目の列にする。
+                # values が無ければ目印の1項目(別名 __expand_<接頭辞>__from__<反復元>。_dataset が展開列の1行にする)。
+                call = v.value
+                ex = env.get("__expand__", {}).get(call.func.id) if sql and isinstance(call, ast.Call) and isinstance(call.func, ast.Name) else None
+                if ex:
+                    # 型のキャストは目印だけに付ける(_dataset が型を取る)。値で展開した列に NULL::型 を付けると、後段が NULL 許容と誤読する
+                    names = [f"NULL AS {ex['prefix']}{x}" for x in ex["values"]] if ex.get("values") else \
+                        [f"NULL{'::' + ex['type'] if ex.get('type') else ''} AS __expand_{ex['prefix']}__from__{ex['source']}"]
+                    out.append(", ".join(names))
+                else:
+                    out.append("X" if sql else "{" + ast.unparse(v.value) + "}")
         return "".join(out)
     return None
 
@@ -622,7 +681,12 @@ def _dataset(sql, unresolved, action):
                 continue
             q = re.search(r"\b([A-Za-z_]\w*)\.\w+", _mask(item))
             tbl = real(q.group(1)) if q and q.group(1) in alias else main
-            if tbl != "X":
+            xm = re.fullmatch(r"__expand_(\w+?)__from__(\w+)", col) if am else None  # _render が置いた、実行時に展開される列の目印
+            if xm and tbl != "X":
+                ty = re.match(r"NULL::(\w+)\s+AS\b", item, re.IGNORECASE)
+                rows.append({"column": xm.group(1) + "*", "table": tbl, "expanded": True,
+                             "rule": f"実行時に {xm.group(2)} の値ごとに {xm.group(1)}<値> の列を作る", "type": ty.group(1) if ty else ""})
+            elif tbl != "X":
                 rows.append({"column": col, "table": tbl})
             else:
                 unresolved.append({"action": action, "reason": f"列「{col}」の出所テーブルを静的に取れない(CTE の FROM が動的)"})
@@ -1709,6 +1773,22 @@ def selftest():
         assert _screen_actions({}, Path(d) / "x_screen_config.json", None) == {"mine"}
         assert _screen_actions({"api_actions": ["a", "b"]}, Path(d) / "y_screen_config.json", None) == {"a", "b"}
         assert _screen_actions({"feature_name": "zz_none"}, Path(d) / "z_screen_config.json", Path(d) / "none.json") is None
+    # G29: 実行時に展開される列(for 変数 in 反復元: cols.append(... AS f_%s))。反復元が定数なら列ごと、決まらなければ f_* の1行(X にも unresolved にもしない)
+    helper = ('def _fc(ft):\n    cols = []\n    for t in TYPES:\n        cols.append("count(*)::bigint AS f_%s" % t)\n    return ", ".join(cols)\n'
+              'def g(p):\n    sql = f"SELECT t.id AS id, {_fc(1)} FROM real_tbl t"\n    return {"rows": sql}\n')
+    for tail, want in (('TYPES = ["a", "b"]\n', {("id", "real_tbl"), ("f_a", "real_tbl"), ("f_b", "real_tbl")}),
+                       ('TYPES = load_types()\n', {("id", "real_tbl"), ("f_*", "real_tbl")})):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "h.py").write_text('import q\nA = {"g": q.g}\n', encoding="utf-8")
+            (Path(d) / "q.py").write_text(tail + helper, encoding="utf-8")
+            xr = extract([Path(d) / "h.py", Path(d) / "q.py"])
+        xd = xr["apis"]["g"]["dataset"]
+        assert {(x["column"], x["table"]) for x in xd} == want and xr["unresolved"] == [], (xd, xr["unresolved"])
+        if "f_*" in {x["column"] for x in xd}:
+            xe = next(x for x in xd if x["column"] == "f_*")
+            assert xe["expanded"] is True and xe["type"] == "bigint" and "TYPES" in xe["rule"], xe
+        else:
+            assert not any(x.get("expanded") for x in xd), xd
     print("[selftest OK] extract_backend_draft")
     return 0
 

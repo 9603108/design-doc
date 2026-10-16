@@ -735,6 +735,11 @@ def check_coverage_and_details(merged: dict) -> list:
     for api in merged.get("api_spec", []) or []:
         for e in api.get("error_patterns") or []:
             mid = e.get("message_id")
+            # 契約 i4.k1: 番号の無い行は status_code(整数)と condition(非空)が根拠。verify_partials._bad_error_rows と同じ基準(400 でも validations の検査は番号のある行だけ)
+            sc = e.get("status_code")
+            if not mid and (not isinstance(sc, int) or isinstance(sc, bool) or not str(e.get("condition") or "").strip()):
+                issues.append(("ERROR", f"api_spec[{api.get('action', '')}].error_patterns: message_id が無い行「{str(e.get('condition') or '')[:30]}」に status_code(整数)か condition が無い"
+                                        "（message_id が無いときは status_code と condition を書く。注記は api_spec の description へ）"))
             if str(e.get("status_code")) == "400" and mid and mid not in vl_msgs:
                 issues.append(("ERROR", f"api_spec[{api.get('action', '')}].error_patterns: 400 のエラー {mid} が validations に無い"
                                         "（バック側の入力検査も validations に1件書き、message_id で結ぶ。画面に検査が無ければ kind を「API検査」にする）"))
@@ -802,7 +807,7 @@ def check_backend_process_substance(merged: dict) -> list:
         #    バックエンドのソースに raise / エラー返却があるかまでは見ない（API ごとの切り分けが難しいため）
         action = (bp.get("endpoint") or {}).get("action")
         if not (bp.get("error_patterns") or []) and not (bp.get("error_patterns_none_reason") or none_reason_by_action.get(action)):
-            issues.append(("ERROR", f"backend_processes[{pid}] {name}: error_patterns が空（api_spec[].error_patterns に {{condition, status_code, message_id}} を書く。本当にエラーを返さないなら api_spec[].error_patterns_none_reason に理由を書く）"))
+            issues.append(("ERROR", f"backend_processes[{pid}] {name}: error_patterns が空（api_spec[].error_patterns に {{condition, status_code}}(メッセージ番号があれば message_id、画面に出す文があれば display)を書く。本当にエラーを返さないなら api_spec[].error_patterns_none_reason に理由を書く）"))
         # 4b. name と overview が同じ文 — 見出しと概要で同じ文を2回読ませることになる
         if str(bp.get("name") or "").strip() and str(bp.get("name") or "").strip() == str(bp.get("overview") or "").strip():
             issues.append(("WARN", f"backend_processes[{pid}] {name}: name と overview が同じ文（api_spec[].name に短い処理名を書くか、description を2文にする）"))
@@ -2226,6 +2231,15 @@ def _selftest() -> int:
         return 1
     if not g10_fe or any("db_operations[].remarks" in m for m in g10_fe):
         print(f"[selftest NG] front_processes の30字超の ERROR に remarks の案内が混ざったか ERROR が無い: {g10_fe}")
+        return 1
+    # G30(i4.k1): message_id の無い error_patterns は status_code(整数)と condition があれば通り、無ければ ERROR。
+    def g30(*rows):
+        return [m for lvl, m in check_coverage_and_details({"api_spec": [{"action": "a", "error_patterns": list(rows)}]}) if lvl == "ERROR" and "message_id が無い行" in m]
+    if g30({"condition": "未ログイン", "status_code": 401, "display": "ログインしてください"}, {"condition": "対象が無い", "status_code": 404}):
+        print(f"[selftest NG] 番号の無い 401・404 の行を ERROR にした: {g30({'condition': '未ログイン', 'status_code': 401})}")
+        return 1
+    if len(g30({"condition": "注記"}, {"condition": "", "status_code": 401})) != 2:
+        print("[selftest NG] status_code 無し・condition 空の行を ERROR にしない")
         return 1
     # G11: React の画面(frontend_files あり)では source_html_path が空でも WARN を出さない。起点が無い画面では従来どおり出す。
     g11_react = check_structure({"meta": {"feature_name": "f", "source_html_path": "", "frontend_files": [{"path": "a.tsx"}]}}, {})

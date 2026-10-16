@@ -9,6 +9,7 @@
   - 並び順が B001・B002… の番号になる。初期表示で呼ぶ順を先にする(screen_config の initial_processes の backend_id と合わせる)
   - no は AP1・AP2… 。path は実際の URL のパス(`/api/sales`)
   - request_params は全件: {name, type, required, location(body / query / path / header), default, validation, description}
+    - default の書き方: 既定値が無い(ソースが省略時の値を決めない)ときは default を空文字 "" にする。「なし」「なし(全店)」「-」などは書かない(検査が ERROR にする。合成は残った分を空にそろえる)。省略時の意味(例: 全店)は description に「未指定のときは全店」と書く。既定が実際の値のとき(0・register など)はその値を書く。例: {"name":"shop_id","default":"","description":"店舗。未指定のときは全店"}
   - response_items は return する JSON の全 key を1キー1行: {key, no, display_name, data_type}
     - key は `rows[].shop_id` の形。「各列」「等」や（）でまとめない。display_name は業務の名前。ただし表示行(画面に出る列)に当たる行(キーに [] を含み、画面の列の名前と同じ欄)は、合成(_compose_response.py)が表示行の事実で決めて上書きするので、書いても残らない。それ以外は合成が画面への写し・同じ別名の列の論理名・request の説明から先に補うので、補えない行だけ業務の名前を書く(空欄のまま残すと検査が H3 に戻す)
     - 応答の型: 下書きの `apis[action].response_fields`(path・ts_base・nullable)は data_type・nullable に写さない。決め方は次の行

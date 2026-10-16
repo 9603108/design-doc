@@ -307,6 +307,11 @@ def _selftest():
             got0 = {x["no"]: x["example"] for x in out0["screen_layout"]["items"]}
             assert got0["IT60"] == "0 円", got0
             assert got0["IT58"] == "851 円", got0
+            # G31: 被演算子が見本値(小計 1,234 円・客数 1,234)のとき、割り算の結果の項目もそろう(1,234 ÷ 1,234 = 1)
+            outs = {"screen_layout": {"items": [it("IT40", "小計（税込売上金額）", "1,234 円", 60), it("IT59", "客数", "1,234", 84),
+                                                it("IT60", "客単価", "1,234 円", 85)]}}
+            fill(outs, [])
+            assert outs["screen_layout"]["items"][2]["example"] == "1 円", outs
         finally:
             _config_loader.INTERMEDIATE_DIR = old
     print("[selftest OK] _compose_calc_examples (新2: 式の結果を例示値の数値へ。切り捨て・被演算子が決まらない形は触らない)")
