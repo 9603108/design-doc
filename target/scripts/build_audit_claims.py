@@ -716,6 +716,64 @@ def _excerpt(src, project_root, cache, merged=None, statement="", budget=None, f
     return ex.text()
 
 
+# 設計書の番号の種類ごとの (一覧の欄, 番号の欄, 名前の欄の候補)。接頭辞は id_scheme.json の categories と同じ
+_ID_SOURCES = {
+    "BE": ("backend_processes", "process_id", ("name",)),
+    "FR": ("front_processes", "process_id", ("name",)),
+    "AP": ("api_spec", "no", ("name", "path")),
+    "DB": ("db_operations", "id", ("dataset_name",)),
+    "VL": ("validations", "no", ("field",)),
+    "CA": ("calculations", "no", ("name",)),
+    "CL": ("common_logic", "no", ("name",)),
+    "MS": ("messages", "message_id", ("message",)),
+    "EV": ("events", "no", ("name", "event_name")),
+    "LG": ("common_logging_processes", "process_id", ("name",)),
+    "IT": ("screen_layout.items", "no", ("item_name",)),
+    "AR": ("screen_layout.areas", "area_no", ("area_name", "name")),
+}
+_ID_REF = re.compile(r"\[([A-Z]{2})(\d+)\]")
+
+
+def _id_labels(merged):
+    """設計書の番号(\"BE2\" など) -> 名前つきの説明 の辞書。バックエンド処理・API は action 名も添える。
+    WHY: 照合の担当はソースしか見ないので、[BE2] だけでは何の処理か分からず unknown になった(run22 の AC004・AC011)。"""
+    labels = {}
+    for prefix, (path, idf, namef) in _ID_SOURCES.items():
+        rows = merged
+        for part in path.split("."):
+            rows = rows.get(part) if isinstance(rows, dict) else None
+        for r in rows or []:
+            if not isinstance(r, dict) or not r.get(idf):
+                continue
+            name = next((str(r[k]).strip() for k in namef if r.get(k)), "")
+            action = ""
+            if prefix == "BE":
+                action = str((r.get("endpoint") or {}).get("action") or "")
+            elif prefix == "AP":
+                action = str(r.get("action") or "")
+            elif prefix == "DB":
+                action = str((r.get("api_endpoint") or {}).get("action") or "")
+            if prefix == "DB" and not name:
+                name = str(r.get("operation_type") or "")
+            bits = name + (f" = action {action}" if action and name else (f"action {action}" if action else ""))
+            if bits:
+                labels[str(r[idf])] = bits
+    return labels
+
+
+def _expand_ids(text, labels, road=""):
+    """文の中の [BE2] などを [BE2](名前 = action 名) に置き換える。引けない番号はそのまま残して警告する。"""
+    def sub(m):
+        key = m.group(1) + m.group(2)
+        if m.group(1) not in _ID_SOURCES:
+            return m.group(0)
+        if key in labels:
+            return f"[{key}]({labels[key]})"
+        print(f"[WARN] 設計書の番号 [{key}] の名前を中間 JSON から引けない: {road}", file=sys.stderr)
+        return m.group(0)
+    return _ID_REF.sub(sub, text)
+
+
 def build_claims(merged, project_root, prior_ok, units, react=None):
     """判定項目の一覧を作る。prior_ok は前回 ok だった (text, src_excerpt) の集合で、そのまま除く（キャッシュ）。
     呼出元 = main() と _selftest()。owner は run_units.owner_of で欄の道筋から決める（引けなければ None）。
@@ -723,17 +781,20 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
     抜粋が空の項目は作らない(判定が必ず unknown になるため。除いた項目は stderr に出す)。"""
     cache = {}
     claims = []
+    labels = _id_labels(merged)
     for kind, road, text, src, subject in _candidates(merged, react):
-        excerpt = _excerpt(src, project_root, cache, merged, text) if src else ""
+        excerpt = _excerpt(src, project_root, cache, merged, text) if src else ""  # 抜粋は元の文(番号つき)で引く
         if not excerpt:
             print(f"[警告] 抜粋が空のため判定項目から除いた: {road}", file=sys.stderr)
             continue
+        text_orig = text
+        text = _expand_ids(text, labels, road)
         if (text, excerpt) in prior_ok:
             continue
         # 再判定(unknown の見直し)用に、予算を広げた抜粋も添える。キャッシュ照合は上の excerpt(従来の予算)で行うので内容を変えない
         src_files = []  # 抜粋が読んだファイル(主+参照先)。再判定の抜粋と同じ範囲で集める
         src_segs = []  # 断片ごとの出典(ファイル・行範囲・ラベル・行)。全文を載せられないファイルの抜粋の節に使う
-        excerpt_wide = _excerpt(src, project_root, cache, merged, text, EXCERPT_TOTAL_WIDE, src_files, src_segs)
+        excerpt_wide = _excerpt(src, project_root, cache, merged, text_orig, EXCERPT_TOTAL_WIDE, src_files, src_segs)
         claims.append({
             "id": f"AC{len(claims) + 1:03d}",
             "kind": kind,
@@ -983,7 +1044,16 @@ def _selftest():
             if need not in ex_b:
                 print(f"[selftest NG] G14 別の state へ写す更新 {need!r} が抜粋に入らない: {ex_b!r}")
                 return 1
-    print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加")
+    # 設計書の番号の名前つき置き換え: 引ける番号は名前と action を添え、引けない番号はそのまま残す
+    lab = _id_labels({"backend_processes": [{"process_id": "BE2", "name": "POS会計レポートの取得",
+                                           "endpoint": {"action": "list_pos_account_report"}}],
+                      "calculations": [{"no": "CA1", "name": "差引"}]})
+    got = _expand_ids("[BE2] のレスポンスを [CA1] に写す。[BE9] も使う", lab)
+    want = "[BE2](POS会計レポートの取得 = action list_pos_account_report) のレスポンスを [CA1](差引) に写す。[BE9] も使う"
+    if got != want:
+        print(f"[selftest NG] 設計書の番号の置き換えが違う: {got!r}")
+        return 1
+    print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加・設計書の番号の名前つき置き換え")
     return 0
 
 
