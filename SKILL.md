@@ -222,20 +222,21 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 |:---|:---|:---|:---|:---|:---|
 | 0 | （tool-worker） | - | screen_config / ソース | `{機能名}_react_draft.json` / `{機能名}_backend_draft.json`（React のときだけ） | 実行順序の Phase 1 |
 | 0.5 | S0 | sonnet | ソース・react_draft | screen_config（雛形のままのときだけ） | `prompts/S0_画面の設定.md` |
-| 1（並行） | S1 S2 S3 H1 H2 H3 H4 | 表のとおり | 下書き・ソース・screen_config | `target/intermediate/_unit_<単位>.json` | `prompts/<単位>_*.md` |
-| 2 | （tool-worker） | - | `_unit_*.json` 7本 | 問題の一覧 | `verify_partials.py --units` |
+| 1a（並行） | S1 S3 H2 H3 H4 | 表のとおり | 下書き・ソース・screen_config | `target/intermediate/_unit_<単位>.json` | `prompts/<単位>_*.md`。依頼文は `run_units.py prompts <機能名> --out … --phase 1` |
+| 1b（並行） | H1 S2 | 表のとおり | 1a が終わって S1 の `_unit_S1.json` ができてから `--phase 2` で依頼文を書く。画面項目の名前は S1 の item_name をそのまま使う | `target/intermediate/_unit_<単位>.json` | `prompts/<単位>_*.md` |
+| 2 | （tool-worker） | - | `_unit_*.json` 7本（1b の後） | 問題の一覧 | `verify_partials.py --units` |
 | 3 | （tool-worker） | - | `_unit_*.json` | partial 4本 | `merge_partials.py "$FEATURE_NAME" --compose-units` → 実行順序の Phase 1 の残り（apply_react_draft --stage partial）→ Phase 2 以降 |
 
-- メインの手順（メインは Bash を使わない。下の `python3` のコマンドは、すべて tool-worker に流させる。コマンドの中身はそのまま tool-worker に渡す。担当の起動はメインが行い、型は design-doc-unit、model は units.json の値を明示する）: tool-worker に `python3 target/scripts/run_units.py prompts <機能名> --out <出力先> --src <絶対パス>`（複数可。出力先は target/ の配下。/private/tmp の外。例 `target/intermediate/<機能名>_unit_prompts.json`）を流させて依頼文を書く → 順1の7体を並行に起動（型 design-doc-unit。出力JSONの各要素の `subagent_type`・`model`・`prompt` をそのまま Agent へ渡す）→ tool-worker に `python3 target/scripts/run_units.py after <機能名>` を流させて検査と後段を流す → 差し戻しがあれば tool-worker に `python3 target/scripts/run_units.py retry <機能名> <単位> --issues <after の出力JSON>` を流させ、その単位だけ起こし直し（型 design-doc-unit）、after を再実行する → after が OK になったら tool-worker に `python3 target/scripts/run_units.py audit <機能名>` を流させ、意味の照合の判定項目と判定の依頼文（25件ずつ。`target/intermediate/<機能名>_audit_prompts.json`）を書く → 各 part ごとに Haiku の担当（型 design-doc-unit）を1体ずつ、メインが起動する（依頼文は audit_prompts.json の part N の prompt。part は1始まりで、配列の位置とは別に各要素の `part` を使う。prompt の先頭行に「あなたは part N。書き先は …_audit_part_N.json。判定項目は ACxxx〜ACyyy」が書いてあるので、書き換えずそのまま渡す）→ tool-worker に `python3 target/scripts/run_units.py audit-check <機能名>` を流させて判定を集める（全判定項目が1回ずつ判定されたかを先に確かめ、欠け・重複・他の part の項目があれば終了コード1で「redo_parts」に出た part だけ、その part の prompt で担当（型 design-doc-unit）を起動し直してから、tool-worker に audit-check をもう一度流させる。そろったあと unknown は sonnet（型 design-doc-unit）で1回だけ判定し直す）→ 差し戻しがあれば担当に直させ、tool-worker に after をもう一度流させる。新しい照合の検査（`_vs_*.py` の各タグ）は [WARN] で入れ、2回の実走で誤検出が無ければ ERROR へ上げる
+- メインの手順（メインは Bash を使わない。下の `python3` のコマンドは、すべて tool-worker に流させる。コマンドの中身はそのまま tool-worker に渡す。担当の起動はメインが行い、型は design-doc-unit、model は units.json の値を明示する）: tool-worker に `python3 target/scripts/run_units.py prompts <機能名> --out <出力先> --src <絶対パス>`（複数可。出力先は target/ の配下。/private/tmp の外。例 `target/intermediate/<機能名>_unit_prompts.json`）を流させて依頼文を書く（既定は `--phase 1`。S1 S3 H2 H3 H4 の分）→ 順1aの5体を並行に起動（型 design-doc-unit。出力JSONの各要素の `subagent_type`・`model`・`prompt` をそのまま Agent へ渡す）→ S1 が終わって `_unit_S1.json` ができたら、tool-worker に同じコマンドを `--phase 2` で流させて H1・S2 の依頼文（S1 の item_name の一覧入り）を書き、順1bの2体を並行に起動（型 design-doc-unit）→ tool-worker に `python3 target/scripts/run_units.py after <機能名>` を流させて検査と後段を流す → 差し戻しがあれば tool-worker に `python3 target/scripts/run_units.py retry <機能名> <単位> --issues <after の出力JSON>` を流させ、その単位だけ起こし直し（型 design-doc-unit）、after を再実行する → after が OK になったら tool-worker に `python3 target/scripts/run_units.py audit <機能名>` を流させ、意味の照合の判定項目と判定の依頼文（25件ずつ。`target/intermediate/<機能名>_audit_prompts.json`）を書く → 各 part ごとに Haiku の担当（型 design-doc-unit）を1体ずつ、メインが起動する（依頼文は audit_prompts.json の part N の prompt。part は1始まりで、配列の位置とは別に各要素の `part` を使う。prompt の先頭行に「あなたは part N。書き先は …_audit_part_N.json。判定項目は ACxxx〜ACyyy」が書いてあるので、書き換えずそのまま渡す）→ tool-worker に `python3 target/scripts/run_units.py audit-check <機能名>` を流させて判定を集める（全判定項目が1回ずつ判定されたかを先に確かめ、欠け・重複・他の part の項目があれば終了コード1で「redo_parts」に出た part だけ、その part の prompt で担当（型 design-doc-unit）を起動し直してから、tool-worker に audit-check をもう一度流させる。そろったあと unknown は sonnet（型 design-doc-unit）で1回だけ判定し直す）→ 差し戻しがあれば担当に直させ、tool-worker に after をもう一度流させる。新しい照合の検査（`_vs_*.py` の各タグ）は [WARN] で入れ、2回の実走で誤検出が無ければ ERROR へ上げる
 - 納品の合否と run の保存（コマンドはすべて tool-worker に流させる）: (a) WARN の許可リストは `target/intermediate/<機能名>_warn_allow.json` で、`{"allow":[{"kind":"period","targets":["steps"],"owner":…,"text":…,"reason":…,"date":…}]}` の形。kind は WARN の種類、targets は対象の欄（steps・remarks・rule）、owner・step_kind・text は処理の識別子（action など）・手順の種別・文の特徴で、手順の番号や処理の名前は使わない（回し直しで変わる）。理由・日付の無い登録と、kind だけの登録は受けない。書き方の全文は `_warn_allow.py` の冒頭。旧形式の `key`（WARN 行への部分一致）も読むが、当たらない登録は gate が `allow_unmatched` に出す。`verify_intermediate.py`・`verify_vs_source.py` に `--warn-allow-strict` を付けると、許可リストに無い WARN があれば終了コード1になる。(b) 合否は `python3 target/scripts/run_units.py gate <機能名>` の1つで決める。ERROR 0・説明のない WARN 0・audit の差し戻し 0 が揃ったときだけ exit 0（audit と audit-check を済ませてから流す）。(c) gate の後に `python3 target/scripts/run_units.py save-run <機能名> <run名>` を流し、`target/runs/<run名>/` に中間JSON・断片・検査ログ・docx を控える（/private/tmp は片付けで消えるため。検査ログは `--log <path>` で渡す）。(d) 回し直しの比較は `python3 target/scripts/diff_runs.py <A.json> <B.json>` で、配列の行を識別子で突き合わせ、単位（units.json の owns。owns に無い欄は「スクリプト」）ごとの欄の揺れ・増えた行・減った行を見て、スクリプトで埋める候補として報告する
-- 順序の依存は S0 だけ（画面名とエリア名を全単位が読むため）。screen_config が揃っていれば S0 は飛ばし、順1の7体を1つのメッセージで同時に起動する
-- 単位どうしは互いの出力を待たない。同じ行（api_spec の action、db_operations の id など）は識別子をソースから同じ規則で導いて指す（`prompts/_共通.md`）。食い違いは順2の検査が `[参照]` で拾う
+- 順序の依存は S0（画面名とエリア名を全単位が読むため）と S1（H1 の trigger と S2 の screen_item_name が S1 の item_name を読むため。units.json の after）。screen_config が揃っていれば S0 は飛ばし、順1aの5体を1つのメッセージで同時に起動し、S1 が終わってから順1bの2体を同時に起動する
+- 単位どうしは互いの出力を待たない。例外は units.json の after で、H1・S2 は S1 の `_unit_S1.json` が書き終わってから回す（画面項目の名前を S1 の item_name に揃えるため。順序は上の順序の依存のとおり）。同じ行（api_spec の action、db_operations の id など）は識別子をソースから同じ規則で導いて指す（`prompts/_共通.md`）。食い違いは順2の検査が `[参照]` で拾う
 - 断片は単位ごとに別ファイルで、同じ行の別の欄を書く。合成は `merge_partials.py --compose-units` が識別子で突き合わせて行い、partial 4本（従来と同じ形）を書く。partial に入口の無かった details は、断片の `event_processes` から `merge_partials.py` が `event_processes[].details` へ写すので、Phase 4 の前の手作業は要らない
 - 書く範囲が重ならないことは `verify_partials.py --units` が検査する（分担表の重なり・担当外の欄 `[範囲外]`・2単位が同じ欄 `[重複]`）
 - 断片 `_unit_*.json` は機能名に依らない固定名。別の画面の下書き・断片を読まないよう、検査と合成は機能名を `--feature`(か環境変数 FEATURE_NAME)で必ず受け(無いと終了コード 2 で止める)、下書き・設定はその機能名の1本だけ読む。断片は最上位 `meta.feature_name` に書いた画面の機能名を持ち、無い・違うと `[機能名なし]`・`[機能名の食い違い]` の ERROR（差し戻し先 = その単位）
 - HTML の画面（下書きが無い）: 同じ単位で回し、H1〜H3 は model を sonnet にする（下書きが無いので haiku の条件を満たさない）。従来どおり1体の Agent（型 design-doc-unit）で作る流れ（Step 3 のプロンプト）も使える。この場合 `_unit_*.json` を置かず、`--compose-units` も流さない
 
-**Agent 呼び出しの雛形（順1。7体を同じメッセージで起動する）:**
+**Agent 呼び出しの雛形（順1。二段で起動する: 順1a の5体（S1 S3 H2 H3 H4。`--phase 1` の依頼文）を同じメッセージで起動し、S1 が終わって `_unit_S1.json` ができてから順1b の2体（H1 S2。`--phase 2` の依頼文）を同じメッセージで起動する）:**
 
 ```
 Agent({
@@ -249,6 +250,8 @@ Agent({
 終わったら python3 target/scripts/verify_partials.py --units --unit {単位} --feature {機能名} を流し、自分を指す問題を直してから3行で報告する。"
 })
 ```
+
+順1b（H1 S2）の依頼文には、`run_units.py prompts --phase 2` が S1 の item_name の「画面項目名の一覧」を付ける。手で組むときもこの一覧を渡す。
 
 差し戻しは同じ雛形に「直す問題: <検査の行をそのまま>」を足し、その単位だけを起動し直す。R1 は「直す断片: _unit_<単位>.json」と「検査のコマンド」を渡す。
 
@@ -510,7 +513,7 @@ v52 で共通スクリプト 5 本（`_config_loader.py` / `apply_trigger_dispat
 export FEATURE_NAME="受注入力"   # 例: 受注入力 / 受注照会 / 顧客マスタ / 商品マスタ 等（既定の機能名は無い。必ず指定する）
 
 # === Phase 1: ソース解析（Agent 並列） ===
-# 委譲の単位で作るとき（「委譲の分担」の節）: 下書きのスクリプト（下の2本。tool-worker が流す）→ 単位7体を並行に起動（型 design-doc-unit。メインが起動）→ 断片を検査・合成する（tool-worker が流す）
+# 委譲の単位で作るとき（「委譲の分担」の節）: 下書きのスクリプト（下の2本。tool-worker が流す）→ 単位を二段で起動（型 design-doc-unit。メインが起動。prompts --phase 1 の S1 S3 H2 H3 H4 を並行、S1 の断片ができてから prompts --phase 2 の H1 S2 を並行）→ 断片を検査・合成する（tool-worker が流す）
 #   python3 target/scripts/verify_partials.py --units --feature {機能名}  # 問題の行末の「→ 差し戻し先 <単位>」へ戻す(機能名は必須。無いと止まる)
 #   python3 target/scripts/merge_partials.py "${FEATURE_NAME}" --compose-units # _unit_*.json → partial 4本（この後、下の apply_react_draft --stage partial へ）
 # 従来の形: Agent 4本並列で _partial_*.json 生成（Step 3）。出力先: target/intermediate/_partial_*.json

@@ -740,6 +740,60 @@ def calc_candidates(sources):
     return {"calc_candidates": out}
 
 
+# validation_candidates: H4 の validations_frontend の kind と同じ 4 種(API検査は backend 下書きの error_patterns が持つ)
+_VC_IF = re.compile(r"\bif\s*\((.+)\)\s*(?:\{|$|return|throw|set\w+\()")
+_VC_INPUT_ERR = re.compile(r"\bsetError\(|\bthrow\s")
+_VC_ATTR = re.compile(r"\b(required|min|max|pattern|maxLength)\b(?:=\{?[\"']?([^\"'}\s>]*))?")
+_VC_FIELD = re.compile(r"(?:aria-label|name|placeholder)=\"([^\"]*)\"")
+_VC_SHOW = re.compile(r"\{\s*([^{}?]+?)\s*(?:&&|\?(?!\.))\s*\(?\s*<")
+_VC_DISABLED = re.compile(r"\bdisabled=\{([^{}]+)\}")
+_VC_FILTER = re.compile(r"\.filter\((.+?)\)\s*(?:\.|;|\)|,|$)")
+
+
+def validation_candidates(sources):
+    """画面の検査・切替・絞り込みの行を {"validation_candidates": [...]} で返す(G36)。呼出元: extract_react_draft.main()。
+
+    意味合い: H4 が validations_frontend の行を「どれを書くか」毎回自分で決め、同じ画面で 28 行と 60 行に揺れた。
+    候補をソースから機械で決め、担当は清書・取捨だけにする。各候補は {kind, field, condition, src}。kind は入力検査・表示切替・活性切替・絞り込み。
+    field は要素の aria-label・name・placeholder が取れるときだけ(表示切替は条件の先頭の識別子)、取れなければ空。
+    condition は条件式の字面。src は該当の行だけ。ソース順・同じ (kind, 行) は1回。
+    ponytail: 行単位の近似。複数行にまたがる条件は先頭の行だけ。取りこぼしは H4 がソースを読んで足す(src を書く)。
+    """
+    out = []
+    for p in sources:
+        if Path(p).suffix not in (".tsx", ".jsx"):
+            continue
+        lines = Path(p).read_text(encoding="utf-8").splitlines()
+
+        def add(kind, field, cond, no):
+            # 同じ (kind, 行) は1回(一行に属性が複数あっても候補は1件)
+            if any(o["kind"] == kind and o["src"][0]["file"] == str(p) and o["src"][0]["line_start"] == no for o in out):
+                return
+            out.append({"kind": kind, "field": field, "condition": cond.strip(), "src": [{"file": str(p), "line_start": no, "line_end": no}]})
+        for no, line in enumerate(lines, 1):
+            if _VC_INPUT_ERR.search(line):
+                # 直前(最大 3 行上を含む)の if の条件が検査の条件。無ければこの行を条件にする
+                ctx = lines[max(0, no - 4):no]
+                m = next((x for x in (_VC_IF.search(c) for c in reversed(ctx)) if x), None)
+                add("入力検査", "", m.group(1) if m else line, no)
+            if re.search(r"<(?:input|select|textarea)\b", line):
+                fm = _VC_FIELD.search(line)
+                for am in _VC_ATTR.finditer(line):
+                    add("入力検査", fm.group(1) if fm else "", am.group(0), no)
+            m = _VC_SHOW.search(line)
+            if m:
+                head = re.match(r"[A-Za-z_]\w*", m.group(1).lstrip("!( "))
+                add("表示切替", head.group(0) if head else "", m.group(1), no)
+            m = _VC_DISABLED.search(line)
+            if m:
+                fm = _VC_FIELD.search(line)
+                add("活性切替", fm.group(1) if fm else "", m.group(1), no)
+            m = _VC_FILTER.search(line)
+            if m:
+                add("絞り込み", "", m.group(1), no)
+    return {"validation_candidates": out}
+
+
 _JSX_OPEN = re.compile(r"<(input|select|textarea|button|span|strong|h1|h2|a|table)\b")
 # 表示専用の要素 → item_type_hint(案 B2)。text を持ち、label は持たない。verify_vs_source._DISPLAY_TAGS と同じ組
 _DISPLAY_HINT = {"span": "Label", "strong": "Label", "h1": "Label", "h2": "Label", "a": "Link", "table": "Grid"}
@@ -1402,6 +1456,37 @@ def selftest_calc():
     return 0
 
 
+def selftest_validation_candidates():
+    """validation_candidates(G36)の4種(入力検査・表示切替・活性切替・絞り込み)が各該当の行を src に持ち、2回流して同じ並びになることを最小の TSX で assert する。"""
+    tsx = (
+        "function A() {\n"
+        "  if (!x) { setError(\"x is required\"); return; }\n"
+        "  return (<div>\n"
+        "    {open && <div/>}\n"
+        "    <button disabled={busy}>go</button>\n"
+        "    {rows.filter(r => r.on).length}\n"
+        "  </div>);\n"
+        "}\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "V.tsx"
+            p.write_text(tsx, encoding="utf-8")
+            got = validation_candidates([p])["validation_candidates"]
+            again = validation_candidates([p])["validation_candidates"]
+        assert got == again, "2回流して並びが違う"
+        by = {(c["kind"], c["src"][0]["line_start"]): c for c in got}
+        assert set(by) == {("入力検査", 2), ("表示切替", 4), ("活性切替", 5), ("絞り込み", 6)}, sorted(by)
+        assert by[("入力検査", 2)]["condition"] == "!x" and by[("表示切替", 4)]["condition"] == "open", got
+        assert by[("活性切替", 5)]["condition"] == "busy" and by[("絞り込み", 6)]["condition"] == "r => r.on", got
+        assert [c["kind"] for c in got] == ["入力検査", "表示切替", "活性切替", "絞り込み"], "ソース順でない"
+    except AssertionError as e:
+        print(f"[selftest NG] validation_candidates {e}")
+        return 1
+    print("[selftest OK] _react_facts.validation_candidates")
+    return 0
+
+
 def selftest_csv():
     """exportCsv 形の最小 TSX で BOM・区切り・改行・固定見出し・合計行・ファイル名・トリガーを assert する。"""
     tsx = (
@@ -2006,6 +2091,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         rc = selftest()
-        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain() or selftest_logic_candidates() or selftest_count_displays())
+        sys.exit(rc or selftest_fetch_plan() or selftest_outcomes() or selftest_csv() or selftest_calc() or selftest_validation_candidates() or selftest_jsx() or selftest_behaviors() or selftest_field_usage() or selftest_ui_strings() or selftest_initials() or selftest_select_options() or selftest_chain() or selftest_logic_candidates() or selftest_count_displays())
     print("[入力不正] 単独では使わない。--selftest のみ", file=sys.stderr)
     sys.exit(2)

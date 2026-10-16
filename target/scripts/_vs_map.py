@@ -743,6 +743,9 @@ def check_jsx_text_gap(d) -> list:
     WHY(run15 の差5): JSX は改行を挟んだ {式} の前後に空白を入れない(「POSがあるのは(改行){shops.length}店」は画面で「POSがあるのは10店」)のに、
     例示値は「POSがあるのは 10店」と空白を足した。固定文言の Label には合成が JSX から字面を付け直しているが、実行時の値を含む文言には当たっていない。
     対象は screen_layout.items[].example と initialization.items[].initial_value。語が3字未満の前後は手掛かりにならないので見ない。
+    WHY(tana02 S1 の誤検知17件): 前後の語が両方3字以上のときは「前の語 空白 値 空白 後の語」が揃う所だけを見る。「メーカー」のように地の文の語が
+    例示値の別の所(「メーカーごとに入れる」)にあるだけで {x.mk} の前の空白と取り違えるのを防ぐ。値は1〜40字・改行なし: 画面の例示値(店名・件数・日付)は
+    この長さに収まり、これより離れた同じ語は別の文言とみなす。片側しか3字以上でないときは従来どおりその側だけで見る。
     呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
     rd, main = d.get("react_draft"), d.get("main")
     if not rd or not main:
@@ -751,17 +754,22 @@ def check_jsx_text_gap(d) -> list:
     for jx in rd.get("jsx_text_joins") or []:
         tail = str(jx.get("before") or "").rstrip()[-6:]
         head = str(jx.get("after") or "").lstrip()[:6]
+        # (側, 正規表現, 空白を取る group の番号, JSX の空白)。両側とも3字以上なら「tail 空白 値 空白 head」の連なりだけを見る
         pats = []
-        if len(tail) >= 3:
-            pats.append(("前", re.compile(re.escape(tail) + r"(\s*)\S"), bool(jx.get("gap_before"))))
-        if len(head) >= 3:
-            pats.append(("後", re.compile(r"\S(\s*)" + re.escape(head)), bool(jx.get("gap_after"))))
+        if len(tail) >= 3 and len(head) >= 3:
+            both_rx = re.compile(re.escape(tail) + r"(\s*)\S[^\n]{0,39}?(\s*)" + re.escape(head))
+            pats.append(("前", both_rx, 1, bool(jx.get("gap_before"))))
+            pats.append(("後", both_rx, 2, bool(jx.get("gap_after"))))
+        elif len(tail) >= 3:
+            pats.append(("前", re.compile(re.escape(tail) + r"(\s*)\S"), 1, bool(jx.get("gap_before"))))
+        elif len(head) >= 3:
+            pats.append(("後", re.compile(r"\S(\s*)" + re.escape(head)), 1, bool(jx.get("gap_after"))))
         for where, kind, text in _item_texts(main):
-            for side, rx, gap in pats:
+            for side, rx, gi, gap in pats:
                 for m in rx.finditer(text):
-                    if bool(m.group(1)) == gap:
+                    if bool(m.group(gi)) == gap:
                         continue
-                    seen = "空白が入る" if m.group(1) else "空白が入らない"
+                    seen = "空白が入る" if m.group(gi) else "空白が入らない"
                     want = "空白が入る" if gap else "空白が入らない"
                     s = (jx.get("src") or [{}])[0]
                     out.append(_error(
@@ -793,8 +801,13 @@ def _selftest_jsx_text_gap() -> bool:
     # 前後の語が3字未満・例示値に前の語が無いときは何も言わない
     short = dict(tight, before="は", after="店")
     nothing = check_jsx_text_gap(d_with("POSがあるのは 10店だけ", joins=(short,))) == [] and check_jsx_text_gap(d_with("関係の無い文", joins=(tight,))) == []
+    # 前後の語が両方3字以上: 値を挟んで揃わない文言(同じ語が別の所にあるだけ)は指摘なし、揃えば前の空白の食い違いを1件指摘(tana02 S1 の誤検知)
+    maker = {"expr": "x.mk", "before": "メーカー", "after": "ごとの", "gap_before": False, "gap_after": True, "src": src}
+    maker_far = check_jsx_text_gap(d_with("メーカーごとに入れる欄", joins=(maker,)))
+    maker_bad = check_jsx_text_gap(d_with("メーカー A ごとの欄", joins=(maker,)))
     return (good == [] and len(bad) == 1 and bad[0].startswith("[ERROR] [JSXの空白] screen_layout.items[IT65]") and "差し戻し先 S1" in bad[0]
             and len(both) == 2 and "initialization.items[65]" in both[1] and len(keep_bad) >= 1 and keep_ok == [] and nothing
+            and maker_far == [] and len(maker_bad) == 1 and maker_bad[0].startswith("[ERROR] [JSXの空白]")
             and check_jsx_text_gap({"main": {}}) == [])
 
 
@@ -962,7 +975,9 @@ def check_same_src_items(d) -> list:
     WHY(run17 差1): IT15(会計カードの見出し)と IT16(店舗と期間)が、どちらも Card 要素の全体 314-321 を src にした。
     run15 は見出し 317・副題 318 と分かれていた。同じ範囲を持つ項目が2つあると、画面の要素と項目の対応が行では決まらず、
     合成の写し(_compose_mapping)が「応答の欄を使う行を src が覆う項目すべて」へ結ぶ(IT15 に店名・レジ・日数が誤って写った)。
-    各項目の src は、その項目の要素の行だけに絞る。同じ範囲が正しい場合(同じ1行に2つの項目を書く画面など)は、WARN なので見送れる。
+    各項目の src は、その項目の要素の行だけに絞る。
+    G35(d): 次の2つは同じ src が正しいので指摘しない。(1) 共通の src がすべて1行だけ(同じ行に2つの要素を書く画面)。
+    (2) 共通の src の本文に .map( がある(1つの map のループで描く要素。行では要素を分けられない)。本文が読めないときは従来どおり指摘する。
     src の無い項目は見ない。呼出元: _vs_map.run(CHECKS)。d の読み方は _vs_common の docstring。"""
     main = d.get("main")
     if not main:
@@ -978,6 +993,14 @@ def check_same_src_items(d) -> list:
     out = []
     for key, its in groups.items():
         if len(its) < 2:
+            continue
+        if all(a == b for _, a, b in key):
+            continue
+        try:
+            looped = any(".map(" in "\n".join(Path(f).read_text(encoding="utf-8").splitlines()[a - 1:b]) for f, a, b in key)
+        except (OSError, TypeError, ValueError):
+            looped = False
+        if looped:
             continue
         spans = "・".join(f"{Path(f).name}:{_vs_common.lines(a, b)}" for f, a, b in key)
         ids = "・".join(str(i.get("no") or i.get("item_name")) for i in its)
@@ -1002,7 +1025,18 @@ def _selftest_same_src_items() -> bool:
              {"no": "IT20", "item_name": "src なし2"}]
     got = check_same_src_items({"main": {"screen_layout": {"items": items}}})
     ok = check_same_src_items({"main": {"screen_layout": {"items": items[2:]}}})
-    return (len(got) == 1 and got[0].startswith("[WARN] [src重複] screen_layout.items[IT15・IT16](会計カードの見出し・会計カードの店舗と期間)")
+    # G35(d): 同じ 1 行の src を持つ 2 項目・本文に .map( を含む同じ範囲の 2 項目は指摘なし。.map( を含まない複数行の同じ範囲は従来どおり1件
+    import tempfile
+    pair = lambda src: {"main": {"screen_layout": {"items": [{"no": "IT1", "item_name": "甲", "src": src}, {"no": "IT2", "item_name": "乙", "src": src}]}}}
+    with tempfile.TemporaryDirectory() as td:
+        loop = Path(td, "L.tsx")
+        loop.write_text("<tbody>\n{rows.map((r) => (\n<tr><td>{r.a}</td></tr>\n))}\n</tbody>\n", encoding="utf-8")
+        plain = Path(td, "P.tsx")
+        plain.write_text("<div>\n<h1>a</h1>\n<p>b</p>\n</div>\n", encoding="utf-8")
+        one_line = check_same_src_items(pair([{"file": f, "line_start": 72, "line_end": 72}]))
+        in_loop = check_same_src_items(pair([{"file": str(loop), "line_start": 1, "line_end": 5}]))
+        no_loop = check_same_src_items(pair([{"file": str(plain), "line_start": 1, "line_end": 4}]))
+    return (one_line == [] and in_loop == [] and len(no_loop) == 1 and len(got) == 1 and got[0].startswith("[WARN] [src重複] screen_layout.items[IT15・IT16](会計カードの見出し・会計カードの店舗と期間)")
             and "Screen.tsx:314-321" in got[0] and "差し戻し先 S1" in got[0] and ok == [] and check_same_src_items({}) == [])
 
 

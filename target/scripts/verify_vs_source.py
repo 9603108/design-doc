@@ -462,12 +462,18 @@ def _example_in_source(text, strings):
 #   字面で照合すると S1 が「空欄項目も表示」「22」のように検査に合わせた不自然な例へ変えた(run13)。この2つの形だけ照合しない。
 _STATE_EXAMPLES = ("オン", "オフ", "ON", "OFF", "チェックあり", "チェックなし", "選択", "未選択")
 _ROW_COUNT_EX = re.compile(r"[0-9０-９]+\s*行(?:\s*[（(][^）)]*?[0-9０-９]+\s*行\s*[）)])?")
+# WHY(G35 e): 合成(_compose_fixed_example.EXAMPLE_BY_TYPE)はソースに根拠の無い実行時の値(店名・担当者名)を「実行時の値」に揃える(G31 の規則の値)。
+#   _wholly_runtime は出典の本文が式だけの項目しか通さず、同じ固定値を持つ他の項目を [例示値] で「ソースに無い」と誤検出した。
+_RUNTIME_VALUE_EXAMPLE = "実行時の値"
 
 
 def _derived_example(item):
-    """例示値が、ソースの字面を持たない導出の値の形か。Checkbox・RadioButton の状態語、Grid の行数(N行・N行(…を除くとM行))。
+    """例示値が、ソースの字面を持たない導出の値の形か。Checkbox・RadioButton の状態語、Grid の行数(N行・N行(…を除くとM行))、
+    どの種類の項目でも合成の固定値「実行時の値」(G31)。
     呼出元: check_examples。形が合うものだけ。他の語を足して通さない。"""
     ex = norm(str(item.get("example") or ""))
+    if ex == _RUNTIME_VALUE_EXAMPLE:
+        return True
     kind = item.get("item_type")
     if kind in ("Checkbox", "RadioButton"):
         return ex in _STATE_EXAMPLES
@@ -563,6 +569,8 @@ def check_items(items, jsx, display_rows=None):
     [画面項目] ソースに無い項目 / (3) item_type と item_type_hint が違う [種別]。
     (4) display_rows(定数配列の行名)が item_name に全部ある(無ければ ERROR。WARN の接頭辞を付けない)。既存の行名に括弧書きを足した item_name(「小計（現金計）」)は ERROR。行名そのもの・jsx の label と字面が一致する項目名は通す。
     表示専用の要素(Label・Grid・Link。label は空)は (1)〜(3) の対象外。jsx が None なら (4) だけ見る。
+    G35(c): ラベルが記号だけの要素(−・＋・½ のボタン)は (1) に出さない。(2) は、item の src と重なる入力・操作系の要素にラベルが無い・記号だけのものがあれば出さない。
+    理由: ラベルの無い入力や記号のボタンは、字面で item_name と対にできない(設計書の名前は src の行で結ぶ)。
     呼出元: main(最終)・verify_partials.check_unit_extras(S1 の単位)。"""
     by_name = {i.get("item_name"): i for i in items if isinstance(i, dict)}
     labels = list(dict.fromkeys(lb for r in display_rows or [] for lb in _row_labels(r)))
@@ -578,13 +586,19 @@ def check_items(items, jsx, display_rows=None):
     if jsx is None:
         return disp
     by_label = {norm(j["label"]): j for j in jsx or [] if j.get("label")}
+    # WHY(G35 c): 英数・かな・漢字を一字も含まないラベル(−・＋・½)は、S1 が「棚数入力 分類1の1増やす」のように意味で名付けるので字面では対にできない
+    sym_only = lambda s: not re.search(r"[0-9A-Za-zぁ-んァ-ヶ一-鿿]", s or "")  # noqa: E731
     problems = disp + [f"[WARN] [画面項目] screen_layout.items: ソースの {j['tag']}「{lb}」({j['item_type_hint']})に対応する item_name が無い(欠け) → 差し戻し先 S1"
-                       for lb, j in by_label.items() if lb not in by_name]
+                       for lb, j in by_label.items() if lb not in by_name and not sym_only(lb)]
+    unlabeled = [j for j in jsx or [] if isinstance(j, dict) and j.get("item_type_hint") in _OPERATION_TYPES and sym_only(norm(j.get("label") or ""))]
     for name, it in by_name.items():
         if it.get("item_type") not in _OPERATION_TYPES:
             continue
         j = by_label.get(norm(name or ""))
         if j is None:
+            # 項目の src と重なるラベル無し・記号だけの入力・操作要素があれば、その要素の項目とみなして指摘しない
+            if any(_overlap(it.get("src"), u.get("src")) for u in unlabeled):
+                continue
             problems.append(f"[WARN] [画面項目] screen_layout.items[{name}]: ソースに対応する入力・操作系の要素が無い項目 → 差し戻し先 S1")
         elif j["item_type_hint"] != it["item_type"]:
             problems.append(f"[WARN] [種別] screen_layout.items[{name}]: item_type={it['item_type']} だがソースの要素は {j['tag']}(目安 {j['item_type_hint']}) → 差し戻し先 S1")
@@ -1789,6 +1803,15 @@ def selftest():
         assert check_examples([{"item_name": "エラー表示", "example": "Error: Failed to fetch", "src": line_at(7, 7)}], ps) == [], "まるごと実行時の項目を WARN にした"
         got = check_examples([{"item_name": "読込中表示", "example": "作り話の表示", "src": line_at(8, 8)}], ps)
         assert len(got) == 1 and got[0].startswith("[WARN] [例示値]"), got
+        # G35(e): 合成の固定値「実行時の値」は、出典の本文が式だけでない項目(Input)でも指摘しない。他の語(A店)は従来どおり指摘する
+        assert check_examples([{"item_name": "店名", "item_type": "Input", "example": "実行時の値", "src": line_at(8, 8)}], ps) == [], "実行時の値を WARN にした"
+        assert len(check_examples([{"item_name": "店名", "item_type": "Input", "example": "A店", "src": line_at(8, 8)}], ps)) == 1, "他の語まで通した"
+        # G35(c): 記号だけのラベルの button は (1) に出さない。src と重なるラベル無しの入力要素があれば (2) も出さない。重ならないときは従来どおり出す
+        jx = [{"tag": "button", "label": "−", "item_type_hint": "Button", "src": line_at(5, 5)},
+              {"tag": "input", "label": "", "item_type_hint": "Input", "src": line_at(6, 6)}]
+        assert check_items([], jx) == [], "記号だけのラベルを (1) に出した"
+        assert check_items([{"item_name": "棚数の直接入力", "item_type": "Input", "src": line_at(6, 6)}], jx) == [], "ラベル無しの入力を (2) に出した"
+        assert len(check_items([{"item_name": "棚数の直接入力", "item_type": "Input", "src": line_at(20, 20)}], jx)) == 1, "重ならない項目の (2) を消した"
     # round14 R2: JSX は改行を含む空白がタグに接すると空白を捨てる。画面どおりの全文(こちらはPOSが…)を通す。空白を足した従来の形も通す。作り話は通さない
     with tempfile.TemporaryDirectory() as td:
         r2 = Path(td, "note.tsx")

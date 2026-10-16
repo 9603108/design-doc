@@ -121,7 +121,10 @@ def _fragment_texts(item, rd):
             continue
         for run in _vs._jsx_runs(_vs._jsx_faithful(body)):
             # WHY: 式の穴({shops.length} など)は実行時の値なので、字面の部分だけを残す
-            out.append(_vs.norm(re.sub(r"\{[^{}]*\}", "", run)))
+            # WHY(G35 b): 行範囲がタグの途中から始まると run にタグの切れ端(onClick={…}> の後ろの「>税抜</option><option value=」)が入る。
+            #   そのまま1つの文言にすると、正しい例示値(「税抜」)が「途中から始まる断片」と誤検出されるので、< > で区切った各片を別々の文言として持つ
+            for piece in re.split(r"[<>]", re.sub(r"\{[^{}]*\}", "", run)):
+                out.append(_vs.norm(piece))
     for el in list(rd.get("jsx_elements") or []) + list(rd.get("ui_strings") or []):
         if isinstance(el, dict) and el.get("text") and _vs._overlap(src, el.get("src") or []):
             out.append(_vs.norm(str(el["text"])))
@@ -181,10 +184,24 @@ def _selftest_example_fragment_miss() -> bool:
     return _fragment_example_count("取込欠損の疑い：この期間に、上書きされた疑いのある日があります。") == 0
 
 
+def _selftest_example_fragment_tag_remnant() -> bool:
+    """G35(b): タグの切れ端(タグの途中から始まる行範囲)を含む文言でも、タグで区切った文言と同じ例示は断片にしない。
+    文言の途中からの切り出し(「（シートと同じ）」だけ)は従来どおり1件出る。"""
+    def count(ex):
+        with tempfile.TemporaryDirectory() as td:
+            tsx = Path(td, "T.tsx")
+            tsx.write_text('<option value="a">税抜（シートと同じ）</option><option value="b">\n<button onClick={() => del(i)}>外す</button>\n', encoding="utf-8")
+            src = [{"file": str(tsx), "line_start": 1, "line_end": 2}]
+            d = {"main": {"screen_layout": {"items": [{"item_name": "金額", "example": ex, "src": src}]}}, "react_draft": {}}
+            return len(check_example_fragment(d))
+    return count("税抜（シートと同じ）") == 0 and count("外す") == 0 and count("（シートと同じ）") == 1
+
+
 # 例示値の断片の検査を CHECKS と SELFTESTS に登録する(run と selftest が呼ぶ)
 CHECKS.append(check_example_fragment)
 SELFTESTS.append(_selftest_example_fragment_hit)
 SELFTESTS.append(_selftest_example_fragment_miss)
+SELFTESTS.append(_selftest_example_fragment_tag_remnant)
 
 
 def _error_template_rx(template):

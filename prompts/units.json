@@ -4,6 +4,7 @@
     "書式": "owns = その単位だけが書く欄(汎用パス。'[]' は識別子つき一覧の各行)。creators = 識別子つき一覧の行を作る単位。他の単位は、作り手が作った行に欄を足すだけ",
     "識別子": "screen_layout.items=item_name / events・events_peripheral・event_processes=event_code / db_operations=id / api_spec=action / response_items=key / request_params=name / messages_backend=message_id",
     "合成で振る欄": "screen_layout.items・validations_frontend・calculations・parameters_backend・common_logic の no は単位が書かず、_units.compose が並び順で振る(_units.NUMBERED)。合成後の必須キーは _units.REQUIRED で検査し、欠けは owns の単位へ戻す。api_spec[].response_to_screen_mapping[].screen_no も単位は書かず、add_screen_areas.py が screen_item_name から items の screen_no を写す。api_spec[].response_items[].source・expression は単位が書かず、extract_backend_draft.py の下書きから合成が入れる(src・type も同じ。担当は書かない)",
+    "after": "after = その単位の依頼文を、挙げた単位の断片 _unit_<単位>.json が書き終わってから組む(画面項目の名前を S1 の item_name に揃えるため)。run_units.py prompts --phase 2 が対象。",
     "変更": "欄の担当を変えるときは、このファイルと prompts/<単位>_*.md の両方を直し、verify_partials.py --selftest を流す"
   },
   "units": {
@@ -21,6 +22,7 @@
     "S2": {
       "model": "sonnet",
       "title": "バック処理の業務の説明",
+      "after": ["S1"],
       "prompt": "prompts/S2_バック処理の業務.md",
       "owns": [
         "api_spec[].name",
@@ -50,6 +52,7 @@
     "H1": {
       "model": "haiku",
       "title": "イベントの清書",
+      "after": ["S1"],
       "prompt": "prompts/H1_イベントの清書.md",
       "owns": [
         "events"

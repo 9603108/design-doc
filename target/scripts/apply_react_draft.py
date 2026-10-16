@@ -121,8 +121,10 @@ def apply_backend(bdraft, backend):
         # verify_intermediate と同じ基準: テーブル名の仮表記(角括弧・集計結果の列)、物理名が英数字と _ だけでない、論理列の括り表記(各列/など/…/等)
         # physical_table はスキーマ(15_中間JSONスキーマ.md)の dataset に無い任意のキー。無い行を仮とみなすと、
         # スキーマどおりに LLM が書いた dataset が全部下書きで消える(2026-10-12 H3 で 62 列が消えた)。verify と同じく、あるときだけ見る
+        # スキーマ修飾名(layout.sites・tana.entries のように . を含む表名。先頭・末尾・連続の . は不可)は正常。
+        # スキーマ修飾名を仮とみなして H2 の担当の dataset を下書きで消していた(tana02 で faces・f_* の別名の行と論理名が消えた)
         provisional = [bool(re.search(r"[\[\]［］（]|集計結果の列", f"{r.get('logical_table') or ''}{r.get('physical_table') or ''}"))
-                       or bool(r.get("physical_table") and not re.fullmatch(r"[A-Za-z0-9_]+", r["physical_table"]))
+                       or bool(r.get("physical_table") and not re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*", r["physical_table"]))
                        or bool(re.search(r"各列|各\S{1,10}の列|など|…|等(?![一-鿿])", r.get("logical_column") or "")) for r in rows]
         if rows and not all(provisional):
             continue
@@ -395,6 +397,14 @@ def selftest():
                                                   "dataset": [{"no": 1, "logical_table": "店舗", "logical_column": "店舗番号",
                                                                "physical_column": "p.mise_no"}]}]}
         assert apply_backend(bd, bk5) == 0 and bk5["db_operations"][0]["dataset"][0]["logical_column"] == "店舗番号", "スキーマどおりの行を消した"
+        # (g) スキーマ修飾の表名(layout.sites)で別名の行(physical_column 空・alias_name つき)と論理名(推定)付きの行を持つ dataset は担当の記述なので消さない(tana02 の退行)
+        bk6 = {"api_spec": [], "db_operations": [{"api_endpoint": {"action": "a1"}, "dataset": [
+            {"no": 1, "logical_table": "拠点", "logical_column": "拠点数", "physical_table": "layout.sites",
+             "physical_column": "", "alias_name": "site_cnt"},
+            {"no": 2, "logical_table": "拠点", "logical_column": "名称(推定)", "physical_table": "layout.sites",
+             "physical_column": "name"}]}]}
+        bk6_before = json.dumps(bk6, ensure_ascii=False, sort_keys=True)
+        assert apply_backend(bd, bk6) == 0 and json.dumps(bk6, ensure_ascii=False, sort_keys=True) == bk6_before, "スキーマ修飾の表名の dataset を消した"
         # (f) 事実の行(fact_lines)の強制(B6): 開始時は最初の呼出の前、成功時は最後の呼出の後、0件は末尾。
         #     モデルの同趣旨の行(開始時が後ろ・成功時が無い・連続操作の重複)は落として1回にする
         fdraft = {"event_processes": [{"event_code": "EV01", "details": ["・load をリクエストする"], "fact_lines": [

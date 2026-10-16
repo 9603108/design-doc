@@ -135,22 +135,20 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u} --feature {feat}` を流し、"
         f"行末が「→ 差し戻し先 {u}」の問題を直してから、3行以内で報告する(書いた行数・残った問題・判断できなかった所)。",
     ]
-    # WHY: S1 と S2 は並行に書くため、S2 が画面項目名を推測して S1 と食い違い差し戻しになる(run3 で52件)。
-    # S2 にだけ、下書き(extract_react_draft の出力)にある画面の文言を渡し、screen_item_name をそれに揃えさせる。
-    # 出所: events[].ui_label(操作の表示名)・display_rows[].labels(表示行の名前)・jsx_elements[].label(入力欄・選択欄の名前)。
-    # jsx_elements を入れないと、イベントに表示名の無い選択欄(店舗の選択欄など。ui_label が空)が一覧から落ち、
-    # 選択肢に使う API(店舗一覧)の response_to_screen_mapping が空になる(2026-10-13 POS会計レポート)。下書きが無ければ何も足さない。
-    if u == "S2":
-        draft = INTER / f"{feat}_react_draft.json"
-        if draft.exists():
-            d = json.loads(draft.read_text(encoding="utf-8"))
-            labels = [e["ui_label"] for e in d.get("events", []) if e.get("ui_label")]
-            labels += [j["label"] for j in d.get("jsx_elements", []) if j.get("label")]
-            labels += [x for r in d.get("display_rows", []) for x in r.get("labels", [])]
-            labels = list(dict.fromkeys(labels))
-            if labels:
-                lines += ["", "【画面項目名の一覧(下書きの画面の文言。screen_item_name はこの名前をそのまま使う。推測で作らない)】"]
-                lines += [f"- {x}" for x in labels]
+    # WHY: H1 の trigger と S2 の screen_item_name は S1 の画面項目の名前(item_name)を参照する。S1 と並行だと名前を推測して毎回20件前後ずれた(tana01・tana02)。
+    # そこで units.json の after に S1 を持つ単位(H1・S2)は S1 を先に回し、書き終えた断片 _unit_S1.json の item_name をここで渡す。
+    # S1 が無い・名前が無いのは順序の誤り(S1 より先に回した)なので黙って省かず止める。呼出元: main の prompts --phase 2・retry。
+    if "S1" in (spec.get("after") or []):
+        s1 = INTER / "_unit_S1.json"
+        if not s1.exists():
+            raise RuntimeError(f"{u} の依頼文には S1 の断片 {s1} が要る(S1 を先に回す)")
+        d = json.loads(s1.read_text(encoding="utf-8"))
+        names = list(dict.fromkeys(i["item_name"] for i in (d.get("screen_layout") or {}).get("items") or []
+                                   if isinstance(i, dict) and i.get("item_name")))
+        if not names:
+            raise RuntimeError(f"{s1} の screen_layout.items に item_name が1件も無い(S1 が終わっていない)")
+        lines += ["", "【画面項目名の一覧(S1 の断片の screen_layout.items の item_name。H1 は trigger と screen_item_name 、S2 は response_to_screen_mapping[].screen_item_name を、この名前をそのまま使う。推測で作らない)】"]
+        lines += [f"- {x}" for x in names]
     if sendbacks:
         lines += [
             "",
@@ -390,20 +388,33 @@ def selftest():
         "  [ERROR] screen_layout.items[2].example: 何か\n", units)
     assert {u: len(v) for u, v in s.items()} == {"S2": 2, "H1": 2, "S1": 1}, s
     assert parse_sendbacks("ERROR foo → 差し戻し先 S1", units) == {"S1": ["ERROR foo → 差し戻し先 S1"]}
-    # S2 の依頼文の画面項目名の一覧に、イベントに表示名の無い選択欄(jsx_elements の label)も入る
+    # G34: H1・S2(units.json の after に S1)の依頼文には S1 の断片 _unit_S1.json の item_name が入り、S1 の依頼文には入らない。
+    # 断片が無いと RuntimeError(S1 より先に回した誤りを黙って省かない)
     import tempfile
     global INTER
     with tempfile.TemporaryDirectory() as td:
-        Path(td, "テスト機能_react_draft.json").write_text(json.dumps({
-            "events": [{"event_code": "EV02", "ui_label": ""}, {"event_code": "EV01", "ui_label": "表示"}],
-            "jsx_elements": [{"tag": "select", "label": "店舗"}, {"tag": "span", "label": ""}],
-            "display_rows": [{"labels": ["総売上"]}]}, ensure_ascii=False), encoding="utf-8")
+        Path(td, "_unit_S1.json").write_text(json.dumps({
+            "screen_layout": {"items": [{"item_name": "店舗の選択欄"}, {"item_name": "総売上の表"}, {"item_name": "店舗の選択欄"}]}}, ensure_ascii=False), encoding="utf-8")
         old, INTER = INTER, Path(td)
         try:
             p = build_prompt(units, "テスト機能", "S2")
+            ph = build_prompt(units, "テスト機能", "H1")
+            ps1 = build_prompt(units, "テスト機能", "S1")
         finally:
             INTER = old
-    assert "- 店舗\n" in p and "- 表示\n" in p and "- 総売上\n" in p, p
+    for t in (p, ph):
+        assert "- 店舗の選択欄\n" in t and "- 総売上の表\n" in t and t.count("- 店舗の選択欄\n") == 1, t
+    assert "画面項目名の一覧" not in ps1, "S1 の依頼文に名前の一覧は入らない"
+    with tempfile.TemporaryDirectory() as td:
+        old, INTER = INTER, Path(td)
+        try:
+            try:
+                build_prompt(units, "テスト機能", "H1")
+                raise AssertionError("_unit_S1.json が無いのに H1 の依頼文を組めた")
+            except RuntimeError:
+                pass
+        finally:
+            INTER = old
     # units 表に無い差し戻し先(S0 など)は unknown に入れる。units を渡さなければ従来どおり名前のまま
     assert parse_sendbacks("[WARN] x → 差し戻し先 S0", units) == {"unknown": ["[WARN] x → 差し戻し先 S0"]}
     assert sorted(parse_sendbacks("x → 差し戻し先 S0,S1,H9", units)) == ["S1", "unknown"]
@@ -951,6 +962,8 @@ def main(argv=None):
     p1.add_argument("feature")
     p1.add_argument("--out", required=True)
     p1.add_argument("--src", action="append", default=[], help="入力のソース(絶対パス)。複数可")
+    p1.add_argument("--phase", type=int, choices=(1, 2), default=1,
+                    help="1=units.json の after を持たない単位(S1 S3 H2 H3 H4)、2=after を持つ単位(H1 S2)。phase 2 は S1 の _unit_S1.json が要る")
     p2 = sub.add_parser("after", help="検査と後段を順に流す")
     p2.add_argument("feature")
     p3 = sub.add_parser("retry", help="差し戻しを足した依頼文を書く")
@@ -974,16 +987,18 @@ def main(argv=None):
         print("selftest OK")
         return 0
     if a.cmd == "prompts":
-        moved = archive_stale_fragments(a.feature)
-        if moved:
-            print(f"前の run の断片 {len(moved[1])} 件を退避: {moved[0]}")
+        # WHY: phase 2 で退避すると phase 1 が書いた S1 の断片を消すので、退避は phase 1 だけ
+        if a.phase == 1:
+            moved = archive_stale_fragments(a.feature)
+            if moved:
+                print(f"前の run の断片 {len(moved[1])} 件を退避: {moved[0]}")
         units = load_units()
         data = {"units": [
             {"unit": u, "subagent_type": SUBAGENT_TYPE, "model": units[u]["model"], "prompt": build_prompt(units, a.feature, u, a.src)}
-            for u in units
+            for u in units if bool(units[u].get("after")) == (a.phase == 2)
         ]}
         Path(a.out).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"wrote {len(data['units'])} units to {a.out}")
+        print(f"wrote {len(data['units'])} units (phase {a.phase}) to {a.out}")
         return 0
     if a.cmd == "after":
         return run_after(a.feature)
