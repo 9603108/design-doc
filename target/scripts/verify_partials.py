@@ -756,13 +756,17 @@ def selftest_units():
         "H4": {"messages_backend": [{"message_id": "MSE00001", "code": "MSE00001", "severity": "error", "message": "保存に失敗しました"}]},
         "S1": {"screen_layout": {"items": [{"item_name": "確定", "area_ref": "A1", "item_type": "Button", "event_code": "EV01"}]}},
         "S2": {"api_spec": [{"action": "save", "description": "受注を保存する", "related_db_operations": ["db_op_save"],
-                             "response_items": [{"key": "result", "source": {"type": "const"}}],
+                             "response_items": [{"key": "result", "description": "保存の結果"}],  # source・expression は担当が書かない(G20: 下書きから合成が入れる)
                              "response_to_screen_mapping": [{"api_field_path": "result", "screen_item_name": "確定"}],
                              "error_patterns": [{"condition": "保存できない", "status_code": 500, "message_id": "MSE00001"}]}],
                "db_operations": [{"id": "db_op_save", "dataset_name": "受注を登録する"}]},
         "S3": {"event_processes": [{"event_code": "EV01", "details": ["入力を確かめる", "・save をリクエストする"]}]},
     }
     assert _units.check_all(spec, good) == [], f"良い断片で問題が出た: {_units.check_all(spec, good)}"
+    # G20: response_items の source はどの単位の担当でもない。S2 が書けば [範囲外] で S2 へ戻す
+    own_src = copy.deepcopy(good)
+    own_src["S2"]["api_spec"][0]["response_items"][0]["source"] = {"type": "const"}
+    assert any(p.startswith("[範囲外]") and "source" in p and p.endswith("差し戻し先 S2") for p in _units.check_all(spec, own_src)), _units.check_all(spec, own_src)
     # 合成後の穴: 画面への写しが空・400 の検査が validations に無いと、断片の段階で S2・H4 へ戻す(最後の検査 verify_intermediate を待たない)
     assert check_composed_gaps(_units.compose(spec, good), good) == [], check_composed_gaps(_units.compose(spec, good), good)
     gap = copy.deepcopy(good)
@@ -777,7 +781,7 @@ def selftest_units():
     assert _units.check_all(spec, gap) == [], "none_reason・kind=API検査 が分担表・検査で通らない: " + str(_units.check_all(spec, gap))
     comp = _units.compose(spec, good)
     assert comp["api_spec"][0]["description"] == "受注を保存する" and comp["api_spec"][0]["method"] == "POST", "合成で欄が落ちた"
-    assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "display_name": "結果", "source": {"type": "const"}}, "行の合成が違う"
+    assert comp["api_spec"][0]["response_items"][0] == {"key": "result", "no": 1, "data_type": "string", "display_name": "結果", "description": "保存の結果"}, "行の合成が違う"
     parts, unknown = _units.split_partials(comp)
     assert "event_processes" in parts["screen_events"] and not unknown, "partial への振り分けが違う"
     assert comp["screen_layout"]["items"][0]["no"] == 1, "合成で items の no を振っていない"
