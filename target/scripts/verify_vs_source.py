@@ -2039,7 +2039,8 @@ def main(argv=None):
         except ValueError as e:
             print(f"[ERROR] 許可リストが不正: {e}")
             return 1
-        bad = _warn_allow.unallowed([p for p in all_lines if p.startswith("[WARN]")], allow)
+        # 識別子(owner・step_kind)の引き当てには data(中間 JSON)を使う
+        bad = _warn_allow.unallowed([p for p in all_lines if p.startswith("[WARN]")], allow, data)
         if bad:
             for p in bad:
                 print(p)

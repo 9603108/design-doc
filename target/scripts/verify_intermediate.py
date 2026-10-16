@@ -2363,10 +2363,12 @@ def main():
         print()
     if warns:
         print("--- WARN（許容範囲、業務担当者の確認推奨） ---")
-        for lvl, msg in warns[:30]:  # 30件まで表示
+        # WHY: --warn-allow-strict のときは全件出す。gate が出力の WARN 行から「当たらない登録」を数えるので、省略すると数え違える
+        shown = warns if warn_allow_strict else warns[:30]  # 通常は30件まで表示
+        for lvl, msg in shown:
             print(f"  [{lvl}] {msg}")
-        if len(warns) > 30:
-            print(f"  ...他 {len(warns) - 30} 件のWARN省略")
+        if len(warns) > len(shown):
+            print(f"  ...他 {len(warns) - len(shown)} 件のWARN省略")
         print()
 
     infos = [i for i in all_issues if i[0] == "INFO"]
@@ -2381,7 +2383,7 @@ def main():
 
     # --warn-allow-strict: 許可リストに無い WARN(理由つきで登録されていない WARN)が1件でもあれば不合格にする。
     # 意味合い: 「WARN にはすべて説明がつく」を納品の条件にするため。理由の無い登録は _warn_allow.load_allow が ValueError で拒否する。
-    # 接続情報: run_units.py の gate が呼ぶ。許可リストの形と照合は _warn_allow.py(load_allow・unallowed)。
+    # 接続情報: run_units.py の gate が呼ぶ。許可リストの形と照合は _warn_allow.py(load_allow・unallowed。登録の書き方もそこ)。
     if warn_allow_strict:
         import _warn_allow
         try:
@@ -2389,7 +2391,8 @@ def main():
         except ValueError as e:
             print(f"[ERROR] 許可リストが不正: {e}")
             sys.exit(1)
-        bad = _warn_allow.unallowed([msg for _lvl, msg in warns], allow)
+        # 識別子(owner・step_kind)の引き当てには merged(中間 JSON)を使う
+        bad = _warn_allow.unallowed([msg for _lvl, msg in warns], allow, merged)
         if bad:
             for msg in bad:
                 print(f"  [WARN] {msg}")

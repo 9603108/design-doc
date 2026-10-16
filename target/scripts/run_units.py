@@ -289,7 +289,8 @@ def run_gate(feat):
     WHY: after(ERROR)・WARN の許可リスト照合・audit の差し戻しが別々に出ると、どれが残っているかをメインが読み分けることになる。
     全部そろったときだけ exit 0 にして、合格の条件(ERROR 0・説明のない WARN 0・audit の差し戻し 0・audit の unknown 0)を1か所に置く。
     同じ WARN は一覧と再出力に2回出るが、1回だけ数える。
-    出力は {ok, after_ok, warn_unallowed, audit_ng, audit_unknown} に、不合格の中身(after・warn_skipped・audit_reason)を足した JSON を1回。
+    出力は {ok, after_ok, warn_unallowed, audit_ng, audit_unknown} に、不合格の中身(after・warn_skipped・audit_reason)と、
+    どの WARN にも当たらなかった許可リストの登録(allow_unmatched。合否には影響しない)を足した JSON を1回。
     呼出元: main の gate。再利用: run_after・audit_sendbacks・load_units(subprocess の呼び方は run_after に任せ、複製しない)。"""
     import contextlib
     import io
@@ -307,9 +308,12 @@ def run_gate(feat):
     # WHY: after が合格している(ERROR 0)ので、--warn-allow-strict の非0は「許可リストに無い WARN」と読める。
     # ERROR で止まっているときは WARN の判定が意味を持たないので評価しない。
     unallowed_warn = []
+    all_warns = []  # 2 本の検査が出した WARN 行(許可に当たったものも含む)。「当たらない登録」の洗い出しに使う
+    allow = None
     if after_rc == 0:
         # WHY: 理由の空な登録など不正な許可リストは load_allow が ValueError にする。例外で落とさず、不合格として
         # 理由を出し(JSON 出力と return 1 に必ず届かせる)、許可リストの裏付けが無いので 2 本の検査は流さない。
+        data = _warn_allow.load_data(INTER / f"{feat}.json")  # owner・step_kind の登録の引き当て用
         try:
             allow = _warn_allow.load_allow(INTER / f"{feat}_warn_allow.json")
         except ValueError as e:
@@ -318,14 +322,20 @@ def run_gate(feat):
         for script in (("verify_vs_source.py", "verify_intermediate.py") if allow is not None else ()):
             cmd = f"python3 target/scripts/{script} {feat} --warn-allow-strict"
             p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True)
+            out = p.stdout + p.stderr
+            all_warns += _warn_allow.split_warns(out.splitlines())
             if p.returncode != 0:
-                out = p.stdout + p.stderr
-                lines = _warn_allow.unallowed(_warn_allow.split_warns(out.splitlines()), allow) or fallback_unknown(out, cmd)
+                lines = _warn_allow.unallowed(_warn_allow.split_warns(out.splitlines()), allow, data) or fallback_unknown(out, cmd)
                 # 一覧と再出力の両方に同じ [WARN] 行が入るので、順序を保って重複を除く
                 unallowed_warn += [f"{script}: {ln}" for ln in dict.fromkeys(ln.strip() for ln in lines)]
     else:
         result["warn_skipped"] = True
     result["warn_unallowed"] = unallowed_warn
+    # WHY: 回し直しで外れた登録(旧形式の key に番号・名前が入っているなど)を、合否とは別に見える形で出す。落とさない(直って要らなくなった登録もある)
+    if allow:
+        miss = _warn_allow.unmatched(list(dict.fromkeys(ln.strip() for ln in all_warns)), allow, data)
+        if miss:
+            result["allow_unmatched"] = [_warn_allow.describe_entry(e) for e in miss]
     # audit: 結果ファイルが無い・壊れているときは握りつぶさず不合格(audit 未実施)
     results_p = INTER / f"{feat}_audit_results.json"
     audit_ng = 0
@@ -593,6 +603,18 @@ def selftest():
             finally:
                 bad_p.unlink()
             assert rc == 1 and not o["ok"] and any("許可リストが不正" in w for w in o["warn_unallowed"]), o
+            # 当たらない登録は合否に影響させず allow_unmatched に出す(旧形式の key・新形式の owner。当たる登録は出さない)
+            ok_p = Path(td) / "機能_warn_allow.json"
+            ok_p.write_text(json.dumps({"allow": [
+                {"key": "db_operations[DB1]", "reason": "r", "date": "2026-10-16"},
+                {"key": "front_processes[FR8].steps[step_no=4]", "reason": "r", "date": "2026-10-16"},
+                {"kind": "period", "targets": ["steps"], "owner": "CSV出力:クリック", "reason": "r", "date": "2026-10-16"}]}), encoding="utf-8")
+            try:
+                rc, o = gate(0, 0, ok_row)
+            finally:
+                ok_p.unlink()
+            assert rc == 0 and o["ok"] and len(o["allow_unmatched"]) == 2 and o["allow_unmatched"][0].startswith("key=front_processes[FR8]"), o
+            assert "allow_unmatched" not in gate(0, 0, ok_row)[1]
             # 一覧と再出力で同じ [WARN] 行が2回出ても、同じ script 由来の行は1回だけ数える
             g["run_after"] = lambda feat: (print(json.dumps({"stopped_at": "x", "sendbacks": {}})) or 0)
             subprocess.run = lambda cmd, **kw: _Proc(1, "[WARN] db_operations[DB1] 空\n[ERROR] 許可リストに無い WARN 1 件\n[WARN] db_operations[DB1] 空")
