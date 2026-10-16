@@ -270,14 +270,18 @@ _TYPE_WORDS = (
     ("name", re.compile(r"名$|名称|氏名|担当者|店舗|店名|顧客|得意先|取引先")),
 )
 _UNIT = re.compile(r"単位[:：=]?\s*([^\s,、。)）]+)")
+# 実行時の値が1つ入る欄の item_type(15_中間JSONスキーマ.md の items[].item_type)。ここに無い型は触らない。
+# WHY: Grid(行数の例)・Checkbox/RadioButton(ON・選択肢)・Button・Link は項目名に「売上」「税」などを含んでも例示値が値1つではなく、見本値で上書きすると壊れる。
+# ComboBox も外す: 例示値は選択肢の字面(POS の店舗は「- 全店 -」)で、見本値にすると選択肢が消える。
+_VALUE_ITEM_TYPES = ("Input", "Calendar", "TextArea")
 
 
 def _runtime_example(item):
     """項目1件の、ソースに根拠が無い例示値の見本値(EXAMPLE_BY_TYPE)。根拠がある・型が取れない・Label・固定文言は None(触らない)。
     根拠の有無は screen_text 系の既存の判定(literal_screen_text が字面を決められたか)で決め、新しい判定を重ねない。
     呼出元: fill。個数の単位は項目の format・remarks の「単位: ○」から付ける(無ければ数値だけ)。"""
-    if item.get("item_type") == "Label" or item.get("format") == "固定文言":
-        return None  # 画面のソースが描く固定の文字(ラベル・見出し)は対象外
+    if item.get("item_type") not in _VALUE_ITEM_TYPES or item.get("format") == "固定文言":
+        return None  # 値1つが入る欄の型だけが対象。Label・Grid・Checkbox・RadioButton・Button・Link と、画面のソースが描く固定の文字は触らない
     s = _tsx_src(item)
     if s is not None and literal_screen_text(s["file"], s["line_start"], s.get("line_end") or s["line_start"]):
         return None  # 出典の JSX が字面を決める欄はソースが正
@@ -402,14 +406,21 @@ def _selftest():
             {"item_name": "文の途中", "item_type": "Label", "example": "旧", "src": src(at("m4"), at("後半は"))},
             {"item_name": "強調と続き", "item_type": "Label", "example": "旧", "src": src(at("<strong>見出し"), at("<strong>見出し"))},
             # G31: 実行時のデータが入る欄(Label 以外で出典の字面が決まらない)は、型ごとの見本値にそろえる
-            {"item_name": "店名", "item_type": "TextBox", "example": "A店"},
-            {"item_name": "担当者名", "item_type": "TextBox", "example": "佐藤"},
-            {"item_name": "売上金額", "item_type": "TextBox", "example": "500 円"},
+            {"item_name": "店名", "item_type": "Input", "example": "A店"},
+            {"item_name": "担当者名", "item_type": "Input", "example": "佐藤"},
+            {"item_name": "売上金額", "item_type": "Input", "example": "500 円"},
             {"item_name": "対象日付", "item_type": "Calendar", "example": "2025/1/1"},
-            {"item_name": "点数", "item_type": "TextBox", "example": "9 点", "format": "単位: 点"},
-            {"item_name": "備考", "item_type": "TextBox", "example": "自由記述"},                      # 型が取れない欄は触らない
-            {"item_name": "店舗名(出典あり)", "item_type": "TextBox", "example": "店舗", "src": src(at("<label>"), at("<label>"))},  # 出典が字面を決める欄は触らない
+            {"item_name": "点数", "item_type": "Input", "example": "9 点", "format": "単位: 点"},
+            {"item_name": "備考", "item_type": "Input", "example": "自由記述"},                      # 型が取れない欄は触らない
+            {"item_name": "店舗名(出典あり)", "item_type": "Input", "example": "店舗", "src": src(at("<label>"), at("<label>"))},  # 出典が字面を決める欄は触らない
             {"item_name": "担当者名ラベル", "item_type": "Label", "example": "店舗", "src": src(at("<label>"), at("<label>"))},  # Label は対象外
+            # 値1つが入らない型(Grid・Checkbox・RadioButton・Button・Link)は、項目名に金額・店舗・日付などの語を含んでも触らない
+            {"item_name": "売上明細", "item_type": "Grid", "example": "22行"},
+            {"item_name": "税込で表示", "item_type": "Checkbox", "example": "ON"},
+            {"item_name": "店舗区分", "item_type": "RadioButton", "example": "全店"},
+            {"item_name": "日付で絞る", "item_type": "Button", "example": "絞る"},
+            {"item_name": "店舗名", "item_type": "Link", "example": "店舗一覧"},
+            {"item_name": "表示店名", "item_type": "ComboBox", "example": "- 全店 -"},  # 選択肢の字面を持つ ComboBox も触らない
         ]}}
         log = []
         fill(out, log)
@@ -434,6 +445,8 @@ def _selftest():
         assert ex["強調と続き"] == "旧", ex["強調と続き"]            # 強調要素で始まる範囲の後ろに文字が続くと、見出しの項目か本文の項目か決まらない
         assert ex["店名"] == "実行時の値" and ex["担当者名"] == "実行時の値", (ex["店名"], ex["担当者名"])
         assert ex["売上金額"] == "1,234 円" and ex["対象日付"] == "2026-10-01" and ex["点数"] == "123 点", ex
+        assert (ex["売上明細"], ex["税込で表示"], ex["店舗区分"], ex["日付で絞る"], ex["店舗名"]) == ("22行", "ON", "全店", "絞る", "店舗一覧"), ex  # 値1つの型でない欄は触らない
+        assert ex["表示店名"] == "- 全店 -", ex["表示店名"]
         assert ex["備考"] == "自由記述" and ex["店舗名(出典あり)"] == "店舗" and ex["担当者名ラベル"] == "店舗", ex
         assert any("[例示値] 店名 の例示値「A店」を「実行時の値」に揃える(ソースに根拠が無い)" in x for x in log), log
         assert any("固定文の例示値を出典の JSX が描く字面に直した: 5 件" in x and "注記" in x for x in log), log

@@ -1279,6 +1279,9 @@ def _selftest_message_text():
 
 
 if __name__ == "__main__":
+    # WHY: 検査は機能名を取らず、実在の機能の下書きにも左右されない。draft_files が読む機能名を、下書きの無い仮の名前 x に固定する(--selftest で流せる)。
+    import os
+    os.environ["FEATURE_NAME"] = "x"  # 各検査が一時の x_*_draft.json を置くため、名前は x
     _selftest_b0()
     _selftest_initial_values()
     _selftest_compose_facts()
