@@ -995,6 +995,8 @@ def check_description_granularity(d, verify_overrides):
                     issues.append((
                         "ERROR",
                         f"v55.1 §19 補遺 概要 30 字超: {section_key}[{item_id}].{field} が {len(v)} 文字 (25 字以内推奨、30 字超 ERROR): {v[:80]}"
+                        # 注記の置き場の案内: backend_processes の概要は30字以内の概要だけにし、注記は db_operations[].remarks に書く(S2 手順書と同じ取り決め)
+                        + (" / 注記は db_operations[].remarks に書き、description は30字以内の概要だけにする" if section_key == "backend_processes" else "")
                     ))
             # 概要長すぎ検出 (句点なしで 80 文字超)
             if period_count == 0 and len(v) > max_summary_len_warn:
@@ -1190,8 +1192,11 @@ def check_structure(merged: dict, project_config: dict) -> list:
     if not meta.get("source_html") and not meta.get("source_html_path") and not meta.get("frontend_files"):
         issues.append(("ERROR", "meta.source_html / meta.source_html_path / meta.frontend_files のいずれも空（解析起点が不明）"))
     # v49: project_pattern / profile / generated_at / source_html_path 単独は WARN に格下げ
+    # WHY: React の画面は HTML を持たず source_html_path が空なのが正常。直前の起点検査と同じ frontend_files 判定で、誤検知の WARN を出さない。
     for k in ("source_html_path", "project_pattern", "profile", "generated_at"):
         if not meta.get(k):
+            if k == "source_html_path" and meta.get("frontend_files"):
+                continue
             issues.append(("WARN", f"meta.{k} が空（v49 で docx 出力からは廃止、内部判定用のみ）"))
 
     # 2026-10-05 汎用化: 許容値は project_config の allowed_project_patterns / allowed_profiles（文字列の配列）。
@@ -1417,6 +1422,7 @@ def check_message_severity_prefix(merged: dict) -> list:
 def check_src(merged: dict, sc: dict) -> list:
     """2026-10-13 新設(案 A4): 行の出典 src({file, line_start, line_end}) を検査する。
     (a) src の無い行は WARN。src が1行も無い中間 JSON(A3 の合成より前)では WARN を1件の要約にまとめる。
+        validations の src は H4 が行ごとに書くので、無いときの文言に H4 を指す語を足す。
     (b) src.file が screen_config の source_files・backend_files(同じフォルダの補助モジュールを含む)に無い、
         line_start > line_end、line_end がファイルの行数を超える → ERROR(作り話の行番号を止める)。
     接続情報: 呼出元 = main() / 入力 = merged・sc / 出力 = [(level, message), ...]"""
@@ -1437,7 +1443,8 @@ def check_src(merged: dict, sc: dict) -> list:
     else:
         for name, r in rows:
             if not r.get("src"):
-                issues.append(("WARN", f"[出典] {name}: src が無い(ソースの根拠が不明)"))
+                hint = "（H4 が行ごとに src を書く）" if name == "validations" else ""
+                issues.append(("WARN", f"[出典] {name}: src が無い(ソースの根拠が不明{hint})"))
     srcs = list(sc.get("source_files") or []) + [str(Path(sc.get("project_root") or ".") / f) for f in sc.get("backend_files") or []]
     allowed_files = {Path(f).resolve() for f in srcs}
     allowed_dirs = {p.parent for p in allowed_files}
@@ -2193,7 +2200,40 @@ def _selftest() -> int:
     if len(check_item_name_duplication(dup3)) != 1:
         print("[selftest NG] 下書きが無いときに同名の WARN を出さない")
         return 1
-    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)・出典の無い項目・初期値の重複")
+    # G9: validations の src が無いときは H4 を指す WARN 1件(ERROR は出さない)。src を足すと WARN が0件になる。
+    with tempfile.TemporaryDirectory() as tmp:
+        src_file = Path(tmp) / "s.tsx"
+        src_file.write_text("a\nb\nc\n", encoding="utf-8")
+        src_ref = [{"file": str(src_file), "line_start": 1, "line_end": 2}]
+        sc_g9 = {"source_files": [str(src_file)]}
+        g9_missing = check_src({"events": [{"src": src_ref}], "validations": [{"no": "VL1"}]}, sc_g9)
+        if not (len(g9_missing) == 1 and g9_missing[0][0] == "WARN" and "H4" in g9_missing[0][1]):
+            print(f"[selftest NG] src の無い validations が H4 を指す WARN 1件にならない: {g9_missing}")
+            return 1
+        g9_filled = check_src({"events": [{"src": src_ref}], "validations": [{"no": "VL1", "src": src_ref}]}, sc_g9)
+        if g9_filled:
+            print(f"[selftest NG] src を持つ validations で出典の指摘が出た: {g9_filled}")
+            return 1
+    # G10: backend_processes の概要が31字以上の ERROR は注記の置き場(db_operations[].remarks)を案内し、front_processes には案内しない。
+    g10_long = "あ" * 31
+    g10_be = [m for lvl, m in check_description_granularity({"backend_processes": [{"process_id": "BE1", "overview": g10_long}]}, {}) if lvl == "ERROR" and "30 字超" in m]
+    g10_fe = [m for lvl, m in check_description_granularity({"front_processes": [{"process_id": "FR1", "overview": g10_long}]}, {}) if lvl == "ERROR" and "30 字超" in m]
+    if not (g10_be and all("db_operations[].remarks" in m for m in g10_be)):
+        print(f"[selftest NG] backend_processes の30字超の ERROR が remarks を案内しない: {g10_be}")
+        return 1
+    if not g10_fe or any("db_operations[].remarks" in m for m in g10_fe):
+        print(f"[selftest NG] front_processes の30字超の ERROR に remarks の案内が混ざったか ERROR が無い: {g10_fe}")
+        return 1
+    # G11: React の画面(frontend_files あり)では source_html_path が空でも WARN を出さない。起点が無い画面では従来どおり出す。
+    g11_react = check_structure({"meta": {"feature_name": "f", "source_html_path": "", "frontend_files": [{"path": "a.tsx"}]}}, {})
+    if any("meta.source_html_path" in m for _, m in g11_react):
+        print(f"[selftest NG] frontend_files ありで source_html_path の WARN を出した: {g11_react}")
+        return 1
+    g11_none = check_structure({"meta": {"feature_name": "f", "source_html_path": ""}}, {})
+    if not any(lvl == "WARN" and "meta.source_html_path" in m for lvl, m in g11_none):
+        print(f"[selftest NG] 起点が無い画面で source_html_path の WARN を出さない: {g11_none}")
+        return 1
+    print("[OK] selftest: B16 の初期処理・動作語・構成図の ID・共通ロジックの呼出元・初期表示の活性と表示(出典から再評価)・出典の無い項目・初期値の重複・validations の出典")
     return 0
 
 

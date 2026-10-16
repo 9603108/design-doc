@@ -534,7 +534,7 @@ def check_s2_overview(composed, frags, directory):
         for level, msg in vi.check_description_granularity(probe, vo):
             if level == "ERROR":
                 out.append(f"[概要] api_spec[{a.get('action')}].description: {msg} → 差し戻し先 S2"
-                           "(業務の言葉で30字以内の1文にする。関数名・物理名は書かない)")
+                           "(業務の言葉で30字以内の1文にする。関数名・物理名は書かない。注記は db_operations[].remarks に書く)")
     return out
 
 

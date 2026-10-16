@@ -422,10 +422,57 @@ def _idents(text_lines):
     return calls, setters, rest
 
 
+def _add_statement_defs(ex, path0, lines0, imports, statement):
+    """文(statement)が述べる識別子の定義(定数・関数)を、ラベル=識別子名の断片として足す。呼出元 = _expand。
+    WHY: _expand が参照先を引くのは主抜粋の本文の識別子だけで、文だけが挙げる名前(CSV_SPECS・_DATE_RE・onSubmit など)は
+    src の行に現れないと抜粋に入らず、判定が根拠不足の unknown になった。引けない名前は黙って飛ばす(ただの語のことが多い)。"""
+    for name in dict.fromkeys(m.group(1) for m in _IDENT_RE.finditer(statement)):
+        if name in _STOP:
+            continue
+        target = imports.get(name)
+        if target:
+            tlines = _read_lines(target, ex.cache) or []
+            i = _find_def(tlines, name)
+            if i is not None:
+                ex.add(target, i, _block_end(tlines, i, DEPTH2_BLOCK_MAX), name, DEPTH2_BLOCK_MAX)
+            continue
+        i = _find_def(lines0, name)
+        if i is not None:
+            ex.add(path0, i, _block_end(lines0, i, DEPTH2_BLOCK_MAX), name, DEPTH2_BLOCK_MAX)
+
+
+_COND_LINE_RE = re.compile(r"&&|\s\?\s|\bif\s*\(|v-if")
+
+
+def _add_display_conditions(ex, path0, lines0, statement):
+    """主抜粋の要素を表示するかを決める条件の行(`{x && (` `{x ? (` `if (x)` `v-if`)を、1行ずつ「表示条件」の断片として足す。呼出元 = _expand。
+    WHY: 「〜のときだけ表示する」型の文は、src が表示される要素の行を指し、条件の行は数行上にあって抜粋の外になっていた。
+    (a) 主抜粋の直前15行のうち、主抜粋の先頭行よりインデントが浅い条件行を近い順に最大2行、
+    (b) 文と主抜粋が使う識別子を含む条件行を、ファイル全体から最大2行足す。予算は ex.add が管理する。"""
+    _p, s0, _e0, _l, body0 = ex.segs[0]
+    first = lines0[s0 - 1] if 0 < s0 <= len(lines0) else ""
+    indent0 = len(first) - len(first.lstrip())
+    taken = 0
+    for i in range(s0 - 2, max(s0 - 2 - 15, -1), -1):
+        ln = lines0[i]
+        if taken >= 2:
+            break
+        if _COND_LINE_RE.search(ln) and len(ln) - len(ln.lstrip()) < indent0:
+            taken += ex.add(path0, i, i, "表示条件", 1)
+    idents = {m.group(1) for m in _IDENT_RE.finditer(statement + "\n" + "\n".join(body0))} - set(_STOP)
+    taken = 0
+    for i, ln in enumerate(lines0):
+        if taken >= 2:
+            break
+        if _COND_LINE_RE.search(ln) and any(re.search(rf"\b{re.escape(n)}\b", ln) for n in idents):
+            taken += ex.add(path0, i, i, "表示条件", 1)
+
+
 def _expand(ex, merged, project_root, statement, src):
     """主抜粋(ex の先頭の断片)の後ろに、判定に要る参照先を足す。呼出元 = _excerpt。
     足す順(優先度の高い順): (1) 文中の [BE1] 等の定義元 (2) 主抜粋が呼ぶ関数・使う定数の本体 (3) 主抜粋が呼ぶ state の更新関数の定義行
     (4) その state を依存配列に持つ hook と、その hook を起動する useEffect (5) 別ファイルから import した関数の本体(参照先の中の呼出しも)
+    (1c) 主抜粋の要素の表示条件の行 (1d) 文中の識別子の定義(予算を (2)〜(5) が使い切る前に確保する)
     WHY: 参照先を決めるのは識別子の一致だけで、案件固有の名前・語は使わない。"""
     path0, s0, e0, _l, body0 = ex.segs[0]
     lines0 = _read_lines(path0, ex.cache) or []
@@ -451,9 +498,13 @@ def _expand(ex, merged, project_root, statement, src):
         hit = next((i for i, ln in enumerate(lines0) if lit in ln), None)
         if hit is not None:
             ex.add(path0, max(hit - 1, 0), min(hit + 1, len(lines0) - 1), "文言の出現箇所", 3)
+    # (1c) 表示条件の行
+    _add_display_conditions(ex, path0, lines0, statement)
     calls, setters, rest = _idents(body0)
     base = path0.parent
     imports = _imports(lines0, base)
+    # (1d) 文が名指しする識別子の定義
+    _add_statement_defs(ex, path0, lines0, imports, statement)
     # WHY: 呼出しでなく値として渡す関数(onClick={exportCsv}・useEffect(load, ...))も、同じファイルに関数の定義があれば引く。
     # 定義の行が関数の形(=> / function / def / useCallback)の名前だけを足し、ただの変数名(rows など)は引かない
     def _fn_like(name):
@@ -528,11 +579,15 @@ def _excerpt(src, project_root, cache, merged=None, statement=""):
 def build_claims(merged, project_root, prior_ok, units, react=None):
     """判定項目の一覧を作る。prior_ok は前回 ok だった (text, src_excerpt) の集合で、そのまま除く（キャッシュ）。
     呼出元 = main() と _selftest()。owner は run_units.owner_of で欄の道筋から決める（引けなければ None）。
-    react は react 下書き(出典の無い検査の出典を behaviors から引く。無ければ None)。"""
+    react は react 下書き(出典の無い検査の出典を behaviors から引く。無ければ None)。
+    抜粋が空の項目は作らない(判定が必ず unknown になるため。除いた項目は stderr に出す)。"""
     cache = {}
     claims = []
     for kind, road, text, src, subject in _candidates(merged, react):
         excerpt = _excerpt(src, project_root, cache, merged, text) if src else ""
+        if not excerpt:
+            print(f"[警告] 抜粋が空のため判定項目から除いた: {road}", file=sys.stderr)
+            continue
         if (text, excerpt) in prior_ok:
             continue
         claims.append({
@@ -693,6 +748,27 @@ def _selftest():
         if got.get(0, {}).get("line_start") != 13 or got.get(1, {}).get("line_start") != 11 or 2 in got:
             print(f"[selftest NG] 点数で決めた組(VL1→行13・VL2→行11)の順序が食い違うのに、並び順で残りを結んだ: {got}")
             return 0
+        # 文が名指しする定数・関数の定義(CSV_SPECS・_DATE_RE・onSubmit)と、表示条件の行({error && ()が、src が表示要素の行だけを指していても抜粋に入る
+        gx = Path(tmp) / "gx.tsx"
+        gx.write_text("\n".join([
+            "const CSV_SPECS = [", "  { key: 'a' },", "  { key: 'b' },", "];",
+            "const _DATE_RE = /^[0-9]+$/;",
+            "const onSubmit = (e) => {", "  e.preventDefault();", "};",
+            "function Page() {", "  return (", "    <div>", "      {error && (",
+            "        <section>", "          <h1>a</h1>", "          <h2>b</h2>", "          <h3>c</h3>",
+            "          <p>shown</p>", "        </section>", "      )}", "    </div>"]) + "\n", encoding="utf-8")
+        gx_ex = _excerpt({"file": str(gx), "line_start": 16, "line_end": 16}, "", {}, {},
+                         "CSV_SPECS・_DATE_RE・onSubmit・error のとき表示する")
+        for need in ("const CSV_SPECS = [", "const _DATE_RE", "const onSubmit", "{error && ("):
+            if need not in gx_ex:
+                print(f"[selftest NG] 文が名指しする定義・表示条件の行 {need!r} が抜粋に入らない: {gx_ex!r}")
+                return 0
+        # 出典を引けない項目(対象の画面項目・領域・react 下書きのどれにも当たらない VL)は、抜粋が空になるので判定項目にしない
+        m7 = {"screen_layout": {"items": []}, "front_processes": [], "common_logic": [], "calculations": [],
+              "validations": [{"no": "VL1", "field": "どこにも無い項目", "kind": "入力検査", "rule": "何かを調べる", "applied_when": "b"}]}
+        if build_claims(m7, "", set(), units):
+            print(f"[selftest NG] 出典を引けない項目が判定項目に残った: {build_claims(m7, '', set(), units)}")
+            return 0
     print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加")
     return 0
 
@@ -721,10 +797,8 @@ def main(argv):
     claims = build_claims(merged, sc.get("project_root") or "", load_prior_ok(feature), load_units(), react)
     out = INTERMEDIATE_DIR / f"{feature}_audit_claims.json"
     out.write_text(json.dumps(claims, ensure_ascii=False, indent=1), encoding="utf-8")
-    # WHY: 抜粋が空の項目は判定が必ず unknown になる(run14 の VL5〜VL15)。件数を出して、出典の引けなかった項目に気づけるようにする
-    empty = [c["id"] for c in claims if not c["src_excerpt"]]
-    print(f"判定項目 {len(claims)} 件を {out} に書いた（owner が None の件数 {sum(1 for c in claims if c['owner'] is None)}、"
-          f"src_excerpt が空の件数 {len(empty)}" + (f": {', '.join(empty[:10])}" if empty else "") + "）")
+    # WHY: 抜粋が空の項目は build_claims が除く(判定が必ず unknown になるため)ので、ここでは件数と owner 未定の件数だけを出す
+    print(f"判定項目 {len(claims)} 件を {out} に書いた（owner が None の件数 {sum(1 for c in claims if c['owner'] is None)}）")
     return 0
 
 

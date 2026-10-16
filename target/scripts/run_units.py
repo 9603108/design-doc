@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # WHY: スクリプトの場所(target/scripts)から2つ上を設計書スキルの根とみなす。絶対パスの埋め込みを避ける。
@@ -285,6 +286,7 @@ def run_gate(feat):
 
     WHY: after(ERROR)・WARN の許可リスト照合・audit の差し戻しが別々に出ると、どれが残っているかをメインが読み分けることになる。
     全部そろったときだけ exit 0 にして、合格の条件(ERROR 0・説明のない WARN 0・audit の差し戻し 0)を1か所に置く。
+    同じ WARN は一覧と再出力に2回出るが、1回だけ数える。
     出力は {ok, after_ok, warn_unallowed, audit_ng} に、不合格の中身(after・warn_skipped・audit_reason)を足した JSON を1回。
     呼出元: main の gate。再利用: run_after・audit_sendbacks・load_units(subprocess の呼び方は run_after に任せ、複製しない)。"""
     import contextlib
@@ -317,7 +319,8 @@ def run_gate(feat):
             if p.returncode != 0:
                 out = p.stdout + p.stderr
                 lines = _warn_allow.unallowed(_warn_allow.split_warns(out.splitlines()), allow) or fallback_unknown(out, cmd)
-                unallowed_warn += [f"{script}: {ln}" for ln in lines]
+                # 一覧と再出力の両方に同じ [WARN] 行が入るので、順序を保って重複を除く
+                unallowed_warn += [f"{script}: {ln}" for ln in dict.fromkeys(ln.strip() for ln in lines)]
     else:
         result["warn_skipped"] = True
     result["warn_unallowed"] = unallowed_warn
@@ -469,6 +472,26 @@ def selftest():
             except exc:
                 continue
             raise AssertionError(f"{exc.__name__} にならない")
+        # logs/ だけの run には控えを書ける。空ディレクトリ・logs 以外もある run は従来どおり断る
+        (t / "r" / "runL" / "logs").mkdir(parents=True)
+        assert "logs/a.log" in save_run("テスト機能", "runL", logs=[t / "a.log"], **kw)[1], "logs だけの run に控えられない"
+        (t / "r" / "runE").mkdir()
+        (t / "r" / "runM" / "logs").mkdir(parents=True)
+        (t / "r" / "runM" / "x.txt").write_text("x", encoding="utf-8")
+        for rn in ("runE", "runM"):
+            try:
+                save_run("テスト機能", rn, **kw)
+            except FileExistsError:
+                continue
+            raise AssertionError(f"{rn} を断らない")
+        # archive_stale_fragments: 断片が無ければ None。あれば _stale_ へ移し(消さない)、断片以外は動かさない
+        assert archive_stale_fragments("テスト機能", runs_root=t / "r2", inter=t / "i0") is None
+        (t / "i" / "_audit_part_1.json").write_text("{}", encoding="utf-8")
+        sd, moved = archive_stale_fragments("テスト機能", runs_root=t / "r2", inter=t / "i")
+        assert sd.parent == t / "r2" and sd.name.startswith("_stale_"), sd
+        assert sorted(moved) == ["_audit_part_1.json", "_partial_backend.json", "_unit_S1.json"], moved
+        assert all((sd / m).is_file() and not (t / "i" / m).exists() for m in moved), "移っていない"
+        assert (t / "i" / "テスト機能.json").is_file(), "断片以外を動かした"
     # run_gate: run_after・subprocess.run・INTER を差し替え、4つの合否の組を見る。差し替えは必ず戻す
     class _Proc:
         def __init__(self, rc, out=""):
@@ -511,6 +534,15 @@ def selftest():
             finally:
                 bad_p.unlink()
             assert rc == 1 and not o["ok"] and any("許可リストが不正" in w for w in o["warn_unallowed"]), o
+            # 一覧と再出力で同じ [WARN] 行が2回出ても、同じ script 由来の行は1回だけ数える
+            g["run_after"] = lambda feat: (print(json.dumps({"stopped_at": "x", "sendbacks": {}})) or 0)
+            subprocess.run = lambda cmd, **kw: _Proc(1, "[WARN] db_operations[DB1] 空\n[ERROR] 許可リストに無い WARN 1 件\n[WARN] db_operations[DB1] 空")
+            audit_p.write_text(json.dumps(ok_row), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as dup_buf:
+                run_gate("機能")
+            o = json.loads(dup_buf.getvalue())
+            dups = [w for w in o["warn_unallowed"] if w.startswith("verify_vs_source.py:") and "db_operations[DB1]" in w]
+            assert len(dups) == 1, o
     finally:
         g["run_after"], subprocess.run, INTER = old_after, old_run, old_inter
     check_step_args("テスト機能")
@@ -637,7 +669,8 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
     """run の成果物(中間JSON・断片・検査ログ・docx)を target/runs/<run名>/ に控える。
 
     WHY: /private/tmp の片付けで run17・run18 が消えたため。回し直しの比較をするには過去の run が残っている必要がある。
-    他の run を壊さないよう保存先が既にあれば FileExistsError。無い対象は黙って飛ばさず skipped に返す。
+    他の run を壊さないよう保存先が既にあれば FileExistsError。ただし logs/ だけの run は成果物が無いので控えを許す
+    (検査ログだけ先に置かれた run への控え。logs/ の同名ファイルは copy2 で置き換わる)。無い対象は黙って飛ばさず skipped に返す。
     呼出元: main の save-run(メインの tool-worker が after と audit-check の後に流す)。
     戻り: (dest, copied(dest からの相対パス), skipped(控えられなかった対象の名前))。"""
     if not run or "/" in run or ".." in run:
@@ -645,7 +678,7 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
     inter = Path(inter) if inter else INTER
     output_dir = Path(output_dir) if output_dir else SKILL / "target" / "output"
     dest = (Path(runs_root) if runs_root else SKILL / "target" / "runs") / run
-    if dest.exists():
+    if dest.exists() and [p.name for p in dest.iterdir()] != ["logs"]:
         raise FileExistsError(f"既にある run は上書きしない: {dest}")
     log_paths = [Path(x) for x in logs]
     for lp in log_paths:
@@ -670,6 +703,25 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
             copied.append(f"{folder}/{f.name}")
     dest.mkdir(parents=True, exist_ok=True)
     return dest, copied, skipped
+
+
+def archive_stale_fragments(feat, runs_root=None, inter=None):
+    """INTER 直下の _unit_*.json・_partial_*.json・_audit_part_*.json を target/runs/_stale_<日時>/ へ移す(消さない)。
+
+    WHY: 前の run の断片が残ったまま依頼文を作ると、担当が古い断片を読んだ例があったため。
+    呼出元: main の prompts(units 読込の前)。feat は呼出しの形をそろえるための引数(断片の名前は機能名を含まない)。
+    戻り: 断片が無ければ None。あれば (退避先 Path, 移した相対名のリスト)。"""
+    inter = Path(inter) if inter else INTER
+    found = []
+    for pat in ("_unit_*.json", "_partial_*.json", "_audit_part_*.json"):
+        found += sorted(inter.glob(pat))
+    if not found:
+        return None
+    dest = (Path(runs_root) if runs_root else SKILL / "target" / "runs") / ("_stale_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    dest.mkdir(parents=True)
+    for f in found:
+        shutil.move(str(f), str(dest / f.name))
+    return dest, [f.name for f in found]
 
 
 def main(argv=None):
@@ -703,6 +755,9 @@ def main(argv=None):
         print("selftest OK")
         return 0
     if a.cmd == "prompts":
+        moved = archive_stale_fragments(a.feature)
+        if moved:
+            print(f"前の run の断片 {len(moved[1])} 件を退避: {moved[0]}")
         units = load_units()
         data = {"units": [
             {"unit": u, "subagent_type": SUBAGENT_TYPE, "model": units[u]["model"], "prompt": build_prompt(units, a.feature, u, a.src)}
