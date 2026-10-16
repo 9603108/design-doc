@@ -17,7 +17,7 @@
 - 列の省略は `verify_partials.py --units` が [列の省略] の ERROR で止め、欠けた列名を挙げて差し戻す
 - 物理列の空欄(下書きの元の表の列が1つに決まるもの)は合成が補う。空のまま書いてよい
 - 論理名は別名1つにつき1つ。「A と B」「A および B」のように2つを括って1つの名前にしない
-- 論理表名の末尾の「(推定)」と、where・order_by の when は合成が付け直す。書き分けなくてよい
+- 論理表名は合成が決め直す(根拠の無い表は物理表名+(推定)、project_config の table_logical_names にある表はその語)。書き分けなくてよい。担当が論理表名を工夫しなくてよい。where・order_by の when も合成が付け直す
 
 ## 書く欄(`_unit_H2.json`。db_operations の行を作る)
 - `logical_names[]`: {physical_table, logical_table, physical_column, logical_column}。dataset に出る列を全部。kind が alias_only の列の行は alias_name(別名)も持ち、physical_column は空にする(実列の行は alias_name を省いてよい)

@@ -209,6 +209,23 @@ DB セクションの SQL は **以下の構造化表** で出力。生 SQL 文�
 
 `レスポンス` / `画面更新` / `戻り値` / `ログ` / `文言` / `メッセージ表示` / `API リクエスト送信` / `結果セット列` / `WebSocket 通知`（A7, 2026-07-19 追加。§23補遺の裏方領域パターン（WebSocket購読エリア等）と対応する出力種別が辞書に存在しなかったため追加）
 
+### データ型
+
+正規の語: `string` / `integer` / `number` / `boolean` / `date` / `datetime` / `array` / `object` / `null`（15_中間JSONスキーマ.md のサンプルと同じ英小文字）
+
+| 別名 | 正規の語 |
+|:---|:---|
+| 文字列 | string |
+| 整数 | integer |
+| 数値 | number |
+| 真偽 | boolean |
+| 日付 | date |
+| 日時 | datetime |
+| 配列 | array |
+| オブジェクト | object |
+
+担当は正規の語で書く。合成（_compose_normalize.py）が別名を正規の語へ直し、辞書に無い値は verify_partials が WARN にする。
+
 ### 結合種別
 
 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN`

@@ -74,6 +74,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 | project_config（手順書だけが参照） | `execution_locations` | 動作場所として書いてよい語の一覧 | `["ブラウザ", "サーバー(API)", "データベース", "定義のみ"]` |
 | project_config（手順書だけが参照） | `naming.legacy_system` | 旧システム由来の命名規則。null なら適用しない | `null` |
 | project_config（手順書だけが参照） | `logical_name_sources` | 論理名の根拠として使う資料の一覧 | `[{"rank": "A", "kind": "customer_docs", "paths": []}, {"rank": "B", "kind": "source_code"}]` |
+| project_config（手順書だけが参照） | `table_logical_names` | 根拠のある表の論理表名。無い表は合成が物理表名+(推定)に固定する | `{}` |
 
 設定を書くときの決まり（どれも、外すと検証で ERROR になるか、画面側とバックエンドの紐付けが抜ける）:
 
@@ -783,6 +784,7 @@ screen_config.json が「画面別の業務的構造」を持つのに対し、*
 | `execution_locations[]` | 動作場所として書いてよい語の一覧。動作場所は、ここに定義した語だけを使う。辞書に無い語を動作場所に書かない（案件で足りなければこの配列に足す）。16_docx出力ハンドオフ.md §11 が参照する | `["ブラウザ", "サーバー(API)", "データベース", "定義のみ"]` |
 | `naming.legacy_system` | 旧システム由来の命名規則（マスタ・コードの接尾辞、英数字の全角化など）。設定されているときだけ、10_論理名変換.md の旧システム前提の規則を適用する | `null`（旧システム前提の規則を適用しない） |
 | `logical_name_sources[]` | 論理名の根拠として使う資料の一覧（rank の高い順に当たる）。10_論理名変換.md が参照する | `[{"rank": "A", "kind": "customer_docs", "paths": []}, {"rank": "B", "kind": "source_code"}]` |
+| `table_logical_names` | {物理表名: 論理表名} の辞書。根拠のある表だけ書く。無い表は合成が物理表名+(推定)に固定する。任意 | `{}` |
 
 この3つの書き方の例（値は架空。動作場所をクラウドのサービスの種類で書き分け、旧システム由来の命名規則を使う案件の場合）:
 

@@ -558,6 +558,31 @@ def _src_text(src):
         return None
 
 
+def check_data_type_warn(frags):
+    """data_type が辞書(正規の語・別名)に無い値を、単位ごとに1行の [WARN] で返す(終了コードには影響させない)。
+    理由: 型の表記揺れ(string と 文字列)は合成が直すが、辞書に無い語は直せないので担当へ戻す。
+    別名('文字列' 等)と None や str 以外は WARN にしない。辞書は _compose_normalize が持つ。呼出元: main_units。"""
+    from _compose_normalize import CANONICAL_DATA_TYPES, DATA_TYPE_ALIASES
+    out = []
+    for unit, frag in frags.items():
+        bad = []
+        stack = [frag]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                v = node.get("data_type")
+                if isinstance(v, str):
+                    key = v.strip().lower()
+                    if key not in DATA_TYPE_ALIASES and key not in CANONICAL_DATA_TYPES:
+                        bad.append(v)
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+        if bad:
+            out.append(f"[WARN] [型] {unit}: data_type に辞書外の値 {', '.join(sorted(set(bad)))}({len(bad)} 件) → 差し戻し先 {unit}")
+    return out
+
+
 def check_explanation_warn(frags):
     """説明文の要の語が、出典の範囲のソース本文に1つも無い行を [WARN] で返す(終了コードには影響させない)。
     理由: 出典が付いていても範囲が別の処理を指すと、説明は根拠の無い文のまま出典の印だけ付く。
@@ -727,7 +752,7 @@ def main_units(directory, only=None):
     # WARN は終了コードに影響しない(合成で機械的に補うため)
     for w in check_h2_logical_names(frags.get("H2") or {}):
         print(w)
-    for w in check_src_warn(composed, spec, skip) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags):
+    for w in check_src_warn(composed, spec, skip) + check_explanation_warn(frags) + check_example_warn(frags) + check_composed_warn(frags) + check_data_type_warn(frags):
         print(w)
     # S1 の example がソースの文字列に無ければ [WARN](D1 後半)。機能名は react 下書きのファイル名から取る
     s1_items = ((frags.get("S1") or {}).get("screen_layout") or {}).get("items") or []
@@ -1037,6 +1062,10 @@ def selftest_warn():
     assert len(s2_out(long_desc + "。店舗を返す", name="一覧")) == 1, "name があれば description 全体が overview"
     assert check_s2_overview({"api_spec": [{"action": "z", "description": long_desc}]}, s2f, "/nonexistent") == [], "S2 が書いていない API を見た"
     assert check_s2_overview({"api_spec": [{"action": "a", "description": long_desc}]}, {"H3": {}}, "/nonexistent") == [], "S2 未着で見た"
+    # data_type: 辞書外は単位ごとに WARN 1行、正規の語・別名・None だけなら WARN なし
+    out = check_data_type_warn({"S1": {"screen_layout": {"items": [{"data_type": "foo"}, {"data_type": "string"}]}}})
+    assert len(out) == 1 and out[0].startswith("[WARN] [型]") and out[0].endswith("差し戻し先 S1"), out
+    assert check_data_type_warn({"S1": {"screen_layout": {"items": [{"data_type": "string"}, {"data_type": "文字列"}, {"data_type": None}]}}}) == []
     print("[selftest OK] verify_partials.warn")
 
 

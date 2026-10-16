@@ -814,6 +814,18 @@ def compose(spec, frags, project_config=None, log=None):
     for generic in NUMBERED:
         for i, row in enumerate(_rows(out, generic), start=1):
             row["no"] = i
+    # WHY: data_type が回ごとに string と 文字列 で揺れたため、担当の書いた表記を辞書の語に固定する。
+    # 接続: normalize_empty(i3)が同じ位置のこの直後で呼ばれる。
+    from _compose_normalize import normalize_data_types
+    fixed = normalize_data_types(out)
+    if log is not None and fixed > 0:
+        log.append(f"[正規化] data_type を辞書の語へ {fixed} 件直す")
+    # WHY: 値の無い欄が null と欄なしで回ごとに揺れた(run22/run23 で 124 件)ため、空の表し方を「欄ごと消す」にそろえる。
+    # 接続: _compose_normalize.normalize_empty(型の正規化の後・return の前)。
+    from _compose_normalize import normalize_empty
+    dropped = normalize_empty(out)
+    if log is not None and dropped > 0:
+        log.append(f"[正規化] 値が null の欄を {dropped} 件消す")
     return out
 
 

@@ -733,10 +733,10 @@ INSERT/UPDATE/DELETE の場合:
 
 - `id`: 内部参照キー。`event_processes[].db_operations_ref` から参照
 - `group_by[]`(任意): `{ logical_table, logical_column, when? }`。`when` は分岐で変わるときの条件(例: `group = register`)。docx の DB 問合せに「グルーピング」の表で出る
-- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)
+- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)。値の無い欄は null を書かず欄ごと省く(合成が null の欄を消す)
 - `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
 - `group_by[]`(任意): `{ logical_table, logical_column, when? }`。`when` は分岐で変わるときの条件(例: `group = register`)。docx の DB 問合せに「グルーピング」の表で出る
-- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)
+- `aggregate[]`(任意): `{ function, target, filter, over, alias, scope }`。`over` はウィンドウ関数だけ(`{partition_by[], order_by[]}`)、`scope` は `main` か `cte <名前>`。docx に「集計」の表で出る(ウィンドウは範囲の欄に `ウィンドウ(PARTITION BY …)`)。値の無い欄は null を書かず欄ごと省く(合成が null の欄を消す)
 - `order_by[]`: `{ priority, logical_table, logical_column, direction, when? }`。docx に「並び順」の表で出る。`migrate_v17_to_v18.py` は group_by・aggregate・having・aliases・order_by を `backend_processes[].processing[].db_op_detail` へそのまま写す
 - `where[].when`（任意、文字列）: その条件が分岐で付く・外れるときの条件（例: `shop_id が指定されたとき`）。`where[].text`（任意）は条件の字面で、合成が `when` を付けるときの照合に使う。
 - `ctes[].conditional_parts[{sql, when}]`（任意）: CTE の中の条件付きの断片。`definition` には無条件の部分だけを残す。`db_operations[].table_aliases{別名: 実表}`（任意）は、`joins[].condition` の「別名.列」を実表・論理表へ解決するための対応表。

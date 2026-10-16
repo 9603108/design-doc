@@ -21,11 +21,43 @@ def _nows(s):
 
 
 def _sfx(name):
-    """論理表名に「(推定)」を付ける。表の出所(DDL の表コメント)は読んでいないので、全部を推定にする。"""
+    """論理表名に「(推定)」を付ける。根拠の無い表は _assign_table_names が物理名由来の仮名にしてから、ここで印を付ける。"""
     # WHY: 半角括弧にする。全角は apply_react_draft の仮判定に掛かるため。
     if not name or name.endswith(SUFFIX):
         return name
     return name + SUFFIX
+
+
+def _assign_table_names(out, terms):
+    """logical_names の論理表名を決め直し、db_operations の各句の論理表名へ同じ置換を写す。戻り: 根拠のある論理表名の set。
+
+    目的: 根拠(terms = project_config の table_logical_names {物理表名: 論理表名})のある表はその語、無い表は物理表名+SUFFIX にする。
+    WHY: 担当(H2)が論理表名を「レジ締め(推定)」「POS会計レポート(推定)」のように回ごとに違う言い回しで書き、約200件が揺れた。
+        根拠の無い名前は機械的に決まる物理名由来の仮名に固定し、推定の印(SUFFIX)は残す。根拠のある名前には印を付けない。
+    冪等: 2回目は旧名が新名になっているので何も変えない。旧名が複数の物理表に付いている場合、句の行は誰の名か決まらないので触らない。
+    呼出元: _compose_db(論理表名の「(推定)」を付ける段)。"""
+    terms = terms or {}
+    given, mapping, owners = set(), {}, {}
+    rows = [r for r in out.get("logical_names") or [] if isinstance(r, dict)]  # fallback-ok: logical_names は任意
+    for r in rows:
+        if r.get("physical_table") and r.get("logical_table"):
+            owners.setdefault(r["logical_table"], set()).add(r["physical_table"])
+    for r in rows:
+        pt, old = r.get("physical_table"), r.get("logical_table")
+        if not pt or not old:
+            continue
+        new = terms.get(pt) or pt + SUFFIX
+        if terms.get(pt):
+            given.add(new)
+        r["logical_table"] = new
+        if new != old and len(owners[old]) == 1:
+            mapping[old] = new
+    for op in out.get("db_operations") or []:  # fallback-ok: db_operations は任意
+        for key in ("dataset", "where", "group_by", "order_by", "joins"):
+            for row in op.get(key) or []:  # fallback-ok: 句は任意
+                if isinstance(row, dict) and row.get("logical_table") in mapping:
+                    row["logical_table"] = mapping[row["logical_table"]]
+    return given
 
 
 def _load_drafts(directory):
@@ -482,7 +514,8 @@ def _drop_subquery_aggs(op, api, log):
         op["aggregate"] = keep
 
 
-def _compose_db(out, drafts, log):
+def _compose_db(out, drafts, log, table_terms=None):
+    # table_terms: project_config の table_logical_names {物理表名: 論理表名}。None は {}(根拠の無い表は全部、物理名由来の仮名)
     ops = out.get("db_operations") or []  # fallback-ok: db_operations は任意(無い版は何もしない)
     lns = out.get("logical_names") or []  # fallback-ok: logical_names は任意
     pairs = []
@@ -496,6 +529,7 @@ def _compose_db(out, drafts, log):
     _fill_physical(out, pairs, log)                 # a) 物理列の空欄
     for op, dop, a in pairs:                        # e) where の when
         _fill_when(op, a)
+    grounded = _assign_table_names(out, table_terms or {})  # b0) 論理表名を決め直す(根拠の無い表は物理名+(推定))。これ以降の論理表名は全部新名
     pt2lt, lt2pt, col = _maps(lns)                  # b) 句の論理名
     for op in ops:
         dop, _ = drafts_of[id(op)]
@@ -509,13 +543,13 @@ def _compose_db(out, drafts, log):
                 row["condition"] = _translate_condition(row["condition"], aliases, pt2lt, col, log)
     _rename_logical_names(out, drafts, log)         # c0) 論理名を事実の出所の名前へ寄せる(下の(推定)の前)
     _unify_same_expression(out, drafts, log)        # c0b) 同じ式の列の論理名を1つに揃える(W5。(推定)の前)
-    for r in lns:                                   # c) 論理表名の「(推定)」
-        if r.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
+    for r in lns:                                   # c) 論理表名の「(推定)」(根拠のある名前 grounded には付けない)
+        if r.get("logical_table") and r["logical_table"] not in grounded:  # fallback-ok: 表名の無い行は対象外
             r["logical_table"] = _sfx(r["logical_table"])
     for op in ops:
         for key in ("dataset", "where", "group_by", "order_by", "joins"):
             for row in op.get(key) or []:  # fallback-ok: 任意の句
-                if row.get("logical_table"):  # fallback-ok: 表名の無い行は対象外
+                if row.get("logical_table") and row["logical_table"] not in grounded:  # fallback-ok: 表名の無い行は対象外
                     row["logical_table"] = _sfx(row["logical_table"])
     for op in ops:                                  # d0) 副問い合わせの中の集計は外側から外す(下書きの subqueries が正。API の action で結ぶ)
         ep = op.get("api_endpoint")  # fallback-ok: api_endpoint は任意
@@ -530,8 +564,12 @@ def _compose_db(out, drafts, log):
 
 def fill(out, log):
     """_run_fillers から呼ばれる入口。下書きは INTERMEDIATE_DIR の *_backend_draft.json を読む。"""
-    from _config_loader import INTERMEDIATE_DIR
-    _compose_db(out, _load_drafts(INTERMEDIATE_DIR), log)
+    import os
+    from _config_loader import INTERMEDIATE_DIR, load_project_config
+    # table_logical_names(根拠のある表の論理表名)は任意欄。機能名の無い実行(試験など)は project_config が無いので {} とする
+    # fallback-ok: 業務の値ではなく任意の設定欄。無ければ全表を物理名由来の仮名にする(決まった規則)
+    terms = (load_project_config().get("table_logical_names") or {}) if os.environ.get("FEATURE_NAME") else {}
+    _compose_db(out, _load_drafts(INTERMEDIATE_DIR), log, terms)
 
 
 def selftest():
@@ -602,12 +640,13 @@ def selftest():
     assert "derived" not in ln[0], ln[0]
     assert ln[3]["physical_column"] == "kai_date" and ln[3].get("derived") is True, ln[3]
     assert op["where"][0]["when"] == "shop_id が指定されたとき", op["where"][0]
-    assert op["where"][0]["logical_table"] == "POS会計(推定)" and op["where"][0]["logical_column"] == "店舗ID", op["where"][0]
+    # G24: 根拠の無い表の論理表名は担当が付けた「POS会計」ではなく、物理表名+(推定)に固定される
+    assert op["where"][0]["logical_table"] == "pos(推定)" and op["where"][0]["logical_column"] == "店舗ID", op["where"][0]
     assert op["group_by"][0]["logical_column"] == "店舗ID", op["group_by"][0]
     assert op["order_by"][0]["logical_column"] == "会計日", op["order_by"][0]
-    assert op["joins"][0]["logical_table"] == "店舗マスタ(推定)", op["joins"][0]
+    assert op["joins"][0]["logical_table"] == "shops(推定)", op["joins"][0]
     # WHY: 店舗マスタ側の列(shops.id)は論理名が無い。等結合の相手(店番号)の論理名を借りる。別名 s. は残さない
-    assert op["joins"][0]["condition"] == "店舗マスタ(推定).店舗ID = POS会計(推定).店舗ID", op["joins"][0]["condition"]
+    assert op["joins"][0]["condition"] == "shops(推定).店舗ID = pos(推定).店舗ID", op["joins"][0]["condition"]
     # 等結合の片側だけ決まる → 相手の論理名。両側とも決まらない・表が不明 → 字面のまま。等結合でない → 片側推定しない
     tl, ptl, cl = {"p": "pos", "s": "shops"}, {"pos": "POS会計", "shops": "店舗マスタ"}, {("pos", "mise_no"): "店番号"}
     assert _translate_condition("s.id = p.mise_no", tl, ptl, cl) == "店舗マスタ(推定).店番号 = POS会計(推定).店番号"
@@ -837,6 +876,28 @@ def selftest():
     r14c = r14_h2()
     _compose_db(r14c, r14_dr, [])
     assert [(r["physical_column"], r.get("alias_name")) for r in r14c["logical_names"][:2]] == [("", "days"), ("kai_date", "first_date")], r14c["logical_names"]
+    # G24: 同じ物理表を担当が違う言い回しで呼んだ2入力は、同じ出力(物理表名+(推定))になる。根拠(table_logical_names)があれば(推定)なしでその語
+    g24_in = lambda name: {"logical_names": [{"physical_table": "pos_account_reports", "logical_table": name, "physical_column": "mise_no", "logical_column": "店舗ID"}],
+                           "db_operations": [{"id": "db_op_g24", "api_endpoint": {"action": "g24"},
+                                              "dataset": [{"logical_table": name, "logical_column": "店舗ID", "physical_table": "pos_account_reports", "physical_column": "mise_no"}],
+                                              "where": [{"logical_table": name, "logical_column": "店舗ID", "operator": "=", "value": "1", "when": "x"}]}]}
+    g24_a, g24_b = g24_in("レジ締め(推定)"), g24_in("POS会計レポート(推定)")
+    _compose_db(g24_a, [], [])
+    _compose_db(g24_b, [], [])
+    assert g24_a == g24_b, (g24_a, g24_b)
+    assert g24_a["logical_names"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["logical_names"]
+    assert g24_a["db_operations"][0]["dataset"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["db_operations"]
+    assert g24_a["db_operations"][0]["where"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["db_operations"]
+    g24_t = g24_in("レジ締め")
+    g24_terms = {"pos_account_reports": "POS会計レポート"}
+    _compose_db(g24_t, [], [], g24_terms)
+    assert g24_t["logical_names"][0]["logical_table"] == "POS会計レポート", g24_t["logical_names"]
+    assert g24_t["db_operations"][0]["dataset"][0]["logical_table"] == "POS会計レポート", g24_t["db_operations"]
+    assert g24_t["db_operations"][0]["where"][0]["logical_table"] == "POS会計レポート", g24_t["db_operations"]
+    g24_snap = copy.deepcopy(g24_t)
+    _compose_db(g24_t, [], [], g24_terms)
+    assert g24_t == g24_snap, "G24 not idempotent"
+    print("[selftest OK] _compose_db_facts G24 (根拠の無い表の論理表名は物理表名+(推定)に固定・table_logical_names の表は(推定)なし・冪等)")
     print("[selftest OK] _compose_db_facts R14 (別名の行の形: physical_column の別名を alias_name へ・落ちた alias_name を dataset から補う・実列でもある名前は触らない)")
     print("[selftest OK] _compose_db_facts T17 (論理名の事実への寄せ・推定は寄せない・旧名の衝突は触らない)")
     print("[selftest OK] _compose_db_facts (B2: 物理列・when・句の論理名・(推定)・集計の別名・derived の除外)")

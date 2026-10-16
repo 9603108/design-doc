@@ -15,8 +15,9 @@ WHY: 回し直しで値が揺れる欄は、LLM に書かせている限り毎�
   - 採番 ID・legacy_*・タイムスタンプ類は比べる価値が低いので数えない(IGNORE_FIELDS ほか)。
 
 使い方: python3 diff_runs.py <A.json> <B.json>   /   python3 diff_runs.py --selftest
-出力: 先頭に単位ごとの件数(欄の揺れ・増えた行・減った行)、次に揺れの大きい欄、
-      増えた行・減った行・揺れた欄の一覧、末尾に単位ごとの「スクリプトで埋める候補」。
+出力: 先頭に単位ごとの件数(欄の揺れ・増えた行・減った行。構造・値/説明文の内訳つき)、次に構造・値の揺れの大きい欄、
+      説明文の揺れの大きい欄、増えた行・減った行・揺れた欄の一覧(構造・値が先)、
+      末尾に構造・値の揺れだけの単位ごとの「スクリプトで埋める候補」。
 終了コード: 比較できれば 0(差があっても 0)。読めない・JSON でないときは 2。
 
 接続: 単位の引き方は run_units.owner_of と load_units(units.json の owns)を再利用する(分担を二重に持たない)。
@@ -314,10 +315,26 @@ def _show(v):
     return s if len(s) <= SHOW_MAX else s[:SHOW_MAX] + "…"
 
 
-def top_fields(res, n=TOP_N):
-    """揺れが多い欄(添字なしの道筋ごと)の上位。[(道筋, 単位, 件数, 例の1件)]。"""
+# 担当の言い回しが入る説明文の欄の末尾名。G26: 構造・値(型・論理名・件数・識別子・出典)の揺れと数を分け、
+# 説明文の揺れに構造の揺れが埋もれないようにする。呼出元: field_class → top_fields・format_report。
+TEXT_LEAVES = frozenset({"description", "transform_backend", "remarks", "note", "notes", "comment", "comments",
+                         "summary", "memo", "rationale", "explanation"})
+
+
+def field_class(path):
+    """添字なしの道筋の最後の要素(末尾の [] は除く)が TEXT_LEAVES にあれば 'text'、なければ 'struct'。"""
+    leaf = path.rsplit(".", 1)[-1]
+    while leaf.endswith("[]"):
+        leaf = leaf[:-2]
+    return "text" if leaf in TEXT_LEAVES else "struct"
+
+
+def top_fields(res, n=TOP_N, cls=None):
+    """揺れが多い欄(添字なしの道筋ごと)の上位。[(道筋, 単位, 件数, 例の1件)]。cls が 'struct'/'text' ならその種類の欄だけ数える。"""
     by = {}
     for r in res["fields"]:
+        if cls is not None and field_class(r["path"]) != cls:
+            continue
         e = by.setdefault(r["path"], {"unit": r["unit"], "n": 0, "ex": r})
         e["n"] += 1
     ranked = sorted(by.items(), key=lambda kv: (-kv[1]["n"], kv[0]))[:n]
@@ -325,22 +342,30 @@ def top_fields(res, n=TOP_N):
 
 
 def format_report(res):
-    """先頭に単位ごとの件数、次に揺れの大きい欄、行の増減、揺れた欄、末尾に単位ごとの候補。"""
+    """先頭に単位ごとの件数(と構造・値/説明文の内訳)、次に構造・値の揺れの大きい欄、説明文の揺れの大きい欄、行の増減、
+    揺れた欄(構造・値が先)、末尾に単位ごとの候補(構造・値の揺れだけ)。
+    WHY: 説明文は担当の言い回しで毎回揺れる。構造・値(型・論理名・件数・識別子・出典)の揺れを先に見せ、埋もれさせない。"""
     summ = summarize(res)
+    struct_rows = [r for r in res["fields"] if field_class(r["path"]) == "struct"]
+    text_rows = [r for r in res["fields"] if field_class(r["path"]) == "text"]
     tot = {k: len(res[k]) for k in ("fields", "added", "removed")}
     lines = ["=== 単位ごとの件数(欄の揺れ / 増えた行 / 減った行) ==="]
     for u, c in summ.items():
         lines.append(f"  {u}: 欄の揺れ {c['fields']} / 増えた行 {c['added']} / 減った行 {c['removed']}")
     lines.append(f"  合計: 欄の揺れ {tot['fields']} / 増えた行 {tot['added']} / 減った行 {tot['removed']}")
+    lines.append(f"  構造・値の揺れ {len(struct_rows)} 件 / 説明文の揺れ {len(text_rows)} 件")
     lines.append(f"  ({SCRIPT} = units.json の owns に無い欄。比べない欄 = 採番 ID・他の欄への参照 ID・legacy_*・タイムスタンプ類)")
     lines.append("")
-    lines.append(f"=== 揺れが大きい欄(道筋ごと、上位 {TOP_N}) ===")
-    for p, u, n, ex in top_fields(res):
-        lines.append(f"  {n} 件 {p} [{u}]")
-        lines.append(f"    例 {ex['label']}")
-        lines.append(f"      A: {_show(ex['a'])}")
-        lines.append(f"      B: {_show(ex['b'])}")
-    lines.append("")
+    for head, cls in ((f"=== 構造・値の揺れが大きい欄(型・論理名・件数・識別子・出典。道筋ごと、上位 {TOP_N}) ===", "struct"),
+                      ("=== 説明文の揺れが大きい欄(description・transform_backend・remarks など。数だけ見る) ===", "text")):
+        lines.append(head)
+        # top_fields(res, cls='struct') と cls='text' を順に出す(構造・値が先)
+        for p, u, n, ex in top_fields(res, cls=cls):
+            lines.append(f"  {n} 件 {p} [{u}]")
+            lines.append(f"    例 {ex['label']}")
+            lines.append(f"      A: {_show(ex['a'])}")
+            lines.append(f"      B: {_show(ex['b'])}")
+        lines.append("")
     lines.append(f"=== 増えた行(B にだけある): {tot['added']} 件 ===")
     for r in res["added"]:
         lines.append(f"  {r['label']} [{r['unit']}]  {_show(r['value'])}")
@@ -349,15 +374,15 @@ def format_report(res):
     for r in res["removed"]:
         lines.append(f"  {r['label']} [{r['unit']}]  {_show(r['value'])}")
     lines.append("")
-    lines.append(f"=== 揺れた欄: {tot['fields']} 件 ===")
-    for r in res["fields"]:
+    lines.append(f"=== 揺れた欄: {tot['fields']} 件(構造・値 {len(struct_rows)} 件を先、説明文 {len(text_rows)} 件を後) ===")
+    for r in struct_rows + text_rows:
         lines.append(f"  {r['label']} [{r['unit']}]")
         lines.append(f"    A: {_show(r['a'])}")
         lines.append(f"    B: {_show(r['b'])}")
     lines.append("")
-    lines.append("=== スクリプトで埋める候補(揺れた欄を単位ごとに。道筋は添字なし) ===")
+    lines.append("=== スクリプトで埋める候補(構造・値の揺れた欄を単位ごとに。道筋は添字なし) ===")
     by_unit = {}
-    for r in res["fields"]:
+    for r in struct_rows:
         by_unit.setdefault(r["unit"], {}).setdefault(r["path"], 0)
         by_unit[r["unit"]][r["path"]] += 1
     for u in sorted(by_unit, key=lambda x: (x == SCRIPT, x)):
@@ -460,6 +485,17 @@ def selftest():
     assert rep.splitlines()[0].startswith("=== 単位ごとの件数"), rep
     assert "S1: 欄の揺れ 1 / 増えた行 1 / 減った行 0" in rep and "スクリプトで埋める候補" in rep, rep
     assert top_fields(r)[0][0] in ("screen_layout.items[].remarks", "parameters[].type"), top_fields(r)
+    # G26: 説明文の欄と構造・値の欄を分けて数え、構造・値を先に出す
+    assert field_class("screen_layout.items[].remarks") == "text" and field_class("screen_layout.items[].data_type") == "struct"
+    assert field_class("api_spec[].response_items[].transform_backend") == "text"
+    st_paths = {p for p, _, _, _ in top_fields(r, cls="struct")}
+    tx_paths = {p for p, _, _, _ in top_fields(r, cls="text")}
+    assert "parameters[].type" in st_paths and "screen_layout.items[].remarks" not in st_paths, st_paths
+    assert "screen_layout.items[].remarks" in tx_paths and "parameters[].type" not in tx_paths, tx_paths
+    rep_lines = rep.splitlines()
+    i_st = next(i for i, x in enumerate(rep_lines) if "構造・値の揺れが大きい欄" in x)
+    i_tx = next(i for i, x in enumerate(rep_lines) if "説明文の揺れが大きい欄" in x)
+    assert i_st < i_tx and rep_lines[0].startswith("=== 単位ごとの件数"), rep
     # 実際の units.json でも、owns の欄は担当の単位が付く
     real = load_units()
     u0 = next(iter(real))
