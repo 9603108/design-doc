@@ -17,6 +17,8 @@ d(_vs_common.load の戻り)の読み方は _vs_common の docstring。
 【接続情報】
   呼出元: _vs_checks_ext.run_all / selftest(verify_vs_source.main と --selftest から)
 """
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 import ast
 import math
 import operator

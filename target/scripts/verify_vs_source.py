@@ -1297,6 +1297,7 @@ def check_cl_csv_format(common_logic, csv_exports):
 # WHY: 「N行」の数だけを見る。「1行目」「2行以上」のような数は、表の行数と一致しなければ見ない
 _ROW_COUNT = re.compile(r"(\d+)\s*行(?!目)")
 _EXCLUDE_WORDS = re.compile(r"除く|除いた|除き")
+_ROW_QUALIFIED = re.compile(r"(?:(?:表示|含め|含む|オンに)(?:する|した)?(?:と|とき|場合)?は?\s*\d+\s*行|\d+\s*行のうち)")
 
 
 def check_row_count_example(items, display_rows):
@@ -1323,6 +1324,9 @@ def check_row_count_example(items, display_rows):
             for sent in re.split(r"[。\n]", str(it.get(k) or "")):
                 if not _EXCLUDE_WORDS.search(sent):
                     continue
+                # WHY(2026-10-16 run23): 「22行のうち、既定では空欄項目を除く行を出す(空欄項目も表示すると22行)」は、22行を全行数と断った書き方で、除いた数と言っていない。
+                # 「空欄項目も表示すると N行」「N行のうち」の N は、全行数の但し書きとして数えない。
+                sent = _ROW_QUALIFIED.sub("", sent)
                 nums = list(dict.fromkeys(int(x) for x in _ROW_COUNT.findall(sent)))
                 # WHY(2026-10-15 run16): 同じ文に dead を除いた正しい行数(L)も書いてあれば、全行数(T)は「オンのときの数」として並べたもので、
                 # 食い違いではない(「22行(空欄項目を除くと14行)」「既定(空欄項目を除く)は14行で、オンにすると全項目の22行」)。
@@ -1395,6 +1399,9 @@ def selftest():
     assert check_row_count_example(w11_it("22行(空欄項目を除くと14行)"), w11_rows) == [], "正しい行数を併記した文を ERROR にした"
     assert check_row_count_example(w11_it("14行(空欄項目を表示すると22行)", "既定(空欄項目を除く)は14行で、オンにすると全項目の22行になる"), w11_rows) == [], "既定の行数を書いた文を ERROR にした"
     assert len(check_row_count_example(w11_it("22行(空欄項目を除く)", "既定は14行"), w11_rows)) == 1, "正しい行数が別の文にあるだけの誤りを通した"
+    # run23: 「22行のうち、既定では空欄項目を除く行を出す(空欄項目も表示すると22行)」は全行数の但し書き。通す。誤りの書き方は通さない
+    assert check_row_count_example(w11_it("14行", "売上から合計までの22行のうち、既定では空欄項目を除く行を出す(空欄項目も表示すると22行)"), w11_rows) == [], "全行数の但し書きを ERROR にした"
+    assert len(check_row_count_example(w11_it("14行", "表は22行で、空欄項目を除く"), w11_rows)) == 1, "但し書きの無い誤りを通した"
     w11_map = [{"action": "act", "response_to_screen_mapping": [{"api_field_path": "rows[].k0", "screen_item_name": "総売上", "transform": "そのまま表示"}]}]
     w11_items = [{"item_name": "総売上", "format": "#,##0 円"}]
     got = check_transform_format(w11_map, w11_items, w11_rows)

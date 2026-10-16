@@ -17,6 +17,8 @@ meta のファイル一覧(backend_files・frontend_files)、日付の書き方�
 【接続情報】
   呼出元: _vs_checks_ext.run_all / selftest(verify_vs_source.main と --selftest から)
 """
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 import _vs_common
