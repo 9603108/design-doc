@@ -2204,6 +2204,11 @@ def main():
     #           設定の読み込みにも同じ値を明示で渡す（_config_loader のアクセサは sys.argv を見ないため）。
     # 接続情報: sys.argv[1] または FEATURE_NAME = 機能名 / 中間 JSON パス = target/intermediate/{機能名}.json
     #           project_config = target/intermediate/{機能名}_project_config.json（無ければ {}）
+    # --warn-allow-strict: 許可リスト(target/intermediate/{機能名}_warn_allow.json)に無い WARN を不合格(終了コード1)にする選択肢。
+    # 接続情報: run_units.py の gate が付けて呼ぶ。フラグを sys.argv[1] の機能名と取り違えないよう、機能名の解決の前に取り除く。
+    warn_allow_strict = "--warn-allow-strict" in sys.argv
+    if warn_allow_strict:
+        sys.argv.remove("--warn-allow-strict")
     feature = get_feature_name_from_argv()
     target = INTERMEDIATE_DIR / f"{feature}.json"
     project_config = load_project_config(feature)
@@ -2332,6 +2337,23 @@ def main():
 
     if not errors and not warns:
         print("整合性 OK。docx 生成に進めます")
+
+    # --warn-allow-strict: 許可リストに無い WARN(理由つきで登録されていない WARN)が1件でもあれば不合格にする。
+    # 意味合い: 「WARN にはすべて説明がつく」を納品の条件にするため。理由の無い登録は _warn_allow.load_allow が ValueError で拒否する。
+    # 接続情報: run_units.py の gate が呼ぶ。許可リストの形と照合は _warn_allow.py(load_allow・unallowed)。
+    if warn_allow_strict:
+        import _warn_allow
+        try:
+            allow = _warn_allow.load_allow(INTERMEDIATE_DIR / f"{feature}_warn_allow.json")
+        except ValueError as e:
+            print(f"[ERROR] 許可リストが不正: {e}")
+            sys.exit(1)
+        bad = _warn_allow.unallowed([msg for _lvl, msg in warns], allow)
+        if bad:
+            for msg in bad:
+                print(f"  [WARN] {msg}")
+            print(f"[ERROR] 許可リストに無い WARN {len(bad)} 件")
+            sys.exit(1)
 
     # 終了コード: ERROR があれば 1、なければ 0
     sys.exit(1 if errors else 0)

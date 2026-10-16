@@ -1898,8 +1898,12 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
         return selftest()
+    # --warn-allow-strict: 許可リスト({機能名}_warn_allow.json)に無い WARN を不合格(戻り値1)にする選択肢。run_units.py の gate が付けて呼ぶ。
+    # フラグが先頭に来ても機能名と取り違えないよう、argv から取り除いてから機能名を読む。
+    warn_allow_strict = "--warn-allow-strict" in argv
+    argv = [x for x in argv if x != "--warn-allow-strict"]
     if not argv:
-        print("使い方: verify_vs_source.py <機能名> | --selftest", file=sys.stderr)
+        print("使い方: verify_vs_source.py <機能名> [--warn-allow-strict] | --selftest", file=sys.stderr)
         return 2
     from _config_loader import INTERMEDIATE_DIR
     feat = argv[0]
@@ -1992,6 +1996,21 @@ def main(argv=None):
     print(f"[INFO] 例示値の行数・transform の書式の照合: ERROR {len(w11_problems)} 件")
     # 形の照合: ERROR 行は末尾に差し戻し先の印を持つ。無い行は、差し戻し先が欄名の引き当て頼み(引けなければ unknown)になる。
     print(form_info_line(all_lines))
+    # --warn-allow-strict: 許可リストに無い WARN が1件でもあれば不合格にする。「WARN にはすべて説明がつく」を納品の条件にするため。
+    # 理由の無い登録は _warn_allow.load_allow が ValueError で拒否する。接続: run_units.py の gate が呼ぶ。
+    if warn_allow_strict:
+        import _warn_allow
+        try:
+            allow = _warn_allow.load_allow(Path(INTERMEDIATE_DIR) / f"{feat}_warn_allow.json")
+        except ValueError as e:
+            print(f"[ERROR] 許可リストが不正: {e}")
+            return 1
+        bad = _warn_allow.unallowed([p for p in all_lines if p.startswith("[WARN]")], allow)
+        if bad:
+            for p in bad:
+                print(p)
+            print(f"[ERROR] 許可リストに無い WARN {len(bad)} 件")
+            return 1
     # WHY: 終了コードは、WARN の接頭辞が無い行(ERROR)が1件でもあれば 1。WARN だけでは止めない
     return 1 if any(not p.startswith("[WARN]") for p in all_lines) else 0
 

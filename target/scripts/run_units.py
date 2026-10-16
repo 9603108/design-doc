@@ -8,17 +8,21 @@ WHY: メインが手で組んでいた「単位ごとの依頼文」「検査後
   prompts <機能名> --out <json> [--src <path>]...  各単位の Agent に渡す依頼文を書く
   after <機能名>                                    検査→後段を順に流し、ERROR で止めて差し戻しを JSON で出す
   retry <機能名> <単位> --issues <json>             差し戻しの文面を足した依頼文を出す
+  gate <機能名>                                     after・許可リスト照合・audit の合否を1つ出す(全部合格なら exit 0)
+  save-run <機能名> <run名> [--log <path>]...  中間JSON・断片・検査ログ・docx を target/runs/<run名>/ に控える
 
 接続: メインは Bash を使わないので、この script は tool-worker に流させる(メインが直に流さない)。
 prompts の出力は呼出元(メイン)が Agent の prompt に渡し、担当は型 design-doc-unit で起動する
 (model は units.json の値を Agent の model に明示する)。after は単位の書込みが終わった後に
 tool-worker が流す。retry は after が出した sendbacks を受けて、その単位だけ呼び直す。
 出力先(--out など)は target/ の配下に置く(/private/tmp の外)。
+run の保存(save-run)も /private/tmp の片付けで消えないよう target/ の配下に置く。
 標準ライブラリのみ。
 """
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -276,6 +280,61 @@ def run_after(feat):
     return 0
 
 
+def run_gate(feat):
+    """納品の合否を1つにまとめる関門。
+
+    WHY: after(ERROR)・WARN の許可リスト照合・audit の差し戻しが別々に出ると、どれが残っているかをメインが読み分けることになる。
+    全部そろったときだけ exit 0 にして、合格の条件(ERROR 0・説明のない WARN 0・audit の差し戻し 0)を1か所に置く。
+    出力は {ok, after_ok, warn_unallowed, audit_ng} に、不合格の中身(after・warn_skipped・audit_reason)を足した JSON を1回。
+    呼出元: main の gate。再利用: run_after・audit_sendbacks・load_units(subprocess の呼び方は run_after に任せ、複製しない)。"""
+    import contextlib
+    import io
+    import _warn_allow
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        after_rc = run_after(feat)
+    result = {"after_ok": after_rc == 0}
+    if after_rc != 0:
+        # run_after が出した JSON(stopped_at・sendbacks)をそのまま載せる。JSON でなければ出力の文字を残す
+        try:
+            result["after"] = json.loads(buf.getvalue())
+        except ValueError:
+            result["after"] = buf.getvalue()[-800:]
+    # WHY: after が合格している(ERROR 0)ので、--warn-allow-strict の非0は「許可リストに無い WARN」と読める。
+    # ERROR で止まっているときは WARN の判定が意味を持たないので評価しない。
+    unallowed_warn = []
+    if after_rc == 0:
+        # WHY: 理由の空な登録など不正な許可リストは load_allow が ValueError にする。例外で落とさず、不合格として
+        # 理由を出し(JSON 出力と return 1 に必ず届かせる)、許可リストの裏付けが無いので 2 本の検査は流さない。
+        try:
+            allow = _warn_allow.load_allow(INTER / f"{feat}_warn_allow.json")
+        except ValueError as e:
+            allow = None
+            unallowed_warn.append(f"許可リストが不正: {e}")
+        for script in (("verify_vs_source.py", "verify_intermediate.py") if allow is not None else ()):
+            cmd = f"python3 target/scripts/{script} {feat} --warn-allow-strict"
+            p = subprocess.run(cmd, shell=True, cwd=SKILL, capture_output=True, text=True)
+            if p.returncode != 0:
+                out = p.stdout + p.stderr
+                lines = _warn_allow.unallowed(_warn_allow.split_warns(out.splitlines()), allow) or fallback_unknown(out, cmd)
+                unallowed_warn += [f"{script}: {ln}" for ln in lines]
+    else:
+        result["warn_skipped"] = True
+    result["warn_unallowed"] = unallowed_warn
+    # audit: 結果ファイルが無い・壊れているときは握りつぶさず不合格(audit 未実施)
+    results_p = INTER / f"{feat}_audit_results.json"
+    audit_ng = 0
+    try:
+        audit_ng = len(audit_sendbacks(json.loads(results_p.read_text(encoding="utf-8")), load_units()))
+    except (OSError, ValueError) as e:
+        audit_ng = 1
+        result["audit_reason"] = f"audit 未実施(結果を読めない: {results_p.name}: {e})"
+    result["audit_ng"] = audit_ng
+    ok = result["after_ok"] and not unallowed_warn and audit_ng == 0
+    print(json.dumps({"ok": ok, **result}, ensure_ascii=False, indent=2))
+    return 0 if ok else 1
+
+
 def selftest():
     s = parse_sendbacks("x ERROR foo → 差し戻し先 S1\nok\n  bar → 差し戻し先 H2,H3\n")
     assert sorted(s) == ["H2", "H3", "S1"], s
@@ -385,6 +444,75 @@ def selftest():
             assert pr == {} and len(v) == 30, pr
         finally:
             INTER = old
+    # save_run: 一時ディレクトリに置いた成果物を控え、他機能・既存の run・不正な run 名・無いログを区別して止める
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td)
+        (t / "i").mkdir()
+        (t / "o").mkdir()
+        for name in ("テスト機能.json", "テスト機能_audit_results.json", "_unit_S1.json", "_partial_backend.json", "他機能.json", "テスト機能長.json"):
+            (t / "i" / name).write_text("{}", encoding="utf-8")
+        (t / "o" / "詳細設計書_テスト機能.docx").write_text("d", encoding="utf-8")
+        (t / "a.log").write_text("log", encoding="utf-8")
+        kw = {"runs_root": t / "r", "inter": t / "i", "output_dir": t / "o"}
+        dest, copied, skipped = save_run("テスト機能", "runX", logs=[t / "a.log"], **kw)
+        assert dest == t / "r" / "runX" and skipped == [], (dest, skipped)
+        for rel in ("json/テスト機能.json", "json/テスト機能_audit_results.json", "fragments/_unit_S1.json", "fragments/_partial_backend.json", "docx/詳細設計書_テスト機能.docx", "logs/a.log"):
+            assert rel in copied and (dest / rel).is_file(), (rel, copied)
+        assert not (dest / "json" / "他機能.json").exists() and not (dest / "json" / "テスト機能長.json").exists(), "他機能を拾った"
+        (t / "o" / "詳細設計書_テスト機能.docx").unlink()
+        assert "docx" in save_run("テスト機能", "runY", **kw)[2], "docx が無いときは skipped に出る"
+        for call, exc in ((lambda: save_run("テスト機能", "runX", **kw), FileExistsError),
+                          (lambda: save_run("テスト機能", "../x", **kw), ValueError),
+                          (lambda: save_run("テスト機能", "runZ", logs=[t / "無い.log"], **kw), FileNotFoundError)):
+            try:
+                call()
+            except exc:
+                continue
+            raise AssertionError(f"{exc.__name__} にならない")
+    # run_gate: run_after・subprocess.run・INTER を差し替え、4つの合否の組を見る。差し替えは必ず戻す
+    class _Proc:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+    ng_row = [{"id": "AC001", "kind": "remarks", "owner": "S1", "text": "t", "verdict": "ng", "reason": "r"}]
+    ok_row = [dict(ng_row[0], verdict="ok")]
+    g = globals()
+    old_after, old_run, old_inter = g["run_after"], subprocess.run, INTER
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            INTER = Path(td)
+            audit_p = Path(td) / "機能_audit_results.json"
+
+            def gate(after_rc, warn_rc, rows):
+                g["run_after"] = lambda feat: (print(json.dumps({"stopped_at": "x", "sendbacks": {}})) or after_rc)
+                subprocess.run = lambda cmd, **kw: _Proc(warn_rc, "[WARN] db_operations[DB1] 空\n[ERROR] 許可リストに無い WARN 1 件")
+                if rows is None:
+                    audit_p.unlink(missing_ok=True)
+                else:
+                    audit_p.write_text(json.dumps(rows), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_gate("機能")
+                return rc, json.loads(buf.getvalue())
+            rc, o = gate(1, 0, ok_row)
+            assert rc == 1 and not o["ok"] and not o["after_ok"] and o.get("warn_skipped") and o["warn_unallowed"] == [], o
+            rc, o = gate(0, 1, ok_row)
+            assert rc == 1 and o["after_ok"] and any("db_operations[DB1]" in w for w in o["warn_unallowed"]), o
+            rc, o = gate(0, 0, ng_row)
+            assert rc == 1 and o["audit_ng"] == 1 and o["warn_unallowed"] == [], o
+            rc, o = gate(0, 0, ok_row)
+            assert rc == 0 and o["ok"] and o["audit_ng"] == 0, o
+            rc, o = gate(0, 0, None)
+            assert rc == 1 and "audit 未実施" in o["audit_reason"], o
+            # 理由の空な許可リストは例外で落とさず不合格(JSON が読め ok が偽、検査の subprocess は流れない)
+            bad_p = Path(td) / "機能_warn_allow.json"
+            bad_p.write_text(json.dumps({"allow": [{"key": "x", "reason": "", "date": "2026-10-16"}]}), encoding="utf-8")
+            try:
+                rc, o = gate(0, 0, ok_row)
+            finally:
+                bad_p.unlink()
+            assert rc == 1 and not o["ok"] and any("許可リストが不正" in w for w in o["warn_unallowed"]), o
+    finally:
+        g["run_after"], subprocess.run, INTER = old_after, old_run, old_inter
     check_step_args("テスト機能")
 
 
@@ -505,6 +633,45 @@ def audit_part_problems(feat, prompts):
     return verdicts, problems
 
 
+def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
+    """run の成果物(中間JSON・断片・検査ログ・docx)を target/runs/<run名>/ に控える。
+
+    WHY: /private/tmp の片付けで run17・run18 が消えたため。回し直しの比較をするには過去の run が残っている必要がある。
+    他の run を壊さないよう保存先が既にあれば FileExistsError。無い対象は黙って飛ばさず skipped に返す。
+    呼出元: main の save-run(メインの tool-worker が after と audit-check の後に流す)。
+    戻り: (dest, copied(dest からの相対パス), skipped(控えられなかった対象の名前))。"""
+    if not run or "/" in run or ".." in run:
+        raise ValueError(f"run 名が不正(空・'/'・'..' は不可): {run!r}")
+    inter = Path(inter) if inter else INTER
+    output_dir = Path(output_dir) if output_dir else SKILL / "target" / "output"
+    dest = (Path(runs_root) if runs_root else SKILL / "target" / "runs") / run
+    if dest.exists():
+        raise FileExistsError(f"既にある run は上書きしない: {dest}")
+    log_paths = [Path(x) for x in logs]
+    for lp in log_paths:
+        if not lp.is_file():
+            raise FileNotFoundError(f"検査ログが無い: {lp}")
+    # 名前は feat と完全一致か feat_ 始まりに絞る(名前が feat で始まる他機能を拾わない)
+    groups = [
+        ("json", "中間JSON", [inter / f"{feat}.json"] + sorted(inter.glob(f"{feat}_*.json"))),
+        ("fragments", "断片(_unit_*.json・_partial_*.json)", sorted(inter.glob("_unit_*.json")) + sorted(inter.glob("_partial_*.json"))),
+        ("docx", "docx", [output_dir / f"詳細設計書_{feat}.docx"]),
+        ("logs", "検査ログ", log_paths),
+    ]
+    copied, skipped = [], []
+    for folder, label, files in groups:
+        files = [f for f in files if f.is_file()]
+        if not files:
+            skipped.append(label)
+            continue
+        (dest / folder).mkdir(parents=True, exist_ok=True)
+        for f in files:
+            shutil.copy2(f, dest / folder / f.name)
+            copied.append(f"{folder}/{f.name}")
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest, copied, skipped
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="design-doc の単位方式を機械化する")
     ap.add_argument("--selftest", action="store_true")
@@ -523,6 +690,12 @@ def main(argv=None):
     p4.add_argument("feature")
     p5 = sub.add_parser("audit", help="判定項目を作り、判定の依頼文(25件ずつ)を書く")
     p5.add_argument("feature")
+    p6 = sub.add_parser("gate", help="after・許可リスト照合・audit の合否を1つ出す")
+    p6.add_argument("feature")
+    p7 = sub.add_parser("save-run", help="中間JSON・断片・検査ログ・docx を target/runs/<run名>/ に控える")
+    p7.add_argument("feature")
+    p7.add_argument("run")
+    p7.add_argument("--log", action="append", default=[], help="検査ログのパス。複数可")
     a = ap.parse_args(argv)
 
     if a.selftest:
@@ -540,6 +713,8 @@ def main(argv=None):
         return 0
     if a.cmd == "after":
         return run_after(a.feature)
+    if a.cmd == "gate":
+        return run_gate(a.feature)
     if a.cmd == "retry":
         units = load_units()
         # WHY: units 表に無い名前(S0・unknown・誤記)は単位ではない。KeyError の追跡でなく、何を直すかの文言で止める。
@@ -673,6 +848,16 @@ def main(argv=None):
             out["retry"] = {"subagent_type": SUBAGENT_TYPE, "model": "sonnet", "out": str(retry_out), "unknown": len(unknown), "prompt": prompt}
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 1 if sendbacks else 0
+    if a.cmd == "save-run":
+        # WHY: run の成果物を /private/tmp の片付けで失わないよう target/runs/ に控える。呼出元: メインの tool-worker(after と audit-check の後)。
+        # 飛ばしがあっても控えたことは成立するので 0。上書き・不正な run 名・無いログは握りつぶさず 2。
+        try:
+            dest, copied, skipped = save_run(a.feature, a.run, logs=a.log)
+        except (FileExistsError, ValueError, FileNotFoundError) as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        print(f"保存先: {dest}\n控えた: {len(copied)} 件\n飛ばした: {'・'.join(skipped) or 'なし'}")
+        return 0
     ap.print_help()
     return 2
 
