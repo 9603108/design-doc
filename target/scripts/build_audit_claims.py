@@ -590,12 +590,105 @@ def _add_server_defs(ex, merged, project_root, statement):
                 taken += ex.add(p, start, _block_end(plines, start, BLOCK_MAX), f"サーバ処理: {action or path}", BLOCK_MAX)
 
 
-def _expand(ex, merged, project_root, statement, src):
+def _resp_leaf(key):
+    """応答の項目の key("rows[].days"・"data.rows" など)の末尾の名前("days"・"rows")。名前の形でなければ空文字。"""
+    parts = [x for x in re.split(r"[.\[\]]+", str(key or "")) if x]
+    return parts[-1] if parts and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", parts[-1]) else ""
+
+
+def _response_apis(merged, subject, statement, src_lines):
+    """判定項目が API の応答の値を述べるなら、その API(api_spec の行)を出現順・重複なしで返す。呼出元 = _add_response_backend。
+    決め方は機械的な突き合わせだけ(どちらか):
+    (a) response_to_screen_mapping の screen_item_name が、項目の主語か文に「名前」の形で出て、その api_field_path の末尾の名前が出典の行に識別子として出る
+    (b) 出典の行に `.名前` の形(応答の値の参照。r.days・d.rows)で出る名前が、ただ1つの API の response_items[].key の末尾の名前に当たる
+    WHY(run23 AC015・AC017): 画面の副題は rows.length・r.days を出すだけで、数え方はバックエンドの集計で決まる。文が数え方を述べても、
+    依頼文に画面のソースしか載らず unknown のまま残った。応答の値に触れない項目には足さない(推測で全項目に足さない)。"""
+    text = f"{subject}\n{statement}"
+    src_text = "\n".join(src_lines)
+    apis = [a for a in merged.get("api_spec") or [] if isinstance(a, dict)]
+    owners = {}  # 応答の末尾の名前 -> それを返す API の番号の集合((b) の「ただ1つ」の判定に使う)
+    for k, a in enumerate(apis):
+        for it in a.get("response_items") or []:
+            leaf = _resp_leaf(it.get("key")) if isinstance(it, dict) else ""
+            if leaf:
+                owners.setdefault(leaf, set()).add(k)
+    picked = []
+    for k, a in enumerate(apis):
+        hit = False
+        for mp in a.get("response_to_screen_mapping") or []:
+            if not isinstance(mp, dict):
+                continue
+            name, leaf = str(mp.get("screen_item_name") or "").strip(), _resp_leaf(mp.get("api_field_path"))
+            if name and leaf and f"「{name}」" in text and re.search(rf"(?<![\w$]){re.escape(leaf)}\b", src_text):
+                hit = True
+                break
+        if not hit:
+            hit = any(owners.get(leaf) == {k} for leaf in re.findall(r"\.([A-Za-z_][A-Za-z0-9_]*)\b", src_text))
+        if hit:
+            picked.append(a)
+    return picked
+
+
+def _backend_src_of_action(merged, project_root, api, cache):
+    """API の action を処理するバックエンドの (ファイルの Path, 0 始まりの行) を返す。引けなければ None。
+    引く順: api_spec の行の src → 同じ action の backend_processes の src → meta.backend_files の中の `def <action>(`。"""
+    action = str(api.get("action") or (api.get("endpoint") or {}).get("action") or "")
+    s = _src_of(api)
+    if not s and action:
+        s = next((_src_of(b) for b in merged.get("backend_processes") or []
+                  if isinstance(b, dict) and str((b.get("endpoint") or {}).get("action") or "") == action and _src_of(b)), None)
+    if s:
+        return _resolve(s["file"], project_root), s["line_start"] - 1
+    if not action:
+        return None
+    for bf in (merged.get("meta") or {}).get("backend_files") or []:
+        f = bf.get("path") if isinstance(bf, dict) else bf
+        if not f:
+            continue
+        p = _resolve(str(f), project_root)
+        for i, ln in enumerate(_read_lines(p, cache) or []):
+            if re.match(rf"\s*(?:async\s+)?def\s+{re.escape(action)}\s*\(", ln):
+                return p, i
+    return None
+
+
+def _add_response_backend(ex, merged, project_root, statement, subject, src):
+    """判定項目が API の応答の値(画面で d.rows・r.days のように受け取った値)を述べるとき、その API の action を処理する
+    バックエンドの関数を足す。呼出元 = _expand。ファイルは files_out(src_files)に入るので、依頼文は上限内なら全文、超えるなら
+    この断片を抜粋の節で載せる(run_units._audit_sources)。どの項目に足すかは _response_apis が決める。最大2件。"""
+    path0 = ex.segs[0][0]
+    lines0 = _read_lines(path0, ex.cache) or []
+    ls = max(int(src.get("line_start") or 1), 1)
+    le = max(int(src.get("line_end") or ls), ls)
+    taken = 0
+    for api in _response_apis(merged, subject, statement, lines0[ls - 1:le]):
+        if taken >= 2:
+            return
+        got = _backend_src_of_action(merged, project_root, api, ex.cache)
+        if not got:
+            continue
+        p, i0 = got
+        # WHY(run23 AC132): 出典がサーバ側のファイルそのもの("p.reji_no" のような SQL の列名)の項目は、応答の値を受け取る側ではない。
+        # そのファイルは主抜粋として src_files に入っているので、足さない
+        if Path(p).resolve() == Path(path0).resolve():
+            continue
+        plines = _read_lines(p, ex.cache) or []
+        if not plines:
+            continue
+        i0 = min(max(i0, 0), len(plines) - 1)
+        start = next((k for k in range(i0, max(i0 - BLOCK_MAX, -1), -1)
+                      if re.match(r"\s*(?:async\s+)?def\s", plines[k])), i0)
+        label = f"応答の値を返すサーバ処理: {api.get('action') or api.get('path') or ''}"
+        taken += ex.add(p, start, _block_end(plines, start, BLOCK_MAX), label, BLOCK_MAX)
+
+
+def _expand(ex, merged, project_root, statement, src, subject=None):
     """主抜粋(ex の先頭の断片)の後ろに、判定に要る参照先を足す。呼出元 = _excerpt。
     足す順(優先度の高い順): (1) 文中の [BE1] 等の定義元 (2) 主抜粋が呼ぶ関数・使う定数の本体 (3) 主抜粋が呼ぶ state の更新関数の定義行
     (4) その state を依存配列に持つ hook と、その hook を起動する useEffect (5) 別ファイルから import した関数の本体(参照先の中の呼出しも)
     (1c) 主抜粋の要素の表示条件の行 (1c2) 参照する state の宣言と初期値 (1c3) その state を更新するイベントハンドラ
-    (1c4) 非同期処理の then/catch/finally (1c5) 文が名指しする API のサーバ側の該当関数 (1d) 文中の識別子の定義(予算を (2)〜(5) が使い切る前に確保する)
+    (1c4) 非同期処理の then/catch/finally (1c5) 文が名指しする API のサーバ側の該当関数
+    (1c6) 出典の行が API の応答の値を使う項目の、その action のサーバ側の関数(subject は項目の主語。応答と画面項目の対応を引くのに使う。None なら行わない) (1d) 文中の識別子の定義(予算を (2)〜(5) が使い切る前に確保する)
     WHY: 参照先を決めるのは識別子の一致だけで、案件固有の名前・語は使わない。"""
     path0, s0, e0, _l, body0 = ex.segs[0]
     lines0 = _read_lines(path0, ex.cache) or []
@@ -628,6 +721,8 @@ def _expand(ex, merged, project_root, statement, src):
     _add_setter_updates(ex, path0, lines0, statement)
     _add_promise_chain(ex, path0, lines0, statement)
     _add_server_defs(ex, merged, project_root, statement)
+    if subject is not None:
+        _add_response_backend(ex, merged, project_root, statement, subject, src)
     calls, setters, rest = _idents(body0)
     base = path0.parent
     imports = _imports(lines0, base)
@@ -683,14 +778,16 @@ def _expand(ex, merged, project_root, statement, src):
                 take_def(path, plines, name, DEPTH2_BLOCK_MAX)
 
 
-def _excerpt(src, project_root, cache, merged=None, statement="", budget=None, files_out=None, segs_out=None):
+def _excerpt(src, project_root, cache, merged=None, statement="", budget=None, files_out=None, segs_out=None, subject=None):
     """src の行の前後 EXCERPT_CONTEXT 行(主抜粋)と、merged があれば文が指す参照先を足した抜粋を返す。読めなければ空文字。
     WHY: 出典の file は絶対パスと project_root 基準の相対が混ざるため、両方に対応する。cache はファイルごとの行の一覧。
     budget は全体の行数の予算(None なら EXCERPT_TOTAL)。build_claims が再判定用に EXCERPT_TOTAL_WIDE で呼び直す。
     files_out が list なら、主抜粋と参照先の断片が読んだファイルの絶対パス(str)を重複なく出現順に足す。
     WHY: 照合の依頼文(run_units.py)が、抜粋の代わりに各ファイルの全文を載せられるようにするため(G18)。
     segs_out が list なら、断片ごとに {file(絶対パス), line_start, line_end, label, lines} を出現順に足す。
-    WHY: 大きすぎて全文を載せられないファイルだけ、依頼文がそのファイルぶんの断片を抜粋の節に出すため。他のファイルは全文で載せる。"""
+    WHY: 大きすぎて全文を載せられないファイルだけ、依頼文がそのファイルぶんの断片を抜粋の節に出すため。他のファイルは全文で載せる。
+    subject は項目の主語(画面項目「…」など)。None でなければ、応答の値を述べる項目にサーバ側の関数を足す(_expand の (1c6))。
+    WHY: build_claims は広い抜粋(src_files・src_segs を集める呼出し)だけに渡し、キャッシュ照合の抜粋(src_excerpt)は変えない。"""
     path = _resolve(src["file"], project_root)
     lines = _read_lines(path, cache)
     if lines is None:
@@ -703,7 +800,7 @@ def _excerpt(src, project_root, cache, merged=None, statement="", budget=None, f
     ex.total = le - ls + 1
     if merged is not None:
         try:
-            _expand(ex, merged, project_root, statement, src)
+            _expand(ex, merged, project_root, statement, src, subject)
         except (OSError, ValueError, RecursionError):
             pass  # 参照先の追加に失敗しても、主抜粋だけは返す
     if files_out is not None:
@@ -794,7 +891,8 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
         # 再判定(unknown の見直し)用に、予算を広げた抜粋も添える。キャッシュ照合は上の excerpt(従来の予算)で行うので内容を変えない
         src_files = []  # 抜粋が読んだファイル(主+参照先)。再判定の抜粋と同じ範囲で集める
         src_segs = []  # 断片ごとの出典(ファイル・行範囲・ラベル・行)。全文を載せられないファイルの抜粋の節に使う
-        excerpt_wide = _excerpt(src, project_root, cache, merged, text_orig, EXCERPT_TOTAL_WIDE, src_files, src_segs)
+        excerpt_wide = _excerpt(src, project_root, cache, merged, text_orig, EXCERPT_TOTAL_WIDE, src_files, src_segs,
+                                subject=subject or "")  # 応答の値を述べる項目はサーバ側の関数も載せる(1c6)
         claims.append({
             "id": f"AC{len(claims) + 1:03d}",
             "kind": kind,
@@ -1044,6 +1142,57 @@ def _selftest():
             if need not in ex_b:
                 print(f"[selftest NG] G14 別の state へ写す更新 {need!r} が抜粋に入らない: {ex_b!r}")
                 return 1
+        # (1c6) 応答の値を述べる項目にだけ、その action のサーバ側の関数を足す(run23 AC015・AC017)。
+        # (a) 応答と画面項目の対応(rows → 「合計副題」)、(b) ただ1つの API が返す名前の参照(r.days)。応答に触れない項目・サーバ側のファイル自身の項目には足さない
+        rb_ui = Path(tmp) / "rb.tsx"
+        rb_ui.write_text("\n".join([
+            "const a = 1;", "const b = 2;", "const c = 3;",
+            "  subtitle={`${applied.from} / ${rows.length}件`}",
+            "const d = 4;", "const e = 5;", "const f = 6;",
+            "  subtitle={`${r.name}（${r.days}日）`}",
+            "const g = 7;", "const h = 8;", "const i = 9;",
+            "const title = '見出し';", "const j = 10;", "const k = 11;"]) + "\n", encoding="utf-8")
+        rb_be = Path(tmp) / "rb_be.py"
+        rb_be.write_text("\n".join([
+            "def list_r(params):", "    rows = run_sql('SELECT p.days FROM t GROUP BY p.shop')", "    return {'rows': rows}", "",
+            "def list_s(params):", "    return {'rows': []}", "",
+            "def list_t(params):", "    return {'rows': []}"]) + "\n", encoding="utf-8")
+        rb_merged = {
+            "screen_layout": {"items": [
+                {"item_name": "合計副題", "remarks": "件数は店ごとの行数", "src": [{"file": str(rb_ui), "line_start": 4, "line_end": 4}]},
+                {"item_name": "会計副題", "remarks": "括弧内は日数", "src": [{"file": str(rb_ui), "line_start": 8, "line_end": 8}]},
+                {"item_name": "見出し", "remarks": "固定の文言を出す", "src": [{"file": str(rb_ui), "line_start": 12, "line_end": 12}]}]},
+            "common_logic": [{"no": "CL1", "name": "束ねる列", "description": "店ごとに束ねる",
+                              "src": [{"file": str(rb_be), "line_start": 2, "line_end": 2}]}],
+            "api_spec": [
+                {"no": "AP1", "action": "list_r", "src": [{"file": str(rb_be), "line_start": 1, "line_end": 3}],
+                 "response_items": [{"key": "rows"}, {"key": "rows[].days"}, {"key": "rows[].name"}],
+                 "response_to_screen_mapping": [{"api_field_path": "rows", "screen_item_name": "合計副題"}]},
+                {"no": "AP2", "action": "list_s", "response_items": [{"key": "rows"}, {"key": "rows[].name"}]}],
+            "backend_processes": [{"process_id": "BE2", "endpoint": {"action": "list_s"}, "src": [{"file": str(rb_be), "line_start": 5, "line_end": 6}]}],
+        }
+        rb_c = {c["subject"]: c for c in build_claims(rb_merged, "", set(), units)}
+        rb_got = {k: [s["label"] for s in c["src_segs"] if (s["label"] or "").startswith("応答の値を返すサーバ処理")] for k, c in rb_c.items()}
+        rb_want = {"合計副題": ["応答の値を返すサーバ処理: list_r"], "会計副題": ["応答の値を返すサーバ処理: list_r"],
+                   "見出し": [], "束ねる列": []}
+        rb_short = {next((w for w in rb_want if f"「{w}」" in k), k): v for k, v in rb_got.items()}
+        if rb_short != rb_want:
+            print(f"[selftest NG] (1c6) 応答の値を述べる項目だけにサーバ側の関数が足されていない: {rb_short}")
+            return 1
+        rb_sum = next(c for k, c in rb_c.items() if "「合計副題」" in k)
+        if str(rb_be) not in rb_sum["src_files"] or str(rb_be) in rb_c[next(k for k in rb_c if "「見出し」" in k)]["src_files"]:
+            print(f"[selftest NG] (1c6) サーバ側のファイルが src_files(全文の節の対象)に入らないか、応答に触れない項目に入った: {rb_sum['src_files']}")
+            return 1
+        if "def list_r" in rb_sum["src_excerpt"] or rb_sum["src_excerpt"] != _excerpt({"file": str(rb_ui), "line_start": 4, "line_end": 4}, "", {}, rb_merged, rb_sum["text"]):
+            print("[selftest NG] (1c6) キャッシュ照合の抜粋(src_excerpt)が変わった")
+            return 1
+        # action の処理の引き方: api_spec の src → backend_processes の src → meta.backend_files の def <action>(
+        rb_m2 = dict(rb_merged, meta={"backend_files": [{"path": str(rb_be), "kind": "backend"}]})
+        rb_src = [_backend_src_of_action(rb_m2, "", {"action": a, **({"src": [{"file": str(rb_be), "line_start": 1}]} if a == "list_r" else {})}, {})
+                  for a in ("list_r", "list_s", "list_t", "list_none")]
+        if [x and x[1] for x in rb_src] != [0, 4, 7, None]:
+            print(f"[selftest NG] (1c6) action からサーバ側の処理を引けない: {rb_src}")
+            return 1
     # 設計書の番号の名前つき置き換え: 引ける番号は名前と action を添え、引けない番号はそのまま残す
     lab = _id_labels({"backend_processes": [{"process_id": "BE2", "name": "POS会計レポートの取得",
                                            "endpoint": {"action": "list_pos_account_report"}}],
