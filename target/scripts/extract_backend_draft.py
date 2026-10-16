@@ -1314,9 +1314,11 @@ def _field_sources(a):
         f["src"] = [{k: s[k] for k in ("file", "line_start", "line_end")} for s in o["src"]]
 
 
-def extract(files, hints=None):
+def extract(files, hints=None, actions=None):
     """backend ファイル(Path の並び)から {apis, unresolved} を作る。
-    hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。"""
+    hints は論理名の候補の材料 {ddl: _ddl(), ui: _ui_specs(), types: _type_blocks()}。無ければ guess だけになる。
+    actions: この画面が呼ぶ action の集合。与えると apis にはそれだけを載せる(共通モジュールの表にある他画面の action は載せない。
+    共通モジュールは、その action の処理が呼ぶ関数を辿るためだけに読む)。None なら表の全 action を載せる。"""
     hints = hints or {}
     mods = {p.stem: Module(p) for p in files}
     # csv_header: backend の定数の辞書、または (列名, 日本語の見出し) の組の並びから、列名→見出しを取る。位置だけで対応する配列は推測しない
@@ -1360,6 +1362,8 @@ def extract(files, hints=None):
                 if tm is None or name not in tm.funcs:
                     continue  # backend_files に無いモジュール(または関数でない値)は対象外
                 action, fn = k.value, tm.funcs[name]
+                if actions is not None and action not in actions:
+                    continue  # 他画面の action(画面の呼出から決まる集合に無い)
                 dataset, errors, seen_col, ops = [], [], set(), []
                 clauses = {k: [] for k in _CLAUSE_KEYS}
                 clo = _closure(tm, fn, mods)
@@ -1688,8 +1692,64 @@ def selftest():
         for order in (["b.py", "a.py"], ["a.py", "b.py"]):
             got = list(extract([Path(d) / n for n in order])["apis"])
             assert got == ["a1", "b1"], f"入口モジュールが複数のとき apis の並びが backend_files の順に左右された: {order} → {got}"
+    # 画面が呼ぶ action(actions)を渡すと、共通モジュールの表にある他画面の action は載らない。共通モジュールの関数は辿る
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "h.py").write_text('import q\nA = {"mine": q.fm, "other": q.fo}\n', encoding="utf-8")
+        (Path(d) / "q.py").write_text(
+            'def helper(p):\n    return "SELECT c.m_col FROM trade.sales_closes c"\n'
+            'def fm(p):\n    s = helper(p)\n    return {"k": s}\n'
+            'def fo(p):\n    return {"o": "SELECT x.o_col FROM other.t x"}\n', encoding="utf-8")
+        fs = [Path(d) / "h.py", Path(d) / "q.py"]
+        assert set(extract(fs)["apis"]) == {"mine", "other"}
+        got = extract(fs, actions={"mine"})
+        assert set(got["apis"]) == {"mine"}, list(got["apis"])
+        assert any(r["table"] == "trade.sales_closes" for r in got["apis"]["mine"]["dataset"]), got["apis"]["mine"]["dataset"]
+        # _screen_actions: react_draft の api_endpoint.action を読む。決まらなければ None(全部載せる)
+        (Path(d) / "x_react_draft.json").write_text('{"db_operations": [{"api_endpoint": {"action": "mine"}}]}', encoding="utf-8")
+        assert _screen_actions({}, Path(d) / "x_screen_config.json", None) == {"mine"}
+        assert _screen_actions({"api_actions": ["a", "b"]}, Path(d) / "y_screen_config.json", None) == {"a", "b"}
+        assert _screen_actions({"feature_name": "zz_none"}, Path(d) / "z_screen_config.json", Path(d) / "none.json") is None
     print("[selftest OK] extract_backend_draft")
     return 0
+
+
+def _screen_actions(cfg, cfg_path, react_draft):
+    """この画面が呼ぶ action の集合を返す。決められなければ None(呼び側は全 action を載せて WARN を出す)。
+    優先: screen_config.api_actions(明示) → react_draft.json の db_operations[].api_endpoint.action
+    (--react-draft、無ければ screen_config と同じフォルダの <名前>_react_draft.json、無ければ target/intermediate/<feature_name>_react_draft.json)
+    → source_files の中の api_call_functions(<名前>_project_config.json)の呼出 fn('action', ...) の第1引数。"""
+    acts = cfg.get("api_actions")
+    if isinstance(acts, list) and acts:
+        return {a for a in acts if isinstance(a, str)}
+    suffix = "_screen_config.json"
+    base = cfg_path.name[:-len(suffix)] if cfg_path.name.endswith(suffix) else cfg_path.stem
+    if react_draft:
+        cands = [Path(react_draft)]
+    else:
+        cands = [cfg_path.parent / f"{base}_react_draft.json",
+                 Path(__file__).resolve().parent.parent / "intermediate" / f"{cfg.get('feature_name', base)}_react_draft.json"]
+    for c in cands:
+        try:
+            dr = json.loads(c.read_text(encoding="utf-8"))
+            got = {o["api_endpoint"]["action"] for o in dr.get("db_operations", [])
+                   if isinstance(o.get("api_endpoint"), dict) and o["api_endpoint"].get("action")}
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            continue
+        if got:
+            return got
+    try:
+        fns = json.loads((cfg_path.parent / f"{base}_project_config.json").read_text(encoding="utf-8")).get("api_call_functions") or []
+    except (OSError, ValueError, AttributeError):
+        fns = []
+    found = set()
+    for s in cfg.get("source_files", []):
+        try:
+            text = Path(os.path.expanduser(os.path.expandvars(s))).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for fn in fns:
+            found.update(re.findall(r"\b" + re.escape(fn) + r"\s*(?:<[^>()]*>)?\(\s*['\"]([A-Za-z_]\w*)['\"]", text))
+    return found or None
 
 
 def main(argv=None):
@@ -1697,6 +1757,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="backend(Python) から API ごとの dataset / response_items / error_patterns の下書き JSON を作る")
     p.add_argument("--screen-config", help="screen_config.json のパス")
     p.add_argument("--out", help="出力する下書き JSON のパス")
+    p.add_argument("--react-draft", help="画面が呼ぶ action を読む react_draft.json(省略時は screen_config の隣を探す)")
     p.add_argument("--selftest", action="store_true", help="組込みの検査を走らせる(--screen-config/--out は不要)")
     args = p.parse_args(argv)
     if args.selftest:
@@ -1728,7 +1789,10 @@ def main(argv=None):
     hints = {"ddl": _ddl(root), "ddl_types": _ddl_types(root), "ui": _ui_specs(srcs), "types": _type_blocks(srcs),
              "ts_files": [p for p in srcs if p.suffix in (".ts", ".tsx") and p.is_file()]}
     try:
-        draft = extract(files, hints)
+        acts = _screen_actions(cfg, Path(args.screen_config), args.react_draft)
+        if acts is None:
+            print("[WARN] 画面が呼ぶ action を決められない(react_draft.json にも api_call_functions の呼出にも無い)。表の全 action を載せる", file=sys.stderr)
+        draft = extract(files, hints, acts)
     except SyntaxError as e:
         print(f"[入力不正] 構文エラー: {e}", file=sys.stderr)
         return 2
