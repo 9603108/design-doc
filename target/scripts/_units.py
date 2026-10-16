@@ -24,7 +24,10 @@ target/intermediate/_unit_<単位>.json に書き、互いの出力を待たな�
 import copy
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 SKILL_DIR = Path(__file__).resolve().parent.parent.parent
 UNITS_SPEC_PATH = SKILL_DIR / "prompts" / "units.json"

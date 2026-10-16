@@ -35,6 +35,8 @@ from pathlib import Path
 
 # v43: ID 体系を id_scheme.json (スキル付属) 経由化、ハードコード接頭辞 "L" を全廃
 # 汎用化: sys.argv[1] / FEATURE_NAME 環境変数対応のため get_feature_name_from_argv 経由化
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import get_feature_name_from_argv, get_logging_spec, format_id, get_id_prefix
 
 SCRIPT_DIR = Path(__file__).resolve().parent

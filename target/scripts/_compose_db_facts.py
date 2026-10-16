@@ -28,6 +28,24 @@ def _sfx(name):
     return name + SUFFIX
 
 
+def _clause_rows(op):
+    """op の句の行(dataset・where・group_by・order_by・joins)と、joins[].on[] の left/right(表と列の組)を順に返す。
+
+    WHY(G24): run22 では joins の結合条件が on[].left/right の形で、そこの論理表名(レジ締め・店舗マスタ)が置換から漏れて4件残った。
+    呼出元: _assign_table_names と _compose_db の(推定)を付ける段。"""
+    for key in ("dataset", "where", "group_by", "order_by", "joins"):
+        for row in op.get(key) or []:  # fallback-ok: 句は任意
+            if not isinstance(row, dict):
+                continue
+            yield row
+            if key == "joins":
+                for cond in row.get("on") or []:  # fallback-ok: on は任意(condition の文字列形もある)
+                    if isinstance(cond, dict):
+                        for side in ("left", "right"):
+                            if isinstance(cond.get(side), dict):
+                                yield cond[side]
+
+
 def _assign_table_names(out, terms):
     """logical_names の論理表名を決め直し、db_operations の各句の論理表名へ同じ置換を写す。戻り: 根拠のある論理表名の set。
 
@@ -53,10 +71,9 @@ def _assign_table_names(out, terms):
         if new != old and len(owners[old]) == 1:
             mapping[old] = new
     for op in out.get("db_operations") or []:  # fallback-ok: db_operations は任意
-        for key in ("dataset", "where", "group_by", "order_by", "joins"):
-            for row in op.get(key) or []:  # fallback-ok: 句は任意
-                if isinstance(row, dict) and row.get("logical_table") in mapping:
-                    row["logical_table"] = mapping[row["logical_table"]]
+        for row in _clause_rows(op):
+            if row.get("logical_table") in mapping:
+                row["logical_table"] = mapping[row["logical_table"]]
     return given
 
 
@@ -547,10 +564,9 @@ def _compose_db(out, drafts, log, table_terms=None):
         if r.get("logical_table") and r["logical_table"] not in grounded:  # fallback-ok: 表名の無い行は対象外
             r["logical_table"] = _sfx(r["logical_table"])
     for op in ops:
-        for key in ("dataset", "where", "group_by", "order_by", "joins"):
-            for row in op.get(key) or []:  # fallback-ok: 任意の句
-                if row.get("logical_table") and row["logical_table"] not in grounded:  # fallback-ok: 表名の無い行は対象外
-                    row["logical_table"] = _sfx(row["logical_table"])
+        for row in _clause_rows(op):
+            if row.get("logical_table") and row["logical_table"] not in grounded:  # fallback-ok: 表名の無い行は対象外
+                row["logical_table"] = _sfx(row["logical_table"])
     for op in ops:                                  # d0) 副問い合わせの中の集計は外側から外す(下書きの subqueries が正。API の action で結ぶ)
         ep = op.get("api_endpoint")  # fallback-ok: api_endpoint は任意
         api = _api_draft(drafts, ep.get("action") if isinstance(ep, dict) else None, log)  # fallback-ok: 形の崩れた endpoint は結べない
@@ -880,7 +896,9 @@ def selftest():
     g24_in = lambda name: {"logical_names": [{"physical_table": "pos_account_reports", "logical_table": name, "physical_column": "mise_no", "logical_column": "店舗ID"}],
                            "db_operations": [{"id": "db_op_g24", "api_endpoint": {"action": "g24"},
                                               "dataset": [{"logical_table": name, "logical_column": "店舗ID", "physical_table": "pos_account_reports", "physical_column": "mise_no"}],
-                                              "where": [{"logical_table": name, "logical_column": "店舗ID", "operator": "=", "value": "1", "when": "x"}]}]}
+                                              "where": [{"logical_table": name, "logical_column": "店舗ID", "operator": "=", "value": "1", "when": "x"}],
+                                              "joins": [{"type": "LEFT JOIN", "logical_table": name,
+                                                         "on": [{"left": {"logical_table": name, "logical_column": "店舗ID"}, "operator": "=", "right": {"logical_table": name, "logical_column": "店舗ID"}}]}]}]}
     g24_a, g24_b = g24_in("レジ締め(推定)"), g24_in("POS会計レポート(推定)")
     _compose_db(g24_a, [], [])
     _compose_db(g24_b, [], [])
@@ -888,12 +906,17 @@ def selftest():
     assert g24_a["logical_names"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["logical_names"]
     assert g24_a["db_operations"][0]["dataset"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["db_operations"]
     assert g24_a["db_operations"][0]["where"][0]["logical_table"] == "pos_account_reports(推定)", g24_a["db_operations"]
+    # joins[].on[].left/right の論理表名も同じ置換を受ける(run22 で4件残った形)
+    g24_on = g24_a["db_operations"][0]["joins"][0]
+    assert g24_on["logical_table"] == "pos_account_reports(推定)" and g24_on["on"][0]["left"]["logical_table"] == "pos_account_reports(推定)" \
+        and g24_on["on"][0]["right"]["logical_table"] == "pos_account_reports(推定)", g24_on
     g24_t = g24_in("レジ締め")
     g24_terms = {"pos_account_reports": "POS会計レポート"}
     _compose_db(g24_t, [], [], g24_terms)
     assert g24_t["logical_names"][0]["logical_table"] == "POS会計レポート", g24_t["logical_names"]
     assert g24_t["db_operations"][0]["dataset"][0]["logical_table"] == "POS会計レポート", g24_t["db_operations"]
     assert g24_t["db_operations"][0]["where"][0]["logical_table"] == "POS会計レポート", g24_t["db_operations"]
+    assert g24_t["db_operations"][0]["joins"][0]["on"][0]["right"]["logical_table"] == "POS会計レポート", g24_t["db_operations"]
     g24_snap = copy.deepcopy(g24_t)
     _compose_db(g24_t, [], [], g24_terms)
     assert g24_t == g24_snap, "G24 not idempotent"

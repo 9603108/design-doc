@@ -14,6 +14,8 @@ from pathlib import Path
 #   意味合い: 機能名が未指定なら _config_loader 側の SystemExit で止まる（既定の機能名は持たない）。
 #   接続情報: INTERMEDIATE_DIR / get_feature_name_from_argv は同ディレクトリの _config_loader が提供。
 #             INTERMEDIATE は main() が読み込み・上書き保存・結果表示に使う。
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv
 
 FEATURE_NAME = get_feature_name_from_argv()

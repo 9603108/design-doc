@@ -15,6 +15,8 @@ from pathlib import Path
 
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 import _vs_db
 import _vs_example
 import _vs_flow

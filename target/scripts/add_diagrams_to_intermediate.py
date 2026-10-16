@@ -35,6 +35,8 @@ from pathlib import Path
 #                      読む側（_config_loader）と、中間JSON を読み書きする側（本スクリプト）の食い違いを防ぐ。
 #            接続情報: 定義元は _config_loader.py の INTERMEDIATE_DIR（SKILL_DIR / "target" / "intermediate"）。
 #                      使うのは本ファイルの main()。
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import get_diagram_spec, get_all_diagram_ids, get_feature_name_from_argv, INTERMEDIATE_DIR
 
 SCRIPT_DIR = Path(__file__).resolve().parent

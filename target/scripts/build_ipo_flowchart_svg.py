@@ -43,6 +43,8 @@ from pathlib import Path
 # v30: ハードコード座標を screen_config.json に集約、_config_loader 経由で取得する
 # 2026-07-19: 画面別実行対応のため get_feature_name_from_argv / get_screen_name を追加
 # 2026-10-05 汎用化: 既定の機能名の定数は _config_loader 側で廃止されたため import しない
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import get_all_diagram_ids, get_diagram_spec, get_feature_name_from_argv, get_screen_name
 
 SCRIPT_DIR = Path(__file__).resolve().parent

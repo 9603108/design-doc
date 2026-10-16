@@ -32,6 +32,8 @@ import sys
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する
 # v51: item_name_aliases も画面別 JSON から取得（項目名表現揺らぎを権威語彙に吸収）
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,

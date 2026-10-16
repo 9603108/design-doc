@@ -45,6 +45,8 @@ from datetime import datetime
 # 目的: 機能名の解決と「未指定なら SystemExit」の止め方を _config_loader の1か所に寄せる。
 # 接続情報: get_feature_name_from_argv は第1引数 → 環境変数 FEATURE_NAME の順に解決し、
 #           INTERMEDIATE_DIR は target/intermediate/ を指す。どちらも main() が使う。
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv
 
 

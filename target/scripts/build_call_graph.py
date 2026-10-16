@@ -43,6 +43,8 @@ from collections import defaultdict
 # 2026-10-05 汎用化: INTERMEDIATE_DIR は _config_loader の定義に寄せた（同値の自前定義を廃止、置き場の二重管理を避ける）。
 #   load_screen_config / load_project_config は main が project_root / api_wrapper_classes を読むために使う
 #   get_backend_entry_patterns は main が入口ファイルの判定語（project_config.backend_entry_patterns）を読むために使う
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import (
     INTERMEDIATE_DIR,
     get_feature_name_from_argv,

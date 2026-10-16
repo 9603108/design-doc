@@ -69,6 +69,8 @@ from datetime import datetime
 #           どちらも main() が使う。
 #           パスは INTERMEDIATE_DIR だけで組むため、このファイルは自前のディレクトリ定数を持たない
 #           （参照が無くなった定数は取り除いた。Path は load / dump の型注釈で使う）。
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from _config_loader import INTERMEDIATE_DIR, get_feature_name_from_argv
 
 
