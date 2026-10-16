@@ -13,6 +13,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+# WHY(G17): python3 -I(分離モード)は実行したスクリプトのフォルダを sys.path に入れないので、同じフォルダの _config_loader・run_units を import できず落ちる。
+# 自分のフォルダを先頭に足して、通常実行でも -I でも同じ import が通るようにする(_config_loader・run_units の import より前に置く)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from _config_loader import INTERMEDIATE_DIR, load_screen_config
 from run_units import load_units, owner_of
 
@@ -24,6 +28,9 @@ EXCERPT_MAX = 40
 # そこで主抜粋の後ろに、文中の語が指す先(関数本体・state の定義・それを使う hook・[BE1] 等の定義元・SQL 定数)を足す。
 # 1項目の全体(主抜粋+参照先)は 80 行までにして、判定の入力を肥らせない。1つの参照先は 40 行まで。
 EXCERPT_TOTAL = 80
+# WHY(G14 run20): unknown の再判定(sonnet)には、状態の宣言・更新処理・定数など参照先をさらに載せた広い抜粋を渡す。
+# 通常の判定とキャッシュ照合は従来の EXCERPT_TOTAL の抜粋(src_excerpt)のまま、再判定だけが src_excerpt_wide(この予算)を読む。
+EXCERPT_TOTAL_WIDE = EXCERPT_TOTAL * 2
 BLOCK_MAX = 40
 DEPTH2_BLOCK_MAX = 20  # 参照先のさらに先(2段目)は短く切る
 REF_HEADER = "---- 参照先"  # AU_意味の照合.md が text の区切りとして説明する印。変えるなら手順書も直す
@@ -364,10 +371,11 @@ def _state_var(lines, setter):
 
 
 class _Excerpt:
-    """1項目の抜粋の組み立て。主抜粋と参照先の断片を、全体 EXCERPT_TOTAL 行の予算で並べる。"""
+    """1項目の抜粋の組み立て。主抜粋と参照先の断片を、全体 budget 行(既定 EXCERPT_TOTAL)の予算で並べる。"""
 
-    def __init__(self, cache):
+    def __init__(self, cache, budget=None):
         self.cache = cache
+        self.budget = EXCERPT_TOTAL if budget is None else budget  # 全体の行数の予算(再判定用の広い抜粋は EXCERPT_TOTAL_WIDE)
         self.segs = []  # (path, 開始行(1始まり), 終了行, ラベル or None, 行の文字列リスト)
         self.total = 0
 
@@ -391,7 +399,7 @@ class _Excerpt:
                 return False
             if i1 < i0:
                 return False
-        room = EXCERPT_TOTAL - self.total - (1 if label else 0)
+        room = self.budget - self.total - (1 if label else 0)
         if room < 3:
             return False
         n = min(i1 - i0 + 1, cap, room)
@@ -468,11 +476,111 @@ def _add_display_conditions(ex, path0, lines0, statement):
             taken += ex.add(path0, i, i, "表示条件", 1)
 
 
+def _add_state_decls(ex, path0, lines0, statement):
+    """主抜粋と文に出る識別子のうち、同じファイルで `[x, setX] = useState(...)` と宣言されている state の宣言行を、初期値まで足す。呼出元 = _expand。
+    WHY(G14 run20): 「初期は〜が真(false)」のような文の根拠は state の初期値にあるが、src は使用箇所を指し、宣言は抜粋の外で unknown になった(13件)。
+    複数行にまたがる初期値は _block_end で閉じる。state 名は決め打ちせず、識別子の一致だけで選ぶ。予算は ex.add が管理する。"""
+    _p, _s0, _e0, _l, body0 = ex.segs[0]
+    words = {m.group(1) for m in _IDENT_RE.finditer(statement + "\n" + "\n".join(body0))} - set(_STOP)
+    decl = re.compile(r"^\s*(?:const|let|var)\s*\[\s*(\w+)\s*,\s*set\w+\s*\]\s*=\s*useState")
+    for i, ln in enumerate(lines0):
+        m = decl.match(ln)
+        if m and m.group(1) in words:
+            ex.add(path0, i, _block_end(lines0, i, DEPTH2_BLOCK_MAX), f"{m.group(1)} の宣言と初期値", DEPTH2_BLOCK_MAX)
+
+
+_FUNC_START_RE = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:\(|\w+\s*=>|function))")
+
+
+def _add_setter_updates(ex, path0, lines0, statement):
+    """主抜粋と文が参照する state の更新関数 setX を呼んでいる箇所のうち、hook の外のイベントハンドラ(`const onApply = () => {...}` 等)を足す。呼出元 = _expand。
+    WHY(G14 run20): ボタン押下で applied を確定する処理(setApplied を呼ぶ関数)は、hook ではなく通常のハンドラにあり、(3)(4) が拾えず unknown になった(6件)。
+    setX の呼出し行を含む関数ブロックを _block_end で閉じて足す(最大3件)。関数の形が見つからない行(JSX 内の onClick={() => setX(..)} など)はその1行だけ足す。"""
+    _p, _s0, _e0, _l, body0 = ex.segs[0]
+    words = {m.group(1) for m in _IDENT_RE.finditer(statement + "\n" + "\n".join(body0))} - set(_STOP)
+    setters = []
+    for ln in lines0:
+        m = re.match(r"^\s*(?:const|let|var)\s*\[\s*(\w+)\s*,\s*(set\w+)\s*\]\s*=\s*useState", ln)
+        if m and (m.group(1) in words or m.group(2) in words):
+            setters.append(m.group(2))
+    hooks = _hook_blocks(lines0)
+    taken = 0
+    for st in setters:
+        call = re.compile(rf"\b{re.escape(st)}\s*\(")
+        for i, ln in enumerate(lines0):
+            if taken >= 3:
+                return
+            if not call.search(ln) or any(h[0] <= i <= h[1] for h in hooks):
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            start = next((k for k in range(i, max(i - BLOCK_MAX, -1), -1)
+                          if _FUNC_START_RE.match(lines0[k]) and len(lines0[k]) - len(lines0[k].lstrip()) < indent or (k == i and _FUNC_START_RE.match(lines0[k]))), None)
+            if start is None:
+                taken += ex.add(path0, i, i, f"{st} を更新する処理", 1)
+            else:
+                taken += ex.add(path0, start, _block_end(lines0, start, BLOCK_MAX), f"{st} を更新する処理", BLOCK_MAX)
+
+
+def _add_promise_chain(ex, path0, lines0, statement):
+    """主抜粋と足し済みの断片にある `.then(` の呼出し文と try/catch/finally を、連鎖の末尾まで足す。呼出元 = _expand。
+    WHY(G14 run20): 「失敗したら〜を表示し、最後に読込中を解除する」型の文は .then/.catch/.finally(setRows 等を含む)が根拠だが、
+    src の行はその一部で、連鎖の残りが抜粋の外になり unknown になった(5件)。連鎖の途中の行(`.catch(` で始まる行)から先頭の呼出し行へ戻り、
+    _block_end(メソッドチェーンの続きを文の途中とみなす)で閉じる。本文はそのまま含めるので setRows 等も根拠に残る。上限は BLOCK_MAX、最大3件。"""
+    taken = 0
+    for path, s, _e, _label, body in list(ex.segs):
+        if path != path0:
+            continue
+        for k, ln in enumerate(body):
+            if taken >= 3:
+                return
+            if not (re.search(r"\.then\s*\(", ln) or re.match(r"\s*try\s*\{", ln)):
+                continue
+            j = s - 1 + k
+            while j > 0 and lines0[j].lstrip().startswith("."):
+                j -= 1
+            end = _block_end(lines0, j, BLOCK_MAX)
+            taken += ex.add(path0, j, end, "非同期処理(then/catch/finally)", BLOCK_MAX)
+            # ex.add は既存の断片と重なる範囲の後ろ側を落とすので、断片の末尾より後ろに続く連鎖(.catch/.finally)は別に足す
+            tail = max(s - 1 + len(body), j)
+            if tail <= end:
+                ex.add(path0, tail, end, "非同期処理(then/catch/finally)", BLOCK_MAX)
+
+
+def _add_server_defs(ex, merged, project_root, statement):
+    """文または主抜粋が名指しする API(action か path が本文に出るもの)の、サーバのソースの該当関数を足す。呼出元 = _expand。
+    WHY(G14 run20): サーバ側の処理を述べる文(4件)は、[BE1] のような ID が文に無いと (1) が引けず、画面のソースしか抜粋に無かった。
+    merged の api_spec と backend_processes の出典(_src_of)を、action・path の一致で選ぶ。action 名は決め打ちしない。出典の行から上へ def を探して関数の先頭にし、
+    _block_end で閉じる(上限 BLOCK_MAX)。同じ範囲は ex.add の重複排除に任せる。最大2件。"""
+    _p, _s0, _e0, _l, body0 = ex.segs[0]
+    text = statement + "\n" + "\n".join(body0)
+    taken = 0
+    for sec in ("api_spec", "backend_processes"):
+        for d in merged.get(sec) or []:
+            if taken >= 2:
+                return
+            if not isinstance(d, dict):
+                continue
+            ep = d.get("endpoint") if isinstance(d.get("endpoint"), dict) else d
+            action, path = str(ep.get("action") or ""), str(ep.get("path") or "")
+            named = (action and re.search(rf"\b{re.escape(action)}\b", text)) or (path and path in text)
+            s = _src_of(d)
+            if not (named and s):
+                continue
+            p = _resolve(s["file"], project_root)
+            plines = _read_lines(p, ex.cache) or []
+            i0 = s["line_start"] - 1
+            start = next((k for k in range(min(i0, len(plines) - 1), max(i0 - BLOCK_MAX, -1), -1)
+                          if re.match(r"\s*(?:async\s+)?def\s", plines[k])), i0)
+            if 0 <= start < len(plines):
+                taken += ex.add(p, start, _block_end(plines, start, BLOCK_MAX), f"サーバ処理: {action or path}", BLOCK_MAX)
+
+
 def _expand(ex, merged, project_root, statement, src):
     """主抜粋(ex の先頭の断片)の後ろに、判定に要る参照先を足す。呼出元 = _excerpt。
     足す順(優先度の高い順): (1) 文中の [BE1] 等の定義元 (2) 主抜粋が呼ぶ関数・使う定数の本体 (3) 主抜粋が呼ぶ state の更新関数の定義行
     (4) その state を依存配列に持つ hook と、その hook を起動する useEffect (5) 別ファイルから import した関数の本体(参照先の中の呼出しも)
-    (1c) 主抜粋の要素の表示条件の行 (1d) 文中の識別子の定義(予算を (2)〜(5) が使い切る前に確保する)
+    (1c) 主抜粋の要素の表示条件の行 (1c2) 参照する state の宣言と初期値 (1c3) その state を更新するイベントハンドラ
+    (1c4) 非同期処理の then/catch/finally (1c5) 文が名指しする API のサーバ側の該当関数 (1d) 文中の識別子の定義(予算を (2)〜(5) が使い切る前に確保する)
     WHY: 参照先を決めるのは識別子の一致だけで、案件固有の名前・語は使わない。"""
     path0, s0, e0, _l, body0 = ex.segs[0]
     lines0 = _read_lines(path0, ex.cache) or []
@@ -500,6 +608,11 @@ def _expand(ex, merged, project_root, statement, src):
             ex.add(path0, max(hit - 1, 0), min(hit + 1, len(lines0) - 1), "文言の出現箇所", 3)
     # (1c) 表示条件の行
     _add_display_conditions(ex, path0, lines0, statement)
+    # (1c2)〜(1c5) 状態の初期値・確定処理・then/catch/finally・サーバ処理。WHY: 照合の unknown の主因で、(2)〜(5) が予算を使い切る前に確保する
+    _add_state_decls(ex, path0, lines0, statement)
+    _add_setter_updates(ex, path0, lines0, statement)
+    _add_promise_chain(ex, path0, lines0, statement)
+    _add_server_defs(ex, merged, project_root, statement)
     calls, setters, rest = _idents(body0)
     base = path0.parent
     imports = _imports(lines0, base)
@@ -555,9 +668,10 @@ def _expand(ex, merged, project_root, statement, src):
                 take_def(path, plines, name, DEPTH2_BLOCK_MAX)
 
 
-def _excerpt(src, project_root, cache, merged=None, statement=""):
+def _excerpt(src, project_root, cache, merged=None, statement="", budget=None):
     """src の行の前後 EXCERPT_CONTEXT 行(主抜粋)と、merged があれば文が指す参照先を足した抜粋を返す。読めなければ空文字。
-    WHY: 出典の file は絶対パスと project_root 基準の相対が混ざるため、両方に対応する。cache はファイルごとの行の一覧。"""
+    WHY: 出典の file は絶対パスと project_root 基準の相対が混ざるため、両方に対応する。cache はファイルごとの行の一覧。
+    budget は全体の行数の予算(None なら EXCERPT_TOTAL)。build_claims が再判定用に EXCERPT_TOTAL_WIDE で呼び直す。"""
     path = _resolve(src["file"], project_root)
     lines = _read_lines(path, cache)
     if lines is None:
@@ -565,7 +679,7 @@ def _excerpt(src, project_root, cache, merged=None, statement=""):
     ls = max(src["line_start"] - EXCERPT_CONTEXT, 1)
     le = min(int(src.get("line_end") or src["line_start"]) + EXCERPT_CONTEXT, len(lines))
     le = min(le, ls + EXCERPT_MAX - 1)
-    ex = _Excerpt(cache)
+    ex = _Excerpt(cache, budget)
     ex.segs.append((path, ls, le, None, lines[ls - 1:le]))
     ex.total = le - ls + 1
     if merged is not None:
@@ -590,6 +704,8 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
             continue
         if (text, excerpt) in prior_ok:
             continue
+        # 再判定(unknown の見直し)用に、予算を広げた抜粋も添える。キャッシュ照合は上の excerpt(従来の予算)で行うので内容を変えない
+        excerpt_wide = _excerpt(src, project_root, cache, merged, text, EXCERPT_TOTAL_WIDE)
         claims.append({
             "id": f"AC{len(claims) + 1:03d}",
             "kind": kind,
@@ -597,6 +713,7 @@ def build_claims(merged, project_root, prior_ok, units, react=None):
             "subject": subject,
             "text": text,
             "src_excerpt": excerpt,
+            "src_excerpt_wide": excerpt_wide,
             "src_ref": ({"file": src["file"], "line_start": src["line_start"], "line_end": src.get("line_end")} if src else None),
         })
     return claims
@@ -768,6 +885,33 @@ def _selftest():
               "validations": [{"no": "VL1", "field": "どこにも無い項目", "kind": "入力検査", "rule": "何かを調べる", "applied_when": "b"}]}
         if build_claims(m7, "", set(), units):
             print(f"[selftest NG] 出典を引けない項目が判定項目に残った: {build_claims(m7, '', set(), units)}")
+            return 0
+        # G14: 文が参照する state の宣言と初期値・押下ハンドラ(setApplied)・then/catch/finally の末尾・サーバ関数が、src の行(連鎖の途中)だけを指していても抜粋に入る。
+        # src_excerpt_wide は src_excerpt 以上の長さで、src_excerpt の内容(キャッシュ照合の鍵)は広げた予算の影響を受けない
+        ap = Path(tmp) / "ap.tsx"
+        ap.write_text("\n".join([
+            "const [showDead, setShowDead] = useState(false);", "const [applied, setApplied] = useState(0);", "const [rows, setRows] = useState([]);",
+            "const onApply = () => {", "  setApplied(5);", "};",
+            "// pad7", "// pad8", "// pad9", "// pad10", "// pad11",
+            "function reload() {", "  fetch(\"/api/z\")", "    .then((d) => setRows(d))", "    .catch(() => setRows([]))", "    .finally(() => doneMarker());", "}"]) + "\n", encoding="utf-8")
+        sv = Path(tmp) / "sv.py"
+        sv.write_text("def run_z(req):\n    x = 1\n    return x\n", encoding="utf-8")
+        stmt_g14 = "showDead が初期は偽で、applied を確定し、失敗したら rows を空にする"
+        merged_g14 = {"backend_processes": [{"process_id": "BE9", "name": "z", "endpoint": {"method": "POST", "path": "/api/z", "action": "run_z"},
+                                             "src": [{"file": str(sv), "line_start": 2, "line_end": 2}]}]}
+        g14_ex = _excerpt({"file": str(ap), "line_start": 13, "line_end": 13}, "", {}, merged_g14, stmt_g14)
+        for need in ("showDead の宣言と初期値", "useState(false)", "setApplied を更新する処理", "setApplied(5)", "doneMarker", "サーバ処理: run_z", "def run_z"):
+            if need not in g14_ex:
+                print(f"[selftest NG] G14 の追加断片 {need!r} が抜粋に入らない: {g14_ex!r}")
+                return 0
+        g14_claims = build_claims({"front_processes": [{"steps": [{"description": stmt_g14, "src": [{"file": str(ap), "line_start": 13, "line_end": 13}]}]}],
+                                   "backend_processes": merged_g14["backend_processes"]}, "", set(), units)
+        g14_c = next((c for c in g14_claims if c["text"] == stmt_g14), None)
+        if g14_c is None or len(g14_c["src_excerpt_wide"]) < len(g14_c["src_excerpt"]) or "showDead の宣言と初期値" not in g14_c["src_excerpt_wide"]:
+            print(f"[selftest NG] src_excerpt_wide が src_excerpt 以上の長さで抜粋の中身を含んでいない: {g14_c}")
+            return 0
+        if g14_c["src_excerpt"] != _excerpt({"file": str(ap), "line_start": 13, "line_end": 13}, "", {}, merged_g14, stmt_g14):
+            print("[selftest NG] src_excerpt が従来の予算の抜粋(_excerpt の既定)と変わった")
             return 0
     print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加")
     return 0

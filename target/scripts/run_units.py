@@ -121,7 +121,8 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
         f"- 書くのは {inter}/_unit_{u}.json の1ファイルだけ。他のファイル(partial・中間 JSON・他の単位の _unit_*.json・screen_config)は書かない。"
         f"書いてよい欄は units.json の {u} の owns だけ: {owns}",
         "- 前回の設計書や過去の partial の中身は参照しない(ソースと下書きから書く)。",
-        "- 【出典】下書きにある行の src は書かない(合成が付ける)。下書きに無い行(ソースを読んで足した行)だけ、読んだ範囲 {file,line_start,line_end} の配列を src に書く。",
+        # WHY: run20 で H4 が「合成が付ける」を validations_frontend にも当てはめ、14行とも src を書かなかった(H4 手順書は全行に書けと決めており矛盾していた)。
+        "- 【出典】下書きから合成が付ける行(events・event_processes・db_operations・api_spec・messages_backend・calculations)の src は書かない。validations_frontend の行は合成が付けないので、全行に、その検査・切替・絞り込みを実際に書いているソースの行範囲 {file,line_start,line_end} の配列を src に書く(手順書 H4 のとおり)。下書きに無い行(ソースを読んで足した行)も同様に、読んだ範囲を src に書く。",
         f"- 終わったら `cd {skill} && python3 target/scripts/verify_partials.py --units --unit {u}` を流し、"
         f"行末が「→ 差し戻し先 {u}」の問題を直してから、3行以内で報告する(書いた行数・残った問題・判断できなかった所)。",
     ]
@@ -285,9 +286,9 @@ def run_gate(feat):
     """納品の合否を1つにまとめる関門。
 
     WHY: after(ERROR)・WARN の許可リスト照合・audit の差し戻しが別々に出ると、どれが残っているかをメインが読み分けることになる。
-    全部そろったときだけ exit 0 にして、合格の条件(ERROR 0・説明のない WARN 0・audit の差し戻し 0)を1か所に置く。
+    全部そろったときだけ exit 0 にして、合格の条件(ERROR 0・説明のない WARN 0・audit の差し戻し 0・audit の unknown 0)を1か所に置く。
     同じ WARN は一覧と再出力に2回出るが、1回だけ数える。
-    出力は {ok, after_ok, warn_unallowed, audit_ng} に、不合格の中身(after・warn_skipped・audit_reason)を足した JSON を1回。
+    出力は {ok, after_ok, warn_unallowed, audit_ng, audit_unknown} に、不合格の中身(after・warn_skipped・audit_reason)を足した JSON を1回。
     呼出元: main の gate。再利用: run_after・audit_sendbacks・load_units(subprocess の呼び方は run_after に任せ、複製しない)。"""
     import contextlib
     import io
@@ -327,13 +328,19 @@ def run_gate(feat):
     # audit: 結果ファイルが無い・壊れているときは握りつぶさず不合格(audit 未実施)
     results_p = INTER / f"{feat}_audit_results.json"
     audit_ng = 0
+    audit_unknown = 0
     try:
-        audit_ng = len(audit_sendbacks(json.loads(results_p.read_text(encoding="utf-8")), load_units()))
+        rows = json.loads(results_p.read_text(encoding="utf-8"))
+        audit_ng = len(audit_sendbacks(rows, load_units()))
+        # WHY: unknown は「ソースと合っているか確かめられていない」で、再判定(sonnet)後も残る。差し戻し(ng)には入らないため、
+        # 数えないと unknown が残ったまま合格する(run20 は 22 件のまま通りうる)。1件でもあれば不合格にし、件数を出す。
+        audit_unknown = sum(1 for r in rows if isinstance(r, dict) and r.get("verdict") == "unknown")
     except (OSError, ValueError) as e:
         audit_ng = 1
         result["audit_reason"] = f"audit 未実施(結果を読めない: {results_p.name}: {e})"
     result["audit_ng"] = audit_ng
-    ok = result["after_ok"] and not unallowed_warn and audit_ng == 0
+    result["audit_unknown"] = audit_unknown
+    ok = result["after_ok"] and not unallowed_warn and audit_ng == 0 and audit_unknown == 0
     print(json.dumps({"ok": ok, **result}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
@@ -475,6 +482,19 @@ def selftest():
         # logs/ だけの run には控えを書ける。空ディレクトリ・logs 以外もある run は従来どおり断る
         (t / "r" / "runL" / "logs").mkdir(parents=True)
         assert "logs/a.log" in save_run("テスト機能", "runL", logs=[t / "a.log"], **kw)[1], "logs だけの run に控えられない"
+        # logs/ と仕分けの記録(.md)だけの run にも控えを書け、.md は残る。.md でも成果物の入る json/ があれば断る
+        (t / "r" / "runT" / "logs").mkdir(parents=True)
+        (t / "r" / "runT" / "warn_triage.md").write_text("仕分け", encoding="utf-8")
+        assert "logs/a.log" in save_run("テスト機能", "runT", logs=[t / "a.log"], **kw)[1], "logs と .md だけの run に控えられない"
+        assert (t / "r" / "runT" / "warn_triage.md").read_text(encoding="utf-8") == "仕分け", ".md が消えた"
+        (t / "r" / "runJ" / "json").mkdir(parents=True)
+        (t / "r" / "runJ" / "warn_triage.md").write_text("x", encoding="utf-8")
+        try:
+            save_run("テスト機能", "runJ", **kw)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("成果物のある run に控えられた")
         (t / "r" / "runE").mkdir()
         (t / "r" / "runM" / "logs").mkdir(parents=True)
         (t / "r" / "runM" / "x.txt").write_text("x", encoding="utf-8")
@@ -523,7 +543,10 @@ def selftest():
             rc, o = gate(0, 0, ng_row)
             assert rc == 1 and o["audit_ng"] == 1 and o["warn_unallowed"] == [], o
             rc, o = gate(0, 0, ok_row)
-            assert rc == 0 and o["ok"] and o["audit_ng"] == 0, o
+            assert rc == 0 and o["ok"] and o["audit_ng"] == 0 and o["audit_unknown"] == 0, o
+            # unknown は ng ではないが、1件でもあれば不合格にし、件数を出す(G13)
+            rc, o = gate(0, 0, ok_row + [dict(ng_row[0], id="AC002", verdict="unknown")] * 2)
+            assert rc == 1 and not o["ok"] and o["audit_ng"] == 0 and o["audit_unknown"] == 2, o
             rc, o = gate(0, 0, None)
             assert rc == 1 and "audit 未実施" in o["audit_reason"], o
             # 理由の空な許可リストは例外で落とさず不合格(JSON が読め ok が偽、検査の subprocess は流れない)
@@ -669,8 +692,8 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
     """run の成果物(中間JSON・断片・検査ログ・docx)を target/runs/<run名>/ に控える。
 
     WHY: /private/tmp の片付けで run17・run18 が消えたため。回し直しの比較をするには過去の run が残っている必要がある。
-    他の run を壊さないよう保存先が既にあれば FileExistsError。ただし logs/ だけの run は成果物が無いので控えを許す
-    (検査ログだけ先に置かれた run への控え。logs/ の同名ファイルは copy2 で置き換わる)。無い対象は黙って飛ばさず skipped に返す。
+    他の run を壊さないよう保存先が既にあれば FileExistsError。ただし logs/ と仕分けの記録(直下の .md)だけの run は成果物が無いので控えを許す
+    (検査ログ・仕分けの記録だけ先に置かれた run への控え。logs/ の同名ファイルは copy2 で置き換わり、.md は触らない)。無い対象は黙って飛ばさず skipped に返す。
     呼出元: main の save-run(メインの tool-worker が after と audit-check の後に流す)。
     戻り: (dest, copied(dest からの相対パス), skipped(控えられなかった対象の名前))。"""
     if not run or "/" in run or ".." in run:
@@ -678,8 +701,12 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
     inter = Path(inter) if inter else INTER
     output_dir = Path(output_dir) if output_dir else SKILL / "target" / "output"
     dest = (Path(runs_root) if runs_root else SKILL / "target" / "runs") / run
-    if dest.exists() and [p.name for p in dest.iterdir()] != ["logs"]:
-        raise FileExistsError(f"既にある run は上書きしない: {dest}")
+    # WHY: 控え済みの成果物(json・fragments・docx)を上書きしないための検査。logs/ と、仕分けの記録(warn_triage.md など直下の .md)は
+    # 成果物ではないので、それだけが在る run には控えを許す。空ディレクトリは従来どおり断る(何の run か分からない)
+    if dest.exists():
+        existing = list(dest.iterdir())
+        if not existing or not all((p.is_dir() and p.name == "logs") or (p.is_file() and p.suffix == ".md") for p in existing):
+            raise FileExistsError(f"既にある run は上書きしない: {dest}")
     log_paths = [Path(x) for x in logs]
     for lp in log_paths:
         if not lp.is_file():
@@ -892,11 +919,18 @@ def main(argv=None):
         if unknown and not (INTER / f"{a.feature}_audit_part_retry.json").exists():
             # WHY: Haiku で決められなかった件(unknown)だけを sonnet に1回判定させる。ok を含む全件は読み直さない
             retry_out = INTER / f"{a.feature}_audit_part_retry.json"
-            items = [_audit_item(c) for c in unknown]
+            # WHY(G14 run20): 再判定には予算を広げた抜粋(src_excerpt_wide)を渡す。無い項目(旧形式の claims)は従来の src_excerpt のまま。_audit_item 自体は通常の判定の形を保つ
+            items = []
+            for c in unknown:
+                it = _audit_item(c)
+                if c.get("src_excerpt_wide"):
+                    it["src_excerpt"]["text"] = c["src_excerpt_wide"]
+                items.append(it)
             prompt = "\n".join([
                 f"design-doc の意味の照合の再判定(sonnet)。機能名: {a.feature}。",
                 f"- 手順書: {SKILL / 'prompts' / 'AU_意味の照合.md'}(読んで従う)",
                 f"- 書くのは {retry_out} の1ファイルだけ。中身は判定の JSON 配列(id・verdict・evidence_line・reason)",
+                "- 決まり: 抜粋(src_excerpt_wide を入れた src_excerpt.text)に無い物を根拠に ok にしない。抜粋で確かめられなければ unknown のまま返す",
                 "- 判定項目:",
                 json.dumps(items, ensure_ascii=False, indent=1),
             ]) + "\n"

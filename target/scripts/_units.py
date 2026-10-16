@@ -389,7 +389,9 @@ def _fill_src(out):
     """下書きの src(ソースの出典 {file,line_start,line_end} の配列)を、合成した行へ機械で付ける。断片に src がある行は触らない。
     呼出元: compose(_fill_logical_names の前)。意味合い: src は機械抽出の下書きが正で、単位に書かせると作り話の行番号が混じるため。
     照合: events/event_processes←react の event_code、api_spec←backend.apis の action、response_items←apis[action] の key、
-    error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id、calculations←react の calc_candidates の label(候補が1件のときだけ)。下書きが無ければ何もしない。"""
+    error_patterns←下書きの id(message_id)、messages_backend←同じ id、db_operations←apis[*].db_operations の id、calculations←react の calc_candidates の label(候補が1件のときだけ)、
+    validations_frontend←下書きの error_patterns の id(kind が「API検査」で message_id を持つ行だけ)。下書きが無ければ何もしない。
+    WHY(validations_frontend): run20 で H4 が src を書かず WARN が残った。画面側の行(入力検査・表示切替)は下書きに対の行が無いので機械では付けず、機械で引ける API検査の行だけ付ける。"""
     from _config_loader import INTERMEDIATE_DIR
     ev, ep, api, ri, err, dbo = {}, {}, {}, {}, {}, {}
     calc, calc_n = {}, {}
@@ -445,6 +447,9 @@ def _fill_src(out):
         for x in a.get("error_patterns") or []:
             if isinstance(x, dict):
                 put(x, err.get(x.get("message_id")))
+    for r in _rows(out, "validations_frontend"):
+        if r.get("kind") == "API検査" and r.get("message_id"):
+            put(r, err.get(r.get("message_id")))
 
 
 def _initial_text(si):
@@ -1039,6 +1044,24 @@ def _selftest_calc_src():
     assert "src" not in rows["平均"], rows["平均"]
     assert rows["税"]["src"] == keep, rows["税"]
     assert "src" not in rows["無"], rows["無"]
+    # validations_frontend: API検査の行だけ下書き error_patterns の src を message_id で引き、画面側の行・既存の src は触らない
+    be_src = [{"file": "q.py", "line_start": 10, "line_end": 12}]
+    backend = {"apis": {"act": {"error_patterns": [{"id": "MSE00001", "src": be_src}]}}}
+    out = {"validations_frontend": [
+        {"kind": "API検査", "message_id": "MSE00001"},
+        {"kind": "入力検査", "message_id": "MSE00001"},
+        {"kind": "API検査", "message_id": "MSE00001", "src": keep}]}
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "x_backend_draft.json").write_text(json.dumps(backend, ensure_ascii=False), encoding="utf-8")
+        _config_loader.INTERMEDIATE_DIR = td
+        try:
+            _fill_src(out)
+        finally:
+            _config_loader.INTERMEDIATE_DIR = old
+    vf = out["validations_frontend"]
+    assert vf[0]["src"] == be_src, vf[0]
+    assert "src" not in vf[1], vf[1]
+    assert vf[2]["src"] == keep, vf[2]
     print("[selftest OK] _units._fill_src (calculations の src は calc_candidates の label が1件のとき)")
 
 
