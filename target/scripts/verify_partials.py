@@ -555,6 +555,33 @@ _GENERIC_ACRONYMS = {"UTC", "JST", "CSV", "API", "SQL", "URL", "HTTP", "HTTPS", 
 # 例示値の穴 {名前}。実行時に決まる値の書き方なので、例示値に残ると例として読めない
 _EX_HOLE = re.compile(r"\{[^{}]+\}")
 _DATE_EX = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+# 入力の種類(format・data_type・remarks の type="month" や YYYY-MM などの書式)ごとの例示値の形。書式が読み取れないときは日付(_DATE_EX)
+_MONTH_EX = re.compile(r"\d{4}[-/]\d{1,2}")
+_TIME_EX = re.compile(r"\d{1,2}:\d{2}(:\d{2})?")
+_DATETIME_EX = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}[T ]\d{1,2}:\d{2}(:\d{2})?")
+
+
+def _example_kind(it):
+    """画面項目の format・data_type・remarks から入力の種類(datetime・month・time)を読む。読めなければ "date"。呼出元: check_example_format。"""
+    t = " ".join(str(it.get(k) or "") for k in ("format", "data_type", "remarks")).lower()
+    if re.search(r"datetime-local|datetime\b|y{2,4}[-/]m{1,2}[-/]d{1,2}[t ]+h{1,2}:m{1,2}|年月日\s*時刻", t):
+        return "datetime"
+    if re.search(r"type\s*=\s*[\"']?month|y{4}[-/]?m{2}(?![-/]?d)|年月(?!日)", t):
+        return "month"
+    if re.search(r"type\s*=\s*[\"']?time|\bh{1,2}:m{1,2}", t):
+        return "time"
+    return "date"
+
+
+def _example_ok(kind, ex):
+    ex = ex.strip()
+    if kind == "month":
+        return bool(_MONTH_EX.fullmatch(ex))
+    if kind == "time":
+        return bool(_TIME_EX.fullmatch(ex))
+    if kind == "datetime":
+        return bool(_DATETIME_EX.search(ex))
+    return bool(_DATE_EX.search(ex))
 
 
 def _src_text(src):
@@ -639,7 +666,7 @@ def check_example_format(frags):
             continue
         ex, name = str(it.get("example") or ""), str(it.get("item_name") or "?")
         # 穴(例 {集計開始日})は書式の問題ではなく check_example_warn の WARN で扱う。ここで ERROR にすると WARN と二重になり、終了コードも 1 になる
-        if it.get("item_type") == "Calendar" and ex and not _EX_HOLE.search(ex) and not _DATE_EX.search(ex):
+        if it.get("item_type") == "Calendar" and ex and not _EX_HOLE.search(ex) and not _example_ok(_example_kind(it), ex):
             bad_fmt.append(f"{name}(例 {ex!r})")
     out = []
     if bad_fmt:
@@ -1098,6 +1125,17 @@ def selftest_warn():
     hole_cal = {"S1": {"screen_layout": {"items": [{"item_name": "集計開始日", "example": "{集計開始日}", "item_type": "Calendar"}]}}}
     assert check_example_format(hole_cal) == [], "日付の穴を ERROR にした"
     assert [w for w in check_example_warn(hole_cal) if "集計開始日" in w], "日付の穴を WARN にしない"
+    # 入力の種類が年月・時刻・年月日時刻なら、その書式の例示値を通す。書式と例示値が食い違うときだけ指摘する
+    def _cal(ex, **kw):
+        return {"S1": {"screen_layout": {"items": [dict({"item_name": "月", "example": ex, "item_type": "Calendar"}, **kw)]}}}
+    assert check_example_format(_cal("2026-10", remarks='<input type="month">')) == [], "type=month の YYYY-MM を指摘した"
+    assert check_example_format(_cal("2026-10", format="YYYY-MM")) == [], "format YYYY-MM の例示値を指摘した"
+    assert check_example_format(_cal("2026-10-01", format="YYYY-MM")), "年月の書式に年月日の例示値を通した"
+    assert check_example_format(_cal("09:30", format="HH:mm")) == [], "時刻の例示値を指摘した"
+    assert check_example_format(_cal("2026-10-01", format="HH:mm")), "時刻の書式に日付を通した"
+    assert check_example_format(_cal("2026-10-01T09:30", remarks="datetime-local")) == [], "年月日時刻を指摘した"
+    assert check_example_format(_cal("2026-10-01", format="yyyy-mm-dd")) == [], "年月日の書式を指摘した"
+    assert check_example_format(_cal("2026-10", format="yyyy-mm-dd")), "年月日の書式に年月を通した"
     # F2: H2 が db_operations の subqueries・ctes を書いても範囲外・重複の ERROR にしない。WARN だけ出す(差し戻し先は書かない)
     import _units
     spec_h2 = {"units": {"H2": {"owns": ["db_operations[].operation_type"]}}}
