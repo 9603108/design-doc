@@ -915,8 +915,7 @@ def check_display_toggle_vl(d) -> list:
             continue
         if any(_spans_overlap(v.get("src"), b["src"]) for v in toggles):
             continue
-        s = b["src"][0]
-        at = f"{Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end') or s.get('line_start')}"
+        at = _vs_common.span(b["src"][0])
         hit = [f"{i.get('no') or ''} {i.get('item_name')}".strip() for i in items if _spans_overlap(i.get("src"), b["src"])]
         out.append(f"[ERROR] [表示切替VL] behaviors[{b.get('id')}]({at}。条件 {b.get('cond')}): 条件で出し分ける要素{'(' + '・'.join(hit[:3]) + ')' if hit else ''}に対応する表示切替の画面ルール"
                    f"(validations の kind=表示切替。src がこの行を含む)が無い。条件付き表示は要素ごとに1件、条件の state と出す・消す内容を書く → 差し戻し先 H4")

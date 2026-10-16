@@ -541,7 +541,7 @@ def check_common_logic_dropped(d) -> list:
         if any(_cl_covers(cand, cl) for cl in cls):
             continue
         s = srcs[0]
-        where = f"logic_candidates[{cand.get('name')}] ({Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})"
+        where = f"logic_candidates[{cand.get('name')}] ({_vs_common.span(s)})"
         cm = str(cand.get("comment") or "")
         msg = (f"この画面の API({', '.join(sorted(set(cand.get('used_by') or []) & actions or actions))})が使う共通の規則 {cand.get('name')}"
                f"({str(cand.get('text') or '')[:50]})が、common_logic のどの項目にも対応していない"
@@ -628,12 +628,12 @@ def check_front_logic_dropped(d) -> list:
         if any(_cl_covers(cand, cl) for cl in cls):
             continue
         s = (cand.get("src") or [{}])[0]
-        where = f"react_draft.logic_candidates[{cand.get('name')}] ({Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})"
+        where = f"react_draft.logic_candidates[{cand.get('name')}] ({_vs_common.span(s)})"
         out.append(_vs_common.warn(
             "共通ロジック漏れ", where,
             f"画面側の共通の処理 {cand.get('name')}({str(cand.get('text') or '')[:50]})が、common_logic のどの項目にも対応していない"
             f"(src の行が重ならず、名前も common_logic の文に出ない)。画面で動く共通ロジックとして足す"
-            f"(runs_on はブラウザ。src は定義の行 {s.get('line_start')}-{s.get('line_end')}) → 差し戻し先 S1"))
+            f"(runs_on はブラウザ。src は定義の行 {_vs_common.lines(s.get('line_start'), s.get('line_end'))}) → 差し戻し先 S1"))
     return list(dict.fromkeys(out))
 
 
@@ -765,7 +765,7 @@ def check_jsx_text_gap(d) -> list:
                     out.append(_error(
                         "JSXの空白", f"{where} {kind}",
                         f"{{{jx.get('expr')}}} の{side}の空白: {kind}「…{text[m.start():m.end() + 4]}…」は{seen}が、JSX の規則("
-                        f"{Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end')})では{want}"
+                        f"{_vs_common.span(s)})では{want}"
                         f"(改行の前後の空白は画面に出ない)。字面を JSX に合わせる → 差し戻し先 S1"))
     return list(dict.fromkeys(out))
 
@@ -798,10 +798,8 @@ def _selftest_jsx_text_gap() -> bool:
 
 # ---- run17 差1〜4: 表の行の注記・合計の構成・同じ src の画面項目 --------------------------------------------------
 def _src_text(sp) -> str:
-    """spec の出典(src の先頭)を「ファイル名:開始行-終了行」にする。指摘の文に載せる。呼出元: check_row_note_in_remarks。"""
-    s = (sp.get("src") or [{}])[0]
-    a, b = s.get("line_start"), s.get("line_end") or s.get("line_start")
-    return f"{Path(str(s.get('file') or '')).name}:{a}-{b}"
+    """spec の出典(src の先頭)を「ファイル名:行の範囲」(_vs_common.span)にする。指摘の文に載せる。呼出元: check_row_note_in_remarks。"""
+    return _vs_common.span((sp.get("src") or [{}])[0])
 
 
 def check_row_note_in_remarks(d) -> list:
@@ -979,7 +977,7 @@ def check_same_src_items(d) -> list:
     for key, its in groups.items():
         if len(its) < 2:
             continue
-        spans = "・".join(f"{Path(f).name}:{a}-{b}" for f, a, b in key)
+        spans = "・".join(f"{Path(f).name}:{_vs_common.lines(a, b)}" for f, a, b in key)
         ids = "・".join(str(i.get("no") or i.get("item_name")) for i in its)
         names = "・".join(str(i.get("item_name")) for i in its)
         out.append(_vs_common.warn(

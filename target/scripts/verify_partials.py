@@ -578,7 +578,8 @@ def check_explanation_warn(frags):
                 #      「?」になり、どの行・どの語か分からなかった(run17〜19 で毎回)。行の名前は _row_name で引き(無ければ最初の文字列の欄)、
                 #      語(説明の識別子)と出典(file:行)も並べる。
                 s0 = next((s for s in r["src"] if isinstance(s, dict)), {})
-                where = f"{Path(str(s0.get('file') or '')).name}:{s0.get('line_start')}-{s0.get('line_end')}"
+                import _vs_common
+                where = _vs_common.span(s0)
                 found.append((unit, f"{_row_name(r)}(語 {', '.join(sorted(terms)[:4])} / 出典 {where})"))
     if not found:
         return []

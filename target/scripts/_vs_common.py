@@ -115,3 +115,16 @@ def load(inter_dir: Path, feature: str) -> dict:
 def warn(tag: str, where: str, msg: str) -> str:
     """検査の指摘の1行。[WARN] 付きなので verify_vs_source の終了コードに影響しない。呼出元: 各 _vs_* の検査。"""
     return f"[WARN] [{tag}] {where}: {msg}"
+
+
+def lines(a, b=None) -> str:
+    """行の範囲の表記。開始行と終了行が同じ(終了行が無い)なら「288」、違えば「285-291」。
+    WHY(2026-10-16): 1行の出典を「288-288」と書くと、範囲なのか1行なのかを読み手が確かめ直す。表記をここに集め、指摘・ログの全部でそろえる。
+    呼出元: span、_vs_map・_vs_flow の検査、_compose_src_line・verify_partials のログ。"""
+    return f"{a}" if b is None or b == a else f"{a}-{b}"
+
+
+def span(s) -> str:
+    """出典(src の1要素)を「ファイル名:行の範囲」にする。行の範囲は lines の表記。呼出元: lines と同じ。"""
+    s = s if isinstance(s, dict) else {}
+    return f"{Path(str(s.get('file') or '')).name}:{lines(s.get('line_start'), s.get('line_end'))}"

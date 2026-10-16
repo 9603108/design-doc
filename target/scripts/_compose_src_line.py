@@ -21,6 +21,8 @@ import json
 import re
 from pathlib import Path
 
+import _vs_common
+
 ORDER = 20
 
 
@@ -116,8 +118,8 @@ def _fix_list(srcs, fix, label, log):
     fixed = [fix(s) if isinstance(s, dict) else s for s in srcs]
     for a, b in zip(srcs, fixed):  # WHY: 重複を消す前に対で比べる(消した後は要素の位置が対応しない)
         if a != b:
-            log.append(f"[出典] {label} の src {Path(str(a.get('file'))).name}:{a.get('line_start')}-{a.get('line_end')} を "
-                       f"{b.get('line_start')}-{b.get('line_end')} に直す(指す名前が本文に出る行へ。0始まりの混同)")
+            log.append(f"[出典] {label} の src {_vs_common.span(a)} を "
+                       f"{_vs_common.lines(b.get('line_start'), b.get('line_end'))} に直す(指す名前が本文に出る行へ。0始まりの混同)")
     return _uniq(fixed)
 
 
