@@ -14,7 +14,9 @@ d(_vs_common.load の戻り)の読み方は _vs_common の docstring。
      例外: check_csv_column_name([CSV列名])・check_common_logic_dropped([共通ロジック漏れ]の sql_condition)・check_docstring_count_example([例示値の実数])・
      check_jsx_text_gap([JSXの空白])は、依頼で ERROR とされたため、このファイルの _error で [ERROR] の行を作る(終了コード 1)。
      check_row_note_in_remarks([注記])も ERROR(合成 _compose_item_notes が足すので、合成の後に出るのは決められなかった項目だけ)。
-     check_total_composition([合計の構成])・check_same_src_items([src重複])は WARN(言い換え・同じ範囲が正しい場合があるため)。
+     check_total_composition([合計の構成])は ERROR(2026-10-16 に WARN から上げた。run13〜20 の実走で誤検出 0 件・正しい指摘は run17(IT40)と run20(IT44)の2件で、
+     WARN のままだと run19・run20 と続けて直されなかった。備考が除外を書く文は検査が通す)。
+     check_same_src_items([src重複])は WARN(同じ範囲が正しい場合があるため)。
      check_common_logic_dropped の sql_fragment(部品の定数)は WARN。
      行の書式は「[ERROR] [タグ] 場所: 内容 → 差し戻し先 S1」(差し戻し先は msg の末尾)。
   3. 関数を CHECKS に足す。
@@ -862,14 +864,19 @@ def csv_parts(csv) -> list:
     return parts if len(parts) >= 2 else []
 
 
+_EXCLUDE_NEG = re.compile(r"含まない|含めない|含まれない|除く|除いた|除き|対象外|ではない|入らない")
+
+
 def check_total_composition(d) -> list:
-    """合計の行の CSV 見出しが「合計1(売上+釣銭)」のように構成を列挙しているとき、備考がその構成より多くの列を挙げていないかを見る(WARN・差し戻し先 S1)。
+    """合計の行の CSV 見出しが「合計1(売上+釣銭)」のように構成を列挙しているとき、備考がその構成より多くの列を挙げていないかを見る(ERROR・差し戻し先 S1)。
     備考が挙げる列 = 同じ表の他の行の label(正規化して3字以上。この行の label・csv 名・注記の字面に含まれるものは除く)のうち、備考に出るもの。
     csv 名の部品(売上・釣銭)は、備考の地の文に出るか、備考が挙げた列の名前と包含関係(釣銭 ⊂ 釣銭準備金)で対になるかで1つずつ使い切る。
     部品に対にならなかった列は、csv 名にも label にも注記にも無い構成要素。
     WHY(run17 差4): IT40 合計(左)の備考「売上と釣銭準備金・売上回収金を合わせた合計」は、csv 名が示す構成「売上+釣銭」に無い売上回収金を足した。
     csv 名の部品「売上」は「売上回収金」にも含まれるので、包含だけで対にすると見逃す。地の文の「売上」を先に部品へ使い切る。
-    WARN にする理由: 備考が「売上回収金は含まない」のように除外を書くと同じ形になる(誤検出)。構成の言い換えの正誤は機械では決められない。
+    ERROR に上げた理由(2026-10-16): WARN では run17 の IT40 も run19・run20 の合計(IT44「釣銭準備金」)も直されないまま通った。run13〜20 の実走で出た指摘は
+    run17 の IT40 と run20 の IT44 の2件で、どちらも正しい指摘(ソースに無い構成要素を足した)、誤検出は 0 件。
+    残る誤検出の型「売上回収金は含まない」のように除外を書いた備考は、その列を挙げた文に除外の語(_EXCLUDE_NEG)があれば挙げたことにしない。
     構成の列挙が無い csv 名・csv 名が無い行は見ない(「小計5(現金計)」の構成は名前から決まらない)。呼出元: _vs_map.run(CHECKS)。"""
     rd, main = d.get("react_draft"), d.get("main")
     if not rd or not main:
@@ -889,10 +896,18 @@ def check_total_composition(d) -> list:
             if len(ln) >= 3 and ln != own and ln not in fixed:
                 raw.setdefault(ln, o.get("label"))
         rest = _notes.norm(it.get("remarks"))
+        # WHY(2026-10-16 ERROR 化): 「売上回収金は含まない」のように除外を書いた文は、その列を構成に挙げていない。
+        #      列を挙げた文のどれもが除外の語を持つときは、挙げたことにしない(ERROR で誤検出を出さないため)
+        sents = [(s, _notes.norm(s)) for s in re.split(r"[。\n]", str(it.get("remarks") or ""))]
+
+        def only_negated(name):
+            hits = [s for s, n in sents if name in n]
+            return bool(hits) and all(_EXCLUDE_NEG.search(s) for s in hits)
         mentioned = []
         for ln in sorted(raw, key=lambda x: (-len(x), x)):
             if ln in rest:
-                mentioned.append(ln)
+                if not only_negated(ln):
+                    mentioned.append(ln)
                 rest = rest.replace(ln, "|")
         left = [p for p in (_notes.norm(x) for x in parts) if p and p not in rest]
         extra = []
@@ -903,7 +918,7 @@ def check_total_composition(d) -> list:
             else:
                 left.remove(hit)
         if extra:
-            out.append(_vs_common.warn(
+            out.append(_error(
                 "合計の構成", f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})",
                 f"備考が構成要素に挙げる「{'」「'.join(extra)}」が、CSV 見出し「{sp.get('csv')}」の構成({'+'.join(parts)})にも注記にも無い。"
                 f"構成は CSV 見出しの括弧の字面({'+'.join(parts)})だけで書く → 差し戻し先 S1"))
@@ -932,7 +947,11 @@ def _selftest_total_composition() -> bool:
     no_csv = check_total_composition(d_with("左の表。売上と釣銭準備金・売上回収金を合わせた合計", csv=None))
     nodata = d_with("x")
     nodata["react_draft"] = {}
-    return (len(bad) == 1 and bad[0].startswith("[WARN] [合計の構成] screen_layout.items[IT40](合計)") and "「売上回収金」" in bad[0] and "釣銭準備金" not in bad[0]
+    # 誤検出の型: 除外を書いた備考(売上回収金は含まない)は挙げたことにしない。除外でなく足した文(別の文に除外の語がある)は挙げたまま
+    neg = check_total_composition(d_with("左の表。売上と釣銭準備金の合計。売上回収金は含まない"))
+    mixed = check_total_composition(d_with("左の表。売上と釣銭準備金・売上回収金を合わせた合計。売上以外は含まない"))
+    return (len(bad) == 1 and bad[0].startswith("[ERROR] [合計の構成] screen_layout.items[IT40](合計)") and "「売上回収金」" in bad[0] and "釣銭準備金" not in bad[0]
+            and neg == [] and len(mixed) == 1
             and "差し戻し先 S1" in bad[0] and ok_a == [] and ok_b == [] and ok_c == [] and no_list == [] and no_csv == []
             and check_total_composition(nodata) == [] and csv_parts("合計1(売上+釣銭)") == ["売上", "釣銭"] and csv_parts("小計5(現金計)") == []
             and csv_parts("A（甲＋乙＋丙）") == ["甲", "乙", "丙"])

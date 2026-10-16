@@ -876,6 +876,82 @@ CHECKS.append(check_threshold_wording)
 SELFTESTS.append(selftest_threshold_wording)
 
 
+# 条件式の中の名前(「s.dead」の dead のように . の後ろのもの・「x.length」の length は除く)
+_COND_NAME = re.compile(r"(?<![\w.$])[A-Za-z_]\w*")
+
+
+def _spans_overlap(a, b) -> bool:
+    """src の配列 a・b のどれかが同じファイルで行範囲が重なるか。呼出元: check_display_toggle_vl。"""
+    return any(x.get("file") == y.get("file") and x.get("line_start") is not None and y.get("line_start") is not None
+               and x["line_start"] <= (y.get("line_end") or y["line_start"]) and y["line_start"] <= (x.get("line_end") or x["line_start"])
+               for x in a or [] if isinstance(x, dict) for y in b or [] if isinstance(y, dict))
+
+
+def check_display_toggle_vl(d) -> list:
+    """画面ソースの条件付き表示(react 下書きの behaviors の display_toggle)ごとに、表示切替の画面ルール(VL。kind=表示切替)があるかを見る(ERROR・差し戻し先 H4)。
+    対: VL の src が、条件付き表示の src と行で重なる。
+    WHY(2026-10-16 run20 差5): 取得エラーの表示(PosReport.tsx:288 の {error && <div className="error-note">})の VL が、H4 の書き出しから落ちたまま
+    after を通った(run19 は誤った文の VL9 があり、run20 は VL ごと無かった)。表示切替は H4 が1つずつ写す前提(H4 手順書)だが、1つ落ちても
+    他の VL が揃っていれば人が気付かない。検査の一覧(behaviors)は画面のソースの事実なので、落ちを機械で拾える。
+    見る対象: 条件に画面の state(state_initials)か派生の配列(derived_arrays。warnRows など)が出る表示切替だけ。
+    表の行の中の印(「空」「新」「※」。条件が行の変数 s.dead など)は、行の見出しの飾りで、画面の state の出し分けではないので見ない
+    (run13〜20 の全部で VL が無く、監査で差異に数えられていない)。
+    VL に src が1件も無い版(run14・run16〜19)は、行で結べないので何も言わない。呼出元: run(CHECKS)。"""
+    main, rd = d.get("main"), d.get("react_draft")
+    if not main or not rd:
+        return []
+    vls = [v for v in (main.get("validations") or main.get("validations_frontend") or []) if isinstance(v, dict)]
+    if not any(v.get("src") for v in vls):
+        return []
+    names = {s.get("state") for s in rd.get("state_initials") or [] if isinstance(s, dict) and s.get("state")}
+    names |= {s.get("name") for s in rd.get("derived_arrays") or [] if isinstance(s, dict) and s.get("name")}
+    toggles = [v for v in vls if v.get("kind") == "表示切替"]
+    items = [i for i in (main.get("screen_layout") or {}).get("items") or [] if isinstance(i, dict)]
+    out = []
+    for b in rd.get("behaviors") or []:
+        if not isinstance(b, dict) or b.get("kind") != "display_toggle" or not b.get("src"):
+            continue
+        if not (set(_COND_NAME.findall(str(b.get("cond") or ""))) & names):
+            continue
+        if any(_spans_overlap(v.get("src"), b["src"]) for v in toggles):
+            continue
+        s = b["src"][0]
+        at = f"{Path(str(s.get('file') or '')).name}:{s.get('line_start')}-{s.get('line_end') or s.get('line_start')}"
+        hit = [f"{i.get('no') or ''} {i.get('item_name')}".strip() for i in items if _spans_overlap(i.get("src"), b["src"])]
+        out.append(f"[ERROR] [表示切替VL] behaviors[{b.get('id')}]({at}。条件 {b.get('cond')}): 条件で出し分ける要素{'(' + '・'.join(hit[:3]) + ')' if hit else ''}に対応する表示切替の画面ルール"
+                   f"(validations の kind=表示切替。src がこの行を含む)が無い。条件付き表示は要素ごとに1件、条件の state と出す・消す内容を書く → 差し戻し先 H4")
+    return out
+
+
+def selftest_display_toggle_vl() -> bool:
+    """当たり: 取得エラーの表示(cond error。src 288)に表示切替の VL が無い → 1件。外れ: VL の src が重なる / 表の行の印(cond s.dead。state でない)/
+    VL に src が1件も無い版 / 表示切替でない kind の VL だけ(絞り込み)は → 当たりにならない(最後は当たり)。"""
+    f = "/x/P.tsx"
+    sp = lambda a, b=None: [{"file": f, "line_start": a, "line_end": b or a}]
+    rd = {"state_initials": [{"state": "error"}, {"state": "loading"}], "derived_arrays": [{"name": "warnRows"}],
+          "behaviors": [{"id": "BH04", "kind": "display_toggle", "cond": "loading", "src": sp(285)},
+                        {"id": "BH05", "kind": "display_toggle", "cond": "error", "src": sp(288)},
+                        {"id": "BH06", "kind": "display_toggle", "cond": "warnRows.length > 0", "src": sp(290, 291)},
+                        {"id": "BH01", "kind": "display_toggle", "cond": "s.dead", "src": sp(132)},
+                        {"id": "BH10", "kind": "data_filter", "cond": "showDead || !s.dead", "src": sp(124)}]}
+    vl = lambda no, kind, src: {"no": no, "field": "x", "kind": kind, "src": src}
+    main = {"validations": [vl("VL7", "表示切替", sp(290, 291)), vl("VL9", "表示切替", sp(285))],
+            "screen_layout": {"items": [{"no": "IT10", "item_name": "取得エラー", "src": sp(288)}]}}
+    got = check_display_toggle_vl({"main": main, "react_draft": rd})
+    ok = dict(main, validations=main["validations"] + [vl("VL10", "表示切替", sp(288))])
+    nosrc = dict(main, validations=[{"no": "VL7", "field": "x", "kind": "表示切替"}])
+    wrong_kind = dict(main, validations=main["validations"] + [vl("VL10", "絞り込み", sp(288))])
+    return (len(got) == 1 and got[0].startswith("[ERROR] [表示切替VL] behaviors[BH05](P.tsx:288。条件 error)") and "IT10 取得エラー" in got[0] and got[0].endswith("→ 差し戻し先 H4")
+            and check_display_toggle_vl({"main": ok, "react_draft": rd}) == []
+            and check_display_toggle_vl({"main": nosrc, "react_draft": rd}) == []
+            and len(check_display_toggle_vl({"main": wrong_kind, "react_draft": rd})) == 1
+            and check_display_toggle_vl({"main": main}) == [] and check_display_toggle_vl({}) == [])
+
+
+CHECKS.append(check_display_toggle_vl)
+SELFTESTS.append(selftest_display_toggle_vl)
+
+
 def run(inter_dir, feature) -> list:
     """d = _vs_common.load(...) を各 check に渡し、指摘の行を連結して返す。呼出元: _vs_checks_ext.run_all。"""
     d = _vs_common.load(Path(inter_dir), feature)

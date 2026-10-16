@@ -338,6 +338,30 @@ def _calc_targets(drafts, items, leaf):
             if isinstance(c, dict) and c.get("label") in names and leaf in (c.get("operands") or [])}
 
 
+def _csv_targets(drafts, items, leaf):
+    """応答の項目 leaf を CSV に出す出力(csv_exports)の、起動ボタンの画面項目名の集合。決まらなければ空。
+    WHY(run20 差1): CSV の列は画面の表示項目ではなく、field_usage にも使用として現れないので候補(_candidates)に入らない。S2 が
+    写し先を「CSV出力」(ボタン)にした店舗名・日数などの写しまで、候補の1番目(IT13・IT17 の表示項目)へ付け替えて壊していた。
+    結び方: csv_exports[].trigger_events の event_code → 同じ event_code の events[].src と行が重なる画面項目。
+    かつ、その csv_exports の行の組み立て(row_builder 等)に `.leaf` が出るときだけ(leaf を CSV に出さない出力なら、S2 の行は
+    CSV の写しではないので、従来どおり候補へ直す)。接続先: fill の _write_rows の keep(この項目への行は付け替えない)。推測しない。"""
+    word = re.compile(r"\." + re.escape(leaf) + r"\b")
+    names = set()
+    for d in drafts:
+        ev_src = {e.get("event_code"): [s for s in e.get("src") or [] if isinstance(s, dict)]
+                  for e in d.get("events") or [] if isinstance(e, dict)}
+        for ex in d.get("csv_exports") or []:
+            if not isinstance(ex, dict) or not word.search(json.dumps(ex, ensure_ascii=False)):
+                continue
+            for code in ex.get("trigger_events") or []:
+                for s in ev_src.get(code, []):
+                    # WHY: ボタンを囲む入れ物(フォーム等)まで保護すると、入れ物への誤った行も残るので内側の項目だけにする(_innermost)
+                    for i in _innermost(items, _items_at(items, s), s):
+                        if items[i].get("item_name"):
+                            names.add(items[i]["item_name"])
+    return names
+
+
 def _write_rows(api, path, cands, items, log, keep=frozenset()):
     """path の行を候補に合わせる。モデルの行の項目が候補にも keep(計算の出力先)にも無ければ候補の1番目へ入れ替え、候補で行が無いものは足す。
     keep の項目への行は S2 が結んだ計算の出力先なので触らない。keep への行は足さない(出力先ごとの文は S2 が書く事実で、機械の定型文では作れない)。"""
@@ -511,7 +535,8 @@ def fill(out, log):
                 continue
             cands = _candidates(states, leaf, drafts, usage, items, derived, cache)
             if cands:
-                _write_rows(api, path, cands, items, log, _calc_targets(drafts, items, leaf))
+                # WHY(run20 差1): calc の出力先に加え、CSV 出力のボタンも付け替えない(S2 が正しく結んだ CSV の写し)
+                _write_rows(api, path, cands, items, log, _calc_targets(drafts, items, leaf) | _csv_targets(drafts, items, leaf))
             elif _key_only(usage, states, leaf):
                 # WHY: 使用が key だけで候補が無い項目は、モデルが書いた写しの行も消す(V6)
                 _drop_rows(api, path, log)
@@ -871,6 +896,39 @@ def _selftest_fixed_title():
     print("[selftest OK] _compose_mapping 固定の見出しを写し先にしない(run17 差1)")
 
 
+def _selftest_csv_target():
+    """run20 差1: S2 が写し先を CSV 出力のボタンにした行(店舗名・日数など)は、候補(画面の表示項目)へ付け替えない。
+    (1) CSV に出る葉の行は、ボタンが入れ物の中にあっても残る。(2) CSV に出ない葉(.leaf が出力に無い)の行は従来どおり候補へ直す。
+    (3) 起動ボタンに結べない csv_exports(event が無い)は何も保護しない。(4) 2回目は何も変えない。"""
+    import copy
+    F = "/src/P.tsx"
+
+    def sp(a, b=None):
+        return [{"file": F, "line_start": a, "line_end": b or a}]
+    items = [{"item_name": "副題", "screen_no": "3", "src": sp(318)},
+             {"item_name": "操作欄", "screen_no": "3", "src": sp(280, 284)},
+             {"item_name": "CSV出力", "screen_no": "3", "src": sp(282)}]
+    drafts = [{"events": [{"event_code": "EV07", "src": sp(282)}],
+               "csv_exports": [{"function": "exportCsv", "trigger_events": ["EV07"], "row_builder": {"columns": [{"row_value": "r.shop_name"}]}}]}]
+    assert _csv_targets(drafts, items, "shop_name") == {"CSV出力"}, _csv_targets(drafts, items, "shop_name")  # 入れ物(操作欄)は含めない
+    assert _csv_targets(drafts, items, "days") == set()  # CSV に出ない葉は保護しない
+    assert _csv_targets([{"csv_exports": drafts[0]["csv_exports"]}], items, "shop_name") == set()  # 起動ボタンが決まらない
+    api = {"action": "x", "response_to_screen_mapping": [
+        {"api_field_path": "rows[].shop_name", "screen_item_name": "CSV出力", "transform": "店舗名をCSVに出す"},
+        {"api_field_path": "rows[].days", "screen_item_name": "CSV出力", "transform": "日数をCSVに出す"}]}
+    log = []
+    for leaf in ("shop_name", "days"):
+        _write_rows(api, f"rows[].{leaf}", [(0, None)], items, log, _calc_targets(drafts, items, leaf) | _csv_targets(drafts, items, leaf))
+    got = [(m["api_field_path"], m["screen_item_name"]) for m in api["response_to_screen_mapping"]]
+    # 店舗名は CSV に出るので S2 の行が残り、候補(副題)の行が足される。日数は CSV の出力に無いので、従来どおり候補(副題)へ直る
+    assert got == [("rows[].shop_name", "CSV出力"), ("rows[].shop_name", "副題"), ("rows[].days", "副題")], got
+    assert len(log) == 2, log
+    once = copy.deepcopy(api)
+    _write_rows(api, "rows[].shop_name", [(0, None)], items, [], _csv_targets(drafts, items, "shop_name"))
+    assert api == once, "2回目で変わった"
+    print("[selftest OK] _compose_mapping CSV 出力ボタンへの写しを付け替えない(run20 差1)")
+
+
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv:
@@ -879,6 +937,7 @@ if __name__ == "__main__":
         _selftest_calc_target()
         _selftest_count_rows()
         _selftest_fixed_title()
+        _selftest_csv_target()
     else:
         print("usage: _compose_mapping.py --selftest (fill は _units.compose から呼ばれる)")
         sys.exit(2)

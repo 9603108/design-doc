@@ -57,11 +57,96 @@ def _top_level_names(tree) -> set:
     return names
 
 
+def _dict_keys(tree) -> dict:
+    """モジュールの先頭の「名前 = {文字列: …}」の辞書の、名前 → キーの文字列の集合。キーに式・** が混じる辞書は入れない(キーが決められない)。
+    WHY: 入口(handler の ACTIONS・WRITE_ACTIONS)が action 名で呼ぶ関数を引く辞書なので、画面の API の action がどの辞書にあるかで、通る経路を決める。"""
+    import ast
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            keys = node.value.keys
+            if keys and all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in keys):
+                out[node.targets[0].id] = {k.value for k in keys}
+    return out
+
+
+def _unreached_ranges(tree, actions) -> list:
+    """画面の API の action では通らない経路の行範囲 [(開始, 終了)]。
+    WHY(2026-10-16 run20 の誤検知): 入口の dispatch は読取と書込みの両方の経路を1つの関数に持つ。書込みの経路(write_fn が None でないときだけ
+    入る if の中。write_policy.check もここ)は、画面の API(読取の action。WRITE_ACTIONS に無い)では通らない。
+    関数の範囲だけで使う名前を数えると、通らない経路の名前(write_policy)まで「画面の API が使う名前」に数えて meta.backend_files に無いと指摘した。
+    決め方: 「v = D.get(…)」「v = D[…]」の D が先頭の辞書(_dict_keys)で、画面の action がどれもキーに無いなら v は常に None。
+    その v だけで決まる if(「if v」「if v is not None」「if v and …」)の本体と、「if v is None」「if not v」の else の側は通らない。
+    見分けのつかない形(キーが式の辞書・別の条件が混じる if)は通らないとみなさない(取りすぎる側。見逃しはあっても誤検知は増やさない)。"""
+    import ast
+    dicts = _dict_keys(tree)
+    out = []
+    # WHY: 変数名(fn・write_fn)は関数ごとに別の意味を持つので、関数ごとに「常に None の変数」を決める(別の関数の同名の変数を巻き込まない)
+    for scope in [fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        none_vars = set()
+        for node in ast.walk(scope):
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+                continue
+            v = node.value
+            base = None
+            if isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "get" and isinstance(v.func.value, ast.Name):
+                base = v.func.value.id
+            elif isinstance(v, ast.Subscript) and isinstance(v.value, ast.Name):
+                base = v.value.id
+            if base in dicts and not (dicts[base] & set(actions)):
+                none_vars.add(node.targets[0].id)
+        if none_vars:
+            out += _dead_branches(scope, none_vars)
+    return out
+
+
+def _dead_branches(scope, none_vars) -> list:
+    """scope の中で、none_vars(常に None の変数)だけで決まる if の、通らない側の行範囲 [(開始, 終了)]。呼出元: _unreached_ranges。"""
+    import ast
+
+    def is_none(t):
+        return isinstance(t, ast.Name) and t.id in none_vars
+
+    def truthy_false(t):
+        """t が、none_vars の変数が真/None でないという意味で、常に偽になる条件か。"""
+        if is_none(t):
+            return True
+        if isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.IsNot) and is_none(t.left) \
+                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value is None:
+            return True
+        if isinstance(t, ast.BoolOp) and isinstance(t.op, ast.And):
+            return any(truthy_false(x) for x in t.values)
+        return False
+
+    def truthy_true(t):
+        """t が、none_vars の変数が None という意味で、常に真になる条件か。"""
+        if isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Is) and is_none(t.left) \
+                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value is None:
+            return True
+        if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and is_none(t.operand):
+            return True
+        return False
+
+    def span(stmts):
+        return (stmts[0].lineno, max(getattr(s, "end_lineno", s.lineno) for s in stmts)) if stmts else None
+
+    out = []
+    for node in ast.walk(scope):
+        if not isinstance(node, ast.If):
+            continue
+        dead = span(node.body) if truthy_false(node.test) else (span(node.orelse) if truthy_true(node.test) else None)
+        if dead:
+            out.append(dead)
+    return out
+
+
 def check_backend_files(d) -> list:
     """画面の API の関数の本体が使う名前の定義元(同じフォルダの .py)が meta.backend_files に無いものを指摘する。
     WHY: 一覧に無いモジュールは設計書の対象外になり、画面の処理がその定義(検査・変換など)を追えなくなるため。
     ただし入口(handler など)が全画面ぶん import する大量のモジュールは、画面の API が使わないので指摘しない
     (extract_source_files._imported_shared_modules と同じ「API の関数が使う名前の定義元だけ・1段」の基準)。
+    ただし関数の中でも、画面の API の action では通らない経路(入口の dispatch の書込みの経路。write_fn が None のときは入らない if の中)
+    の名前は数えない(_unreached_ranges。2026-10-16 run20 の誤検知: 読取の API は write_policy.check を通らない)。
     Where: 起点は d["main"]["api_spec"][*]["src"](関数の行範囲)。ソースは d["screen_config"]["project_root"] を展開して解く。
     差し戻し先は extract_source_files.py(一覧を作る段)。"""
     import ast
@@ -79,6 +164,8 @@ def check_backend_files(d) -> list:
         p = e.get("path") if isinstance(e, dict) else e
         if p:
             listed.add(posixpath.normpath(p))
+    # 画面の API の action(通る経路を決める。_unreached_ranges)
+    actions = {a.get("action") for a in main.get("api_spec") or [] if a.get("action")}
     # 起点: 画面の API の関数の置き場(ファイル → 行範囲の並び)
     ranges: dict = {}
     for api in main.get("api_spec") or []:
@@ -97,7 +184,9 @@ def check_backend_files(d) -> list:
             tree = ast.parse(f.read_text(encoding="utf-8", errors="ignore"))
         except SyntaxError:
             continue
-        in_span = lambda n: any(a <= getattr(n, "lineno", -1) <= b for a, b in spans)
+        # WHY(2026-10-16): 関数の範囲のうち、画面の API の action では通らない経路(書込みの if など)の名前は数えない(_unreached_ranges)
+        dead = _unreached_ranges(tree, actions)
+        in_span = lambda n: any(a <= getattr(n, "lineno", -1) <= b for a, b in spans) and not any(x <= getattr(n, "lineno", -1) <= y for x, y in dead)
         bare, dotted = set(), set()
         for node in ast.walk(tree):
             if not in_span(node):
@@ -161,8 +250,35 @@ def selftest_check_backend_files() -> bool:
     return len(hit) == 1 and "h/helper.py" in hit[0] and miss == []
 
 
+def selftest_backend_files_write_path() -> bool:
+    """2026-10-16 run20 の型: 入口の dispatch が読取と書込みの両方の経路を持ち、書込みの経路(WRITE にある action のときだけ入る if)の中で
+    writer.check を呼ぶ。読取の action(READ にある)の API は writer を通らないので指摘しない。書込みの action(WRITE にある)の API は通るので指摘する。
+    当たり: action w(書込み)→ writer.py が一覧に無く 1件。外れ: action a(読取)→ 0件(helper は一覧にある)。
+    外れ: 書込みの辞書のキーが式(**展開)で決まらないとき、通らないとみなさず 1件(取りすぎる側)。"""
+    import tempfile
+    head = ("import helper\nimport writer\nREAD = {\"a\": 1}\nWRITE = {\"w\": 2}\n"
+            "def disp(action):\n    fn = READ.get(action)\n    wfn = WRITE.get(action)\n"
+            "    if wfn is not None:\n        return writer.check(action)\n    return helper.f(fn)\n")
+    unknown = head.replace('WRITE = {"w": 2}', 'WRITE = {"w": 2, **READ}')
+    files = {"h/q.py": head, "h/helper.py": "def f(x):\n    return 1\n", "h/writer.py": "def check(a):\n    return None\n"}
+
+    def case(action, text=head):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, body in dict(files, **{"h/q.py": text}).items():
+                fp = Path(tmp) / rel
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(body, encoding="utf-8")
+            d = {"main": {"meta": {"backend_files": [{"path": "h/q.py", "kind": "backend", "description": ""}, {"path": "h/helper.py", "kind": "backend", "description": ""}]},
+                          "api_spec": [{"action": action, "src": [{"file": str(Path(tmp) / "h/q.py"), "line_start": 5, "line_end": 10}]}]},
+                 "screen_config": {"project_root": tmp}}
+            return check_backend_files(d)
+    write, read, unk = case("w"), case("a"), case("a", unknown)
+    return (len(write) == 1 and "h/writer.py" in write[0] and read == [] and len(unk) == 1 and "h/writer.py" in unk[0])
+
+
 CHECKS.append(check_backend_files)
 SELFTESTS.append(selftest_check_backend_files)
+SELFTESTS.append(selftest_backend_files_write_path)
 
 
 def _column_name(arg: str) -> str:
