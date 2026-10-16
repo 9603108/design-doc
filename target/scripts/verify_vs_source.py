@@ -511,8 +511,8 @@ def check_calcs(calcs, candidates):
         # WHY: num() 等を通らないオペランドを持つ式に「値が無いときは 0」と書くと、ソースに無い扱いを書くことになる(run9 の CA1)
         guard = cand.get("operand_guard") or {}
         nones = [o for o in cand.get("operands") or [] if guard.get(o) == "none"]
-        if nones and _ZERO_FILL.search(c.get("remarks") or ""):
-            problems.append(f"[ERROR] [式の欠損] {where}: 値が無いときの扱いはソースに無い(オペランド {'・'.join(nones)} が num() 等を通らない)。「0 として扱う」を外す → 差し戻し先 S2")
+        if nones and zero_fill_phrase(c.get("remarks")):
+            problems.append(f"[ERROR] [式の欠損] {where}: 値が無いときの扱いはソースに無い(オペランド {'・'.join(nones)} が num() 等を通らない)。「0 として扱う」を外す → 差し戻し先 H4")
         words = (c.get("formula") or "") + (c.get("remarks") or "")
         if "Math.floor" in cand.get("funcs", []) and not re.search(r"切り捨|切捨|FLOOR|floor", words):
             problems.append(f"[WARN] [式] {where}: ソースは Math.floor(切り捨て)だが式に切り捨ての語が無い → 差し戻し先 H4")
@@ -534,6 +534,24 @@ def check_calcs(calcs, candidates):
 
 # WHY: 値が無いときを「0 として扱う」と書いた備考の形(check_calcs が見る)
 _ZERO_FILL = re.compile("0 として|値が無いとき[^。]*0|欠損[^。]*0")
+# WHY(run20): 「計算は 0 補完をしない」のような否定の文、「表示は値が無いと 0 になる」のような計算以外(表示)の文は、0 補完を書いたことにならない
+_NEGATION = re.compile("ない|せず|なし|ず、|ません|除く|外す")
+_DISPLAY_WORDS = re.compile("表示|画面")
+
+
+def zero_fill_phrase(remarks):
+    """remarks のうち「0 として扱う」と書いた語句(節ごとに見る。否定の節・表示を述べる節は拾わない)。無ければ None。"""
+    for sent in re.split("[。\n]", remarks or ""):
+        for m in _ZERO_FILL.finditer(sent):
+            # 語句をまたぐ読点までを、その語句の節とする
+            a = sent.rfind("、", 0, m.start()) + 1
+            b = sent.find("、", m.end())
+            clause = sent[a:] if b < 0 else sent[a:b]
+            if not (_NEGATION.search(clause) or _DISPLAY_WORDS.search(clause)):
+                return m.group(0)
+    return None
+
+
 _OPERATION_TYPES = {"ComboBox", "Calendar", "Checkbox", "Input", "Button", "TextArea"}
 # jsx_elements のうち表示専用の要素(_react_facts._DISPLAY_HINT の tag と同じ)。check_items の (1)〜(3) の対象外
 _DISPLAY_TAGS = {"span", "strong", "h1", "h2", "a", "table"}
@@ -1842,6 +1860,14 @@ def selftest():
     cg_calc = [{"name": "差引額", "formula": "差引額 = 売上 - 返品", "remarks": "返品が無いときは 0 として扱う", "inputs": [{"name": "売上"}, {"name": "返品"}]}]
     assert [g for g in check_calcs(cg_calc, cg) if g.startswith("[ERROR] [式の欠損]")], check_calcs(cg_calc, cg)
     assert not [g for g in check_calcs([dict(cg_calc[0], remarks="")], cg) if "[式の欠損]" in g], "備考が空なのに ERROR"
+    assert check_calcs(cg_calc, cg)[0].endswith("差し戻し先 H4"), "差し戻し先が H4 でない"
+    # 否定の文・表示について述べた文は拾わない。肯定の文は拾う(読点をまたぐ形も)
+    for ok in ("計算は 0 補完をしない", "計算は返品をそのまま引き、値が無いときの 0 補完はしない（X.tsx 80 行）。返品の表示は値が無いと 0 になる",
+               "画面では欠損を 0 と表示する"):
+        assert zero_fill_phrase(ok) is None, ok
+        assert not [g for g in check_calcs([dict(cg_calc[0], remarks=ok)], cg) if "[式の欠損]" in g], ok
+    for ng in ("返品が無いときは 0 として扱う", "値が無いときは、0 とする", "計算は引き算。欠損は 0 として扱う"):
+        assert zero_fill_phrase(ng), ng
     # 日数の指摘(説明文だけ見る)。正例: 単位を日数と説明した説明文は指摘。負例: 表示名・ソースの文字列の一致・単位の補足(行数・集計単位による)は通す
     assert _day_unit_claim("期間内の会計日数") and _day_unit_claim("店舗ごとの集計日数を表示する", {"日数"}), "説明文の日数を拾わない"
     assert not _day_unit_claim("期間内の会計日数", {"期間内の会計日数"}), "ソースの文字列と一致する文言を指摘した"
