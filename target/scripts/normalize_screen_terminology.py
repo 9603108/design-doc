@@ -50,15 +50,17 @@ from _config_loader import (
 #          拾えない。直後のモジュール先頭アクセサ（import 時に実行）より前に解決し、明示で渡す
 # 接続情報: 中間 JSON は _config_loader.INTERMEDIATE_DIR / "{機能名}.json"、
 #          設定は同ディレクトリの "{機能名}_screen_config.json"（アクセサ経由で読む）
-FEATURE_NAME = get_feature_name_from_argv()
+# WHY: --selftest は機能名も画面設定も要らない(convert_events_location_action.py と同じ流儀)。仮の機能名・空の辞書で import を通す
+SELFTEST_MODE = "--selftest" in sys.argv
+FEATURE_NAME = "selftest" if SELFTEST_MODE else get_feature_name_from_argv()
 INTERMEDIATE_JSON = INTERMEDIATE_DIR / f"{FEATURE_NAME}.json"
 
 # v30: AREA_ALIAS / SCREEN_NAME_ALIAS は screen_config.json から動的取得（モジュールロード時に1回）
 # 意味合い: 画面別ハードコードを画面別 JSON に外出しすることで、本スクリプトは画面非依存の汎用処理になる
-AREA_ALIAS = get_area_aliases(FEATURE_NAME)
-SCREEN_NAME_ALIAS = get_screen_name_aliases(FEATURE_NAME)
+AREA_ALIAS = {} if SELFTEST_MODE else get_area_aliases(FEATURE_NAME)
+SCREEN_NAME_ALIAS = {} if SELFTEST_MODE else get_screen_name_aliases(FEATURE_NAME)
 # v51: 項目名エイリアス（「検索条件チェックボックス」→「検索条件」のような表現揺らぎ吸収）
-ITEM_NAME_ALIAS = get_item_name_aliases(FEATURE_NAME)
+ITEM_NAME_ALIAS = {} if SELFTEST_MODE else get_item_name_aliases(FEATURE_NAME)
 
 
 def _require_keys(node: dict, keys: tuple, where: str) -> None:
@@ -153,7 +155,7 @@ def resolve_item(item_no: int, item_name_raw: str, items_by_no: dict, items_by_n
 #          「（編集モード）」の任意部分と後続部分は従来のまま（動作を変えない）
 # 接続情報: screen_name は _config_loader.get_screen_name(FEATURE_NAME) が {機能名}_screen_config.json から読む。
 #          空だと「^(...)の」が画面名なしの文にも一致してしまうため、ここで止める
-_SCREEN = re.escape(get_screen_name(FEATURE_NAME))
+_SCREEN = re.escape("テスト画面" if SELFTEST_MODE else get_screen_name(FEATURE_NAME))
 if not _SCREEN:
     raise SystemExit(f"screen_name 未設定: {FEATURE_NAME}_screen_config.json の screen_name を指定してください")
 # 1. {画面名}の{エリア}[{no}]{項目}を{動作}する
@@ -204,6 +206,66 @@ def parse_trigger(trigger: str):
     return None
 
 
+def refine_by_known_names(trigger: str, parsed, areas_by_name: dict, items_by_name: dict):
+    """parse_trigger の結果を、画面の既知のエリア名・項目名で取り直す(2026-10-16)。
+
+    目的: 項目名に「を」を含む(「棚数を1減らす」「担当割りの行を外す」等)と、PATTERN_* の「最初の を」で
+          項目が「棚数」のように切り詰められ、location が権威語彙に無く ERROR になる。
+    意味合い: 画面名・エリア名の後ろの文に、既知の項目名(items[].item_name)を長いものから順に「{項目名}を」で当て、
+          当たったものを項目とする(エリア名も長いものから順に「{エリア名}の」で当てる)。
+          どれにも当たらないときは parsed を変えず、従来の切り方のまま。[N] 形式は、[N] の直後の文に当てる。
+    接続情報: normalize_event が parse_trigger の直後に呼ぶ。parsed を直接書き換えて返す。
+    """
+    if not parsed or not trigger:
+        return parsed
+    body = trigger.strip()
+    screen = parsed.get("screen") or ""
+    if not body.startswith(screen + "の"):
+        return parsed
+    rest = body[len(screen) + 1:]
+    area = None
+    if parsed.get("item_no") is not None:
+        tag = f"[{parsed['item_no']}]"
+        idx = rest.find(tag)
+        if idx < 0:
+            return parsed
+        tail = rest[idx + len(tag):]
+    elif parsed.get("item_name_raw") is None:
+        tail = rest
+        for name in sorted(areas_by_name, key=len, reverse=True):
+            if name and rest.startswith(name + "の"):
+                area = name
+                tail = rest[len(name) + 1:]
+                break
+    else:
+        return parsed
+    for name in sorted(items_by_name, key=len, reverse=True):
+        # 「{項目名}ボタンを」のように種別語が挟まる形も同じ項目とする(resolve_item も同じ種別語を落とす)
+        sm = re.match(re.escape(name) + r'(?:ボタン|タブ|リンク|フィールド)?を', tail) if name else None
+        if not sm:
+            continue
+        end = sm.end()
+        if parsed.get("item_no") is not None:
+            # [N] 形式: 今の切り方より長い項目名に当たったときだけ置き換える(エリア・番号はそのまま)
+            if len(name) > len((parsed.get("item_name_raw") or "").strip()):
+                parsed["item_name_raw"] = name
+                parsed["action_raw"] = _strip_action(tail[end:])
+        else:
+            parsed["area_raw"] = area
+            parsed["item_name_raw"] = name
+            parsed["action_raw"] = _strip_action(tail[end:])
+        break
+    return parsed
+
+
+def _strip_action(s: str) -> str:
+    """動作句の末尾の句点と「する」を落とす(PATTERN_* の (.+?)(?:する)?[。.]? と同じ結果にする)。"""
+    s = s.strip()
+    s = re.sub(r'[。.]\s*$', '', s)
+    s = re.sub(r'する$', '', s)
+    return s
+
+
 def normalize_event(ev: dict, areas_by_name: dict, items_by_no: dict, items_by_name: dict) -> dict:
     """events[].location を権威語彙に正規化、area_ref / item_ref_no を付与。
 
@@ -213,7 +275,7 @@ def normalize_event(ev: dict, areas_by_name: dict, items_by_no: dict, items_by_n
     """
     trigger = ev.get("trigger", "") or ""
     source_kind = ev.get("source_kind", "screen")
-    parsed = parse_trigger(trigger)
+    parsed = refine_by_known_names(trigger, parse_trigger(trigger), areas_by_name, items_by_name)
 
     new_location = []
     area_ref = None
@@ -444,7 +506,47 @@ def normalize_screen_mapping(data, items_by_name):
             # 完全一致しないものはそのまま（疑似項目として許容）
 
 
+def selftest() -> int:
+    """項目名に「を」を含む trigger が、既知の項目名で切り出されることを assert する。終了コード 0=OK / 1=NG。
+
+    接続情報: main() の --selftest から呼ぶ(機能名・中間 JSON は不要)。
+    """
+    area = {"area_name": "棚分析エリア", "area_no": 1}
+    names = ["棚数", "棚数を1減らす", "棚数を1増やす", "棚数を0.5増やす", "担当割りの行を外す", "分類1の棚数を戻す", "保存"]
+    items_by_no = {i + 1: {"no": i + 1, "item_name": n, "area_ref": 1} for i, n in enumerate(names)}
+    items_by_name = {it["item_name"]: [it] for it in items_by_no.values()}
+    areas_by_name = {area["area_name"]: area}
+
+    def loc(trigger):
+        ev = {"trigger": trigger, "source_kind": "screen"}
+        return normalize_event(ev, areas_by_name, items_by_no, items_by_name)["location"]
+
+    cases = [
+        ("テスト画面の棚分析エリアの棚数を1減らすをクリックする。", ["テスト画面", "棚分析エリア", "棚数を1減らす"]),
+        ("テスト画面の棚分析エリアの棚数を1増やすボタンをクリックする。", ["テスト画面", "棚分析エリア", "棚数を1増やす"]),
+        ("テスト画面の棚分析エリアの棚数を0.5増やすをクリックする。", ["テスト画面", "棚分析エリア", "棚数を0.5増やす"]),
+        ("テスト画面の棚分析エリアの分類1の棚数を戻すをクリックする。", ["テスト画面", "棚分析エリア", "分類1の棚数を戻す"]),
+        ("テスト画面の棚分析エリアの担当割りの行を外すをクリックする。", ["テスト画面", "棚分析エリア", "担当割りの行を外す"]),
+        ("テスト画面の棚分析エリアの棚数を入力する。", ["テスト画面", "棚分析エリア", "棚数"]),
+        ("テスト画面の棚分析エリアの保存をクリックする。", ["テスト画面", "棚分析エリア", "保存"]),
+        ("テスト画面の棚分析エリア[3]棚数を1増やすをクリックする。", ["テスト画面", "棚分析エリア", "棚数を1増やす"]),
+        ("テスト画面の[2]棚数を1減らすをクリックする。", ["テスト画面", "棚分析エリア", "棚数を1減らす"]),
+    ]
+    ng = 0
+    for trigger, want in cases:
+        got = loc(trigger)
+        if got != want:
+            ng += 1
+            print(f"[NG] {trigger}\n  期待 {want}\n  実際 {got}", file=sys.stderr)
+    if ng:
+        return 1
+    print(f"[OK] normalize_screen_terminology selftest {len(cases)} 件")
+    return 0
+
+
 def main():
+    if SELFTEST_MODE:
+        sys.exit(selftest())
     if not INTERMEDIATE_JSON.exists():
         print(f"[ERROR] 中間JSONが見つかりません: {INTERMEDIATE_JSON}", file=sys.stderr)
         sys.exit(1)
