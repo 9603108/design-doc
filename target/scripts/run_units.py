@@ -86,7 +86,7 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     lines = [
         f"design-doc スキルの委譲の単位 {u}({spec['title']})を行う。機能名(FEATURE_NAME): {feat}。",
         "",
-        "【あなたの道具】cbm-serena(Serena と Bash を持ち、Read/Write は無い)。"
+        "【あなたの道具】cbm-serena(codeflow の find・refs・view・edit・create と Bash を持ち、Read/Write は無い)。"
         "最初に mcp__codebase-memory-mcp__list_projects を1回呼ぶこと。"
         "ファイルの読み書きは codeflow(mcp__codeflow__find / view / edit / create)で、絶対パスで行う。"
         "Bash は検査の python3 実行だけに使い、grep/cat/sed でソースを読まない。",
