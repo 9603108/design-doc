@@ -11,6 +11,7 @@
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 # 2026-10-05 汎用化: 中間 JSON の絶対パス直書きをやめ、機能名から組み立てる。

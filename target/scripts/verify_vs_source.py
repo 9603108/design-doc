@@ -24,6 +24,7 @@ import html
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 import tempfile
 from pathlib import Path
 

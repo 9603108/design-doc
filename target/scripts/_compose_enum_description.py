@@ -14,6 +14,7 @@ WHY(run15・run16): 画面の select(集計単位: レジ別・店舗別)の選�
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 140

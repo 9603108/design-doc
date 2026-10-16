@@ -24,6 +24,7 @@ WHY: 固定文の例示値は、画面に出る字面そのものが正解で、
 import html
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 60

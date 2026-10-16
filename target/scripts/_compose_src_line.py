@@ -19,8 +19,10 @@ WHY: H3 が書いた api_spec・request_params の src に、0始まりの行番
 """
 import json
 import re
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 import _vs_common
 
 ORDER = 20

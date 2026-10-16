@@ -14,7 +14,10 @@ WHY: S1 は「画面だけの整形(3桁区切りなど)」と「CSV でも使�
 下書き・出典が無いときは何もしない。
 """
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 ORDER = 170
 

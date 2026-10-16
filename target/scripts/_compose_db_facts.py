@@ -8,6 +8,7 @@ WHY: 物理列の空欄・句の物理名・表の論理名の付け忘れ・分
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 10

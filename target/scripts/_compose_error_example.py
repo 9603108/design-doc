@@ -15,6 +15,7 @@ WHY: 画面項目「取得エラーの表示」の example を S1(モデル)が�
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 130

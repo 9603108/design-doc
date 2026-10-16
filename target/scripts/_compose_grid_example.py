@@ -12,6 +12,7 @@ WHY(run13〜run16): S1(モデル)が表の例示値を「22行(空欄項目を�
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 140

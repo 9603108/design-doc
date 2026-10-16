@@ -498,11 +498,20 @@ def _add_setter_updates(ex, path0, lines0, statement):
     setX の呼出し行を含む関数ブロックを _block_end で閉じて足す(最大3件)。関数の形が見つからない行(JSX 内の onClick={() => setX(..)} など)はその1行だけ足す。"""
     _p, _s0, _e0, _l, body0 = ex.segs[0]
     words = {m.group(1) for m in _IDENT_RE.finditer(statement + "\n" + "\n".join(body0))} - set(_STOP)
-    setters = []
+    decls = []
     for ln in lines0:
         m = re.match(r"^\s*(?:const|let|var)\s*\[\s*(\w+)\s*,\s*(set\w+)\s*\]\s*=\s*useState", ln)
-        if m and (m.group(1) in words or m.group(2) in words):
-            setters.append(m.group(2))
+        if m:
+            decls.append((m.group(1), m.group(2)))
+    setters = [st for var, st in decls if var in words or st in words]
+    # WHY(G14 run20 の取り残し): 「「表示」を押した時点の値で集計する」の根拠は、入力の state(from)を別の state(applied)へ写す setApplied({ from, to }) にある。
+    # 文にも主抜粋にも applied は出ないので、参照する state の値を引数に渡している setter の呼出しも、更新する処理の候補に足す(後ろに回す)
+    refvars = {var for var, st in decls if var in words or st in words}
+    for var, st in decls:
+        if st in setters:
+            continue
+        if any(re.search(rf"\b{re.escape(st)}\s*\(", ln) and any(re.search(rf"\b{re.escape(r)}\b", ln.split(st, 1)[1]) for r in refvars) for ln in lines0):
+            setters.append(st)
     hooks = _hook_blocks(lines0)
     taken = 0
     for st in setters:
@@ -510,7 +519,13 @@ def _add_setter_updates(ex, path0, lines0, statement):
         for i, ln in enumerate(lines0):
             if taken >= 3:
                 return
-            if not call.search(ln) or any(h[0] <= i <= h[1] for h in hooks):
+            if not call.search(ln):
+                continue
+            # WHY(G14 run20 の取り残し): 読込中・エラーのように、JSX は state を読むだけで更新は useCallback / useEffect の中(load など)にある文は、
+            # hook の中の setter 呼出しを含む hook ごと足す(以前は hook の中を飛ばし、更新の根拠が抜粋に入らず unknown が残った)
+            hk = next((h for h in hooks if h[0] <= i <= h[1]), None)
+            if hk is not None:
+                taken += ex.add(path0, hk[0], hk[1], f"{st} を更新する処理(hook{(' ' + hk[2]) if hk[2] else ''})", BLOCK_MAX)
                 continue
             indent = len(ln) - len(ln.lstrip())
             start = next((k for k in range(i, max(i - BLOCK_MAX, -1), -1)
@@ -913,13 +928,41 @@ def _selftest():
         if g14_c["src_excerpt"] != _excerpt({"file": str(ap), "line_start": 13, "line_end": 13}, "", {}, merged_g14, stmt_g14):
             print("[selftest NG] src_excerpt が従来の予算の抜粋(_excerpt の既定)と変わった")
             return 0
+        # G14(取り残し): (a) 読込中の表示は state を読むだけで、更新(setLoading)は useCallback の hook の中にある
+        # (b) 入力の state(from)を別の state(applied)へ写す setApplied({ from }) は、文にも主抜粋にも applied が出なくても抜粋に入る
+        hk_src = [
+            "const [loading, setLoading] = useState(false);", "const [from, setFrom] = useState('a');", "const [applied, setApplied] = useState({ from: 'a' });",
+            "const load = useCallback(() => {", "  setLoading(true);", "  fetchX().finally(() => setLoading(false));", "}, [applied]);",
+            "// pad1", "// pad2", "// pad3", "// pad4", "// pad5", "// pad6", "// pad7",
+            "const view = (", "  <div>", "    {loading && <span>wait</span>}", "    <input value={from} onChange={(e) => setFrom(e.target.value)} />", "  </div>", ");",
+            "const onSubmit = (e) => {", "  e.preventDefault();", "  setApplied({ from });", "};"]
+        hk = Path(tmp) / "hk.tsx"
+        hk.write_text("\n".join(hk_src) + "\n", encoding="utf-8")
+        ex_a = _excerpt({"file": str(hk), "line_start": hk_src.index("    {loading && <span>wait</span>}") + 1, "line_end": hk_src.index("    {loading && <span>wait</span>}") + 1}, "", {}, {}, "取得が終わるまでの間だけ表示する")
+        for need in ("setLoading を更新する処理(hook load)", "setLoading(true)", ".finally(() => setLoading(false))"):
+            if need not in ex_a:
+                print(f"[selftest NG] G14 hook の中の state 更新 {need!r} が抜粋に入らない: {ex_a!r}")
+                return 1
+        ex_b = _excerpt({"file": str(hk), "line_start": hk_src.index("    <input value={from} onChange={(e) => setFrom(e.target.value)} />") + 1,
+                         "line_end": hk_src.index("    <input value={from} onChange={(e) => setFrom(e.target.value)} />") + 1}, "", {}, {}, "押した時点の値で集計する")
+        for need in ("setApplied を更新する処理", "setApplied({ from })"):
+            if need not in ex_b:
+                print(f"[selftest NG] G14 別の state へ写す更新 {need!r} が抜粋に入らない: {ex_b!r}")
+                return 1
     print("[OK] selftest: 判定項目の形（抜粋・owner・主語・キャッシュの除外）と参照先の追加")
     return 0
 
 
 def main(argv):
     if "--selftest" in argv:
-        return _selftest()
+        # WHY: _selftest は NG を表示しても return 0 する枝が多く、そのままでは失敗が exit 0 に埋もれる。[selftest NG] が出たら exit 1 にする
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _selftest()
+        sys.stdout.write(buf.getvalue())
+        return 1 if rc or "[selftest NG]" in buf.getvalue() else 0
     if len(argv) < 2:
         print("使い方: build_audit_claims.py <機能名> | --selftest", file=sys.stderr)
         return 0

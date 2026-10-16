@@ -45,6 +45,7 @@ v48 「id_scheme 経由ヘッダ」と続いた一連の汎用化の集大成と
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 import shutil
 from pathlib import Path
 from datetime import datetime

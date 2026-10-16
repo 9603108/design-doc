@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する

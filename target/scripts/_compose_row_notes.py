@@ -13,6 +13,7 @@ WHY: 画面項目の備考(remarks)を単位(S1)が書くとき、同じ画面�
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 ORDER = 150

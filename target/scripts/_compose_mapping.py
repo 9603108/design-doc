@@ -21,7 +21,10 @@ WHY: S2 が応答の項目を画面項目へ結ぶとき、別の表示の項目
 """
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 ORDER = 120
 

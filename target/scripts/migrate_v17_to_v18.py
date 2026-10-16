@@ -26,6 +26,7 @@ import functools
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する
 # v43: ID 体系を id_scheme.json (スキル付属) 経由化、ハードコード接頭辞 "F" を全廃

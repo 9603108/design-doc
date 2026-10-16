@@ -24,6 +24,7 @@ logical_names テーブルを引いて「論理名[物理名]」表記（例: �
 import json
 import re
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 # v30: ハードコード辞書を screen_config.json に集約、_config_loader 経由で取得する
 # v51: project_config.json の forbidden_terms_map を読んで旧システムの名前等を業務語彙に置換

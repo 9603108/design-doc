@@ -16,7 +16,10 @@ ORDER を 110 にする理由: 表示名の補完は論理名(_compose_db_facts.
 """
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 
 ORDER = 110
 

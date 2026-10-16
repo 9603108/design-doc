@@ -25,6 +25,7 @@ WHY: 回し直しで値が揺れる欄は、LLM に書かせている限り毎�
 import difflib
 import json
 import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # G17: python3 -I でも同じフォルダの import を通す
 from pathlib import Path
 
 from run_units import load_units, owner_of
