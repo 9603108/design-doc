@@ -72,19 +72,38 @@ def selftest():
 #      (null 判定は screenNo の === null 1 箇所と、verify の step_no 等の is None のみで、欄なしも同じ扱い)、影響する欄は無いので空。
 NULL_KEEP_KEYS = frozenset()
 
+# WHY: 空文字(前後の空白だけも含む)の欄も null と同じく欄ごと消すが、「空であること」そのものを書いている欄だけは残す。
+#      残す欄(理由):
+#        example        画面に出す例示値。空欄として出す項目は「空欄である」ことが例示の内容
+#        initial_value  初期値。空欄で始まることが初期値の内容
+#        default        API パラメータの既定値。既定値が空文字なのと、既定値が無いのとを区別する
+#        default_value / default_text  同上(15_中間JSONスキーマ.md の欄名)
+#        value          where などの比較値・リテラル。空文字との比較は条件の内容
+#        physical_column  空=物理列を持たない別名・導出列の行。_compose_db_facts の R14、verify_partials、_vs_db がこの空を印として読む
+#      消す欄は「無い」を表すだけの欄(length・event_code・format・and_or・param_no・param_name・details_none_reason など)。
+#      下流(verify_intermediate.py・merge_partials.py・generate_docx.js)はこれらを真偽で判定し、欄なしも同じ扱い。
+EMPTY_KEEP_KEYS = frozenset({"example", "initial_value", "default", "default_value", "default_text", "value", "physical_column"})
+
+
+def _is_blank_str(v):
+    return isinstance(v, str) and v.strip() == ""
+
 
 def normalize_empty(composed):
-    """composed 内の値が None の dict の欄を、欄ごと消す(in-place)。消した件数を返す。
+    """composed 内の値が None または空文字(空白だけも含む)の dict の欄を、欄ごと消す(in-place)。消した件数を返す。
 
-    WHY: 値の無い欄(aggregate[].over など)が null と欄なしで回ごとに揺れた(run22/run23 で 124 件)ため、「欄ごと消す」にそろえる。
-    list の要素の None・空文字・空配列・0・False は触らない。NULL_KEEP_KEYS の欄は残す。呼出元: _units.compose の最後。
+    WHY: 値の無い欄(aggregate[].over など)が null と欄なしで回ごとに揺れた(run22/run23 で 124 件)。さらに空文字と欄なしも
+    揺れた(screen_layout.items[].length・event_code で計約 90 件)ため、どちらも「欄ごと消す」にそろえる。
+    list の要素の None・空文字、空配列・0・False は触らない。NULL_KEEP_KEYS(null を残す欄)と
+    EMPTY_KEEP_KEYS(空文字を残す欄)は残す。呼出元: _units.compose の最後。
     """
     n = 0
     stack = [composed]
     while stack:
         node = stack.pop()
         if isinstance(node, dict):
-            for k in [k for k, v in node.items() if v is None and k not in NULL_KEEP_KEYS]:
+            for k in [k for k, v in node.items()
+                      if (v is None and k not in NULL_KEEP_KEYS) or (_is_blank_str(v) and k not in EMPTY_KEEP_KEYS)]:
                 del node[k]
                 n += 1
             stack.extend(node.values())
@@ -97,8 +116,24 @@ def selftest_empty():
     """normalize_empty の試験。"""
     c = {"db_operations": [{"aggregate": [{"function": "count", "over": None}]}]}
     assert normalize_empty(c) == 1 and "over" not in c["db_operations"][0]["aggregate"][0], c
-    keep = {"aggregate": [{"over": {"partition_by": [], "order_by": []}, "a": "", "b": [], "c": 0, "d": False}]}
-    assert normalize_empty(keep) == 0 and len(keep["aggregate"][0]) == 5, keep
+    keep = {"aggregate": [{"over": {"partition_by": [], "order_by": []}, "b": [], "c": 0, "d": False, "e": "x", "l": ["", None]}]}
+    assert normalize_empty(keep) == 0 and len(keep["aggregate"][0]) == 6 and keep["aggregate"][0]["l"] == ["", None], keep  # 空配列・0・False・値あり・list の要素は触らない
+    # 空文字・空白だけの文字列は null と同じく欄ごと消す(欄なしにそろえる)
+    c = {"screen_layout": {"items": [{"item_name": "見出し", "length": "", "event_code": "  ", "format": "　", "remarks": None},
+                                    {"item_name": "合計", "length": "10"}]}}
+    assert normalize_empty(c) == 4, c
+    assert c["screen_layout"]["items"] == [{"item_name": "見出し"}, {"item_name": "合計", "length": "10"}], c
+    # null と空文字と欄なしの3つが、消した後は同じ形になる
+    t1, t2, t3 = {"x": [{"a": None}]}, {"x": [{"a": ""}]}, {"x": [{}]}
+    normalize_empty(t1), normalize_empty(t2)
+    assert t1 == t2 == t3, (t1, t2, t3)
+    # 空であることに意味がある欄(EMPTY_KEEP_KEYS)は空文字のまま残す。ただし null は消す
+    k = {"items": [{"example": "", "initial_value": " ", "default": "", "value": "", "physical_column": "", "remarks": ""},
+                   {"example": None, "physical_column": None}]}
+    assert normalize_empty(k) == 3, k
+    assert k["items"] == [{"example": "", "initial_value": " ", "default": "", "value": "", "physical_column": ""}, {}], k
+    # 2回目は何も変えない(冪等)
+    assert normalize_empty(k) == 0, k
     c = {"x": {"y": [{"z": {"w": None}}]}, "v": None}
     assert normalize_empty(c) == 2 and c == {"x": {"y": [{"z": {}}]}}, c
     assert normalize_empty(c) == 0, c

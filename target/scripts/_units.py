@@ -823,12 +823,13 @@ def compose(spec, frags, project_config=None, log=None):
     fixed = normalize_data_types(out)
     if log is not None and fixed > 0:
         log.append(f"[正規化] data_type を辞書の語へ {fixed} 件直す")
-    # WHY: 値の無い欄が null と欄なしで回ごとに揺れた(run22/run23 で 124 件)ため、空の表し方を「欄ごと消す」にそろえる。
+    # WHY: 値の無い欄が null・空文字・欄なしで回ごとに揺れた(run22/run23 で null 124 件・空文字約 90 件)ため、空の表し方を「欄ごと消す」にそろえる。
+    # 空文字に意味がある欄(example など)は EMPTY_KEEP_KEYS で残す。
     # 接続: _compose_normalize.normalize_empty(型の正規化の後・return の前)。
     from _compose_normalize import normalize_empty
     dropped = normalize_empty(out)
     if log is not None and dropped > 0:
-        log.append(f"[正規化] 値が null の欄を {dropped} 件消す")
+        log.append(f"[正規化] 値が null または空文字の欄を {dropped} 件消す")
     return out
 
 
