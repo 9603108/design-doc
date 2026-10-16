@@ -771,7 +771,8 @@ def validation_candidates(sources):
                 return
             out.append({"kind": kind, "field": field, "condition": cond.strip(), "src": [{"file": str(p), "line_start": no, "line_end": no}]})
         for no, line in enumerate(lines, 1):
-            if _VC_INPUT_ERR.search(line):
+            # setError(null)・setError("") はエラーを消す操作で、検査ではない
+            if _VC_INPUT_ERR.search(line) and not re.search(r"setError\(\s*(?:null|\"\"|'')\s*\)", line):
                 # 直前(最大 3 行上を含む)の if の条件が検査の条件。無ければこの行を条件にする
                 ctx = lines[max(0, no - 4):no]
                 m = next((x for x in (_VC_IF.search(c) for c in reversed(ctx)) if x), None)

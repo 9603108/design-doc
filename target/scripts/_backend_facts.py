@@ -217,6 +217,61 @@ def response_fields(ts_paths):
     return out
 
 
+_TS_CALL_NAMED = re.compile(r"\bcall\s*<\s*(\w+)\s*>\s*\(\s*[\"'](\w+)[\"']")
+_TS_TYPE = re.compile(r"\b(?:interface\s+(\w+)[^{\n=]*|type\s+(\w+)\s*=\s*)\{")
+
+
+def _key_paths(members, prefix, types, chain, out):
+    """欄の並び members の path を out に足す。型が { … }(入れ子)・interface・type の別名なら、その中を `親.子`・配列は `親[].子` で辿る。
+    index signature・Record・タプル・ユニオンは葉として止める。chain は辿り中の型名(自分を含む型の循環を止める)。"""
+    for txt, _off in members:
+        m = _TS_MEMBER.match(txt)
+        if not m or not m.group(1):
+            continue
+        path = prefix + m.group(1)
+        out.append(path)
+        base, _nullable = _union(m.group(3).strip().rstrip(","))
+        arr = ""
+        while base.endswith("[]"):
+            base, arr = base[:-2].strip(), arr + "[]"
+        if base.startswith("{") and _end(base, 0) == len(base) - 1:
+            _key_paths(_members(base, 1, len(base) - 1), path + arr + ".", types, chain, out)
+        elif re.fullmatch(r"\w+", base) and base in types and base not in chain:
+            _key_paths(types[base], path + arr + ".", types, chain | {base}, out)
+
+
+def response_key_paths(ts_paths):
+    """TS ファイル群から {action: [path]} を作る(G36。H3 の response_items の行の候補)。call<{…}>("action") と call<型名>("action") の
+    型を、入れ子の欄まで(`site.code`・`rows[].l1`・`entries.assign[].kind`)親が先の順で出す。型名は interface と type X = { … } を引く。
+    response_fields は call<{…}> と1段の interface だけ辿る(型エイリアス・入れ子の { … } は辿らない)ので、行の候補にはこちらを足す。
+    ponytail: 総称型(type X<T> = …)・交差型・Record・タプルは葉として止める。呼出元: extract_backend_draft.extract(response_item_keys)。"""
+    texts, types = [], {}
+    for p in ts_paths:
+        try:
+            raw = Path(p).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        t = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: re.sub(r"[^\n]", " ", m.group()), raw, flags=re.S)
+        texts.append(t)
+        for m in _TS_TYPE.finditer(t):
+            types[m.group(1) or m.group(2)] = _members(t, m.end(), _end(t, m.end() - 1))
+    out = {}
+    for t in texts:
+        for m in _TS_CALL.finditer(t):
+            e = _end(t, m.end() - 1)
+            am = re.match(r"\s*>\s*\(\s*[\"'](\w+)[\"']", t[e + 1:])
+            if am:
+                paths = []
+                _key_paths(_members(t, m.end(), e), "", types, frozenset(), paths)
+                out[am.group(1)] = paths
+        for m in _TS_CALL_NAMED.finditer(t):
+            if m.group(1) in types:
+                paths = []
+                _key_paths(types[m.group(1)], "", types, frozenset({m.group(1)}), paths)
+                out[m.group(2)] = paths
+    return out
+
+
 def enclosing_if(fn, node):
     """fn の中で node(raise)を body に含む最も内側の if。無ければ None。呼出元: extract_backend_draft._errors(F2)。"""
     best = None

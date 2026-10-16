@@ -10,6 +10,7 @@ ACTIONS = {"action名": module.func, ...} のような「文字列 → 関数参
   - dataset[]: {column, table}。SQL 文字列(SELECT で始まる f 文字列を含む)の最上位 SELECT 句の列(別名.列 AS x は物理列、式 AS x は別名)と、
     その列の出所テーブル(別名・WITH の名前は FROM / JOIN から解決)
   - response_items[]: {key}。action の関数が return する dict のキー(return が補助関数の呼出なら、その return を辿る)
+  - response_item_keys[]: H3 が写す行の候補(文字列)。response_items の key と response_fields の path と api.ts の型を入れ子まで辿った path(call<型名>・入れ子の { … })を、親が先・重複なし・[*] を含む path を入れずに並べたもの(rows → rows[].shop_id …)
   - error_patterns[]: {condition, status_code, message}。raise と _err(...) の返却。condition は業務語彙なので空文字(LLM が書く)
   - unresolved[]: {action, reason}。静的に取れなかったもの。推測で埋めずここにだけ出す
   - db_operations[]: {id, from, columns}。SQL 1 本ごと(id は H2 と同じ db_op_<action>、複数なら _<n>)。
@@ -49,7 +50,7 @@ import tokenize
 from pathlib import Path
 
 # 集計・ウィンドウ関数の下書き(C4)。同じフォルダの _backend_facts.py を読む(実行時の sys.path は scripts/)
-from _backend_facts import features as _features, merge_features as _merge_features, response_fields as _response_fields
+from _backend_facts import features as _features, merge_features as _merge_features, response_fields as _response_fields, response_key_paths as _response_key_paths
 # 境界値・共通エラーの事実(F2)
 from _backend_facts import boundaries as _boundaries, common_errors as _common_errors, enclosing_if as _enclosing_if
 # 語(列名)・語:列名 の対(P17)。下書きの最上位 docstring_terms に入れる
@@ -1711,6 +1712,7 @@ def extract(files, hints=None, actions=None):
                                                      "aggregate_units": o["aggregate_units"], "src": o["src"]} for o in ops]}
     # B3: 応答項目の型(api.ts)。action ごとに response_fields を足す(型が取れない API は空)
     rf = _response_fields(hints.get("ts_files") or [])
+    kp = _response_key_paths(hints.get("ts_files") or [])  # G36: 行の候補用。型名・入れ子の { … } まで辿った path
     for action, a in apis.items():
         a["response_fields"] = rf.get(action, [])
         # index signature([col: string]: …)の行は欄名が api.ts に無いので、SQL の列(別名)ごとに型の手掛かり(sql_hint・db_type・db_nullable)つきの欄を足す。
@@ -1723,6 +1725,22 @@ def extract(files, hints=None, actions=None):
                     if typ and path not in have:
                         have.add(path)
                         a["response_fields"].append({**idx, "path": path, "sql_hint": c["expression"], "db_type": typ, "db_nullable": nul})
+        # G36: H3 が「入れ子を書くか」を毎回自分で決め、同じ画面で 109 行と 48 行に揺れた(tana)。行の候補 response_item_keys を下書きが決め、担当は清書だけにする。
+        # 最上位の response_items の key と response_fields の path を、親(rows を rows[].x より先)が先・同じ path は1回の順に並べる。
+        # 続けて api.ts の型を入れ子の欄まで辿った path(型エイリアス・入れ子の { … }。response_fields は辿らない)を足す。
+        # index signature だけの path([*] を含む)は入れない。呼出先: H3 手順書(行の候補として写す)
+        keys = []
+
+        def _add_key(path):
+            if path in keys or "[*]" in path:
+                return
+            segs = path.split(".")
+            for i in range(1, len(segs)):
+                _add_key(".".join(segs[:i]).removesuffix("[]"))
+            keys.append(path)
+        for path in [x["key"] for x in a["response_items"]] + [f["path"] for f in a["response_fields"]] + kp.get(action, []):
+            _add_key(path)
+        a["response_item_keys"] = keys
         _field_sources(a)  # 別名が一致する欄に source・expression・src を足す(契約 i3.k1)
     auth = _auth(mods, tables)
     ids = {}  # メッセージ ID は下書き全体で機械採番する。同じ文面は同じ ID(別の文面に同じ ID を付けない)
@@ -1789,6 +1807,20 @@ def selftest():
     assert rf["rows[].b"]["nullable"] is True and rf["rows[].b"]["ts_base"] == "number", rf
     assert rf["rows[].name"]["nullable"] is False and rf["tags"]["ts_base"] == "string[]" and rf["n"]["ts_base"] == "number", rf
     assert rf["rows[][*]"]["index_signature"] and rf["rows"]["ts_base"] == "R[]" and r["apis"]["get_y"]["response_fields"] == [], rf
+    # G36: 行の候補 response_item_keys は、親(rows)が子(rows[].x)より先・重複なし・[*] を含む path を入れない。response_fields が空の API は response_items の key だけ
+    ks = a["response_item_keys"]
+    assert len(ks) == len(set(ks)) and not any("[*]" in k for k in ks) and {"rows", "rows[].b", "rows[].name", "tags", "n"} <= set(ks), ks
+    assert ks.index("rows") < ks.index("rows[].b") and ks.index("rows") < ks.index("rows[].name"), ks
+    assert r["apis"]["get_y"]["response_item_keys"] == [x["key"] for x in r["apis"]["get_y"]["response_items"]], r["apis"]["get_y"]["response_item_keys"]
+    # G36: call<型名>(type の別名)と入れ子の { … }・配列の別名を、親が先の path で辿る。Record・ユニオン・index signature は葉、循環は止める
+    with tempfile.TemporaryDirectory() as d2:
+        (Path(d2) / "api.ts").write_text(
+            "export type Row = { l1: number; m?: Record<string, number>; [k: string]: unknown };\n"
+            "export type Rep = {\n  /** c */\n  site: { code: string; id: number | null }; rows: Row[]; kind: \"a\" | \"b\";\n"
+            "  lay: { v: number; by?: Record<string, number> } | null;\n  tree: Rep[]; as: Row[] | null\n};\n"
+            "export function r(p: P) {\n  return call<Rep>(\"rep\", p);\n}\n", encoding="utf-8")
+        kp = _response_key_paths([Path(d2) / "api.ts"])
+    assert kp == {"rep": ["site", "site.code", "site.id", "rows", "rows[].l1", "rows[].m", "kind", "lay", "lay.v", "lay.by", "tree", "as", "as[].l1", "as[].m"]}, kp
     # G20: 別名が一致する欄だけ source(db / calculated)・expression・src を持つ。入れ物(rows)・別名の無い欄には付けない
     assert rf["rows[].name"]["source"] == {"type": "db", "op": "db_op_get_x", "column": "name"} and rf["rows[].name"]["expression"] == "s.name", rf["rows[].name"]
     assert rf["rows[].b"]["source"]["type"] == "calculated" and rf["rows[].b"]["source"]["op"] == "db_op_get_x", rf["rows[].b"]

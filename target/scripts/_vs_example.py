@@ -123,11 +123,15 @@ def _fragment_texts(item, rd):
             # WHY: 式の穴({shops.length} など)は実行時の値なので、字面の部分だけを残す
             # WHY(G35 b): 行範囲がタグの途中から始まると run にタグの切れ端(onClick={…}> の後ろの「>税抜</option><option value=」)が入る。
             #   そのまま1つの文言にすると、正しい例示値(「税抜」)が「途中から始まる断片」と誤検出されるので、< > で区切った各片を別々の文言として持つ
-            for piece in re.split(r"[<>]", re.sub(r"\{[^{}]*\}", "", run)):
+            #   入れ子の {…}(`{a ? `…${x}…` : "…"}` の外側。内側の ${x} を消した後に残る)・引用符・バッククォートでも区切る
+            for piece in re.split(r"[<>{}\"`]", re.sub(r"\{[^{}]*\}", "", run)):
                 out.append(_vs.norm(piece))
     for el in list(rd.get("jsx_elements") or []) + list(rd.get("ui_strings") or []):
         if isinstance(el, dict) and el.get("text") and _vs._overlap(src, el.get("src") or []):
-            out.append(_vs.norm(str(el["text"])))
+            # WHY(G35 b): 下書きの text は {…} やタグ・引用符をまたいで取れることがある(`>税抜</option><option value=`・`cond ? "…" : "まだ…"`)。
+            #   そのまま1つの文言にすると、正しい例示値がその途中からの断片と誤検出されるので、< > { } " ` で区切った各片を別々の文言として持つ
+            for piece in re.split(r"[<>{}\"`]", str(el["text"])):
+                out.append(_vs.norm(piece))
     return [t for t in out if t]
 
 
@@ -197,11 +201,30 @@ def _selftest_example_fragment_tag_remnant() -> bool:
     return count("税抜（シートと同じ）") == 0 and count("外す") == 0 and count("（シートと同じ）") == 1
 
 
+def _selftest_example_fragment_draft_text() -> bool:
+    """G35(b): react 下書きの ui_strings の text がタグ・{…}・引用符をまたいでいても、区切った片と同じ例示値は断片にしない。
+    片の途中からの切り出し(「ありません」だけ)は従来どおり1件出る。"""
+    def count(ex, body="x\n", ui_on=True):
+        with tempfile.TemporaryDirectory() as td:
+            tsx = Path(td, "U.tsx")
+            tsx.write_text(body, encoding="utf-8")
+            src = [{"file": str(tsx), "line_start": 1, "line_end": 1}]
+            ui = [{"text": '{a ? `保存します` : "まだ担当割りがありません。"}', "src": src},
+                  {"text": ">税抜（シートと同じ）</option><option value=", "src": src}] if ui_on else []
+            d = {"main": {"screen_layout": {"items": [{"item_name": "文言", "example": ex, "src": src}]}}, "react_draft": {"ui_strings": ui}}
+            return len(check_example_fragment(d))
+    # ソース本文の入れ子の {…}(内側の ${n} を消した後に外側の {…} が残る)も同じ
+    nested = "<p>{a ? `保存${n}件` : \"まだ担当割りがありません。\"}</p>\n"
+    return (count("まだ担当割りがありません") == 0 and count("税抜（シートと同じ）") == 0 and count("担当割りがありません") == 1
+            and count("まだ担当割りがありません", nested, False) == 0 and count("担当割りがありません", nested, False) == 1)
+
+
 # 例示値の断片の検査を CHECKS と SELFTESTS に登録する(run と selftest が呼ぶ)
 CHECKS.append(check_example_fragment)
 SELFTESTS.append(_selftest_example_fragment_hit)
 SELFTESTS.append(_selftest_example_fragment_miss)
 SELFTESTS.append(_selftest_example_fragment_tag_remnant)
+SELFTESTS.append(_selftest_example_fragment_draft_text)
 
 
 def _error_template_rx(template):

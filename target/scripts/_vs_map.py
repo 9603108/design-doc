@@ -673,14 +673,27 @@ def _selftest_front_logic_dropped() -> bool:
 
 
 # ---- 差5: 実行時の値を含む文言の例示値(店数など)の照合 ----------------------------------------------------------
-def _item_texts(main):
-    """画面項目の example と、initialization の initial_value の文字列を (場所, 種別, 文字列) で返す。呼出元: 差5 の2つの検査。"""
-    out = []
+def _item_texts(main, with_src=False):
+    """画面項目の example と、initialization の initial_value の文字列を (場所, 種別, 文字列) で返す。呼出元: 差5 の2つの検査。
+    with_src=True のときは末尾にその項目の src(無いときは空の配列)を足した 4 つ組を返す(check_jsx_text_gap が、別の行の項目を見ないために使う)。"""
+    out, by_name = [], {}
     for it in (main.get("screen_layout") or {}).get("items") or []:
-        out.append((f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "example", str(it.get("example") or "")))
+        row = (f"screen_layout.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "example", str(it.get("example") or ""))
+        by_name.setdefault(it.get("item_name"), it.get("src") or [])
+        out.append(row + (it.get("src") or [],) if with_src else row)
     for it in (main.get("initialization") or {}).get("items") or []:
-        out.append((f"initialization.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "initial_value", str(it.get("initial_value") or "")))
+        row = (f"initialization.items[{it.get('no') or it.get('item_name')}]({it.get('item_name')})", "initial_value", str(it.get("initial_value") or ""))
+        # initialization の項目は src を持たないことが多いので、同じ item_name の画面項目の src を使う
+        out.append(row + (it.get("src") or by_name.get(it.get("item_name")) or [],) if with_src else row)
     return out
+
+
+def _src_near(item_src, jx_src, margin=2):
+    """項目の src のどれかが、jx の src と同じファイルで行が重なる(前後 margin 行を許す)か。項目に src が無い・jx に src が無いときは手掛かりが無いので真。"""
+    if not item_src or not jx_src:
+        return True
+    return any(a.get("file") == b.get("file") and (a.get("line_start") or 0) <= (b.get("line_end") or 0) + margin
+               and (b.get("line_start") or 0) - margin <= (a.get("line_end") or 0) for a in item_src for b in jx_src)
 
 
 def check_docstring_count_example(d) -> list:
@@ -764,7 +777,12 @@ def check_jsx_text_gap(d) -> list:
             pats.append(("前", re.compile(re.escape(tail) + r"(\s*)\S"), 1, bool(jx.get("gap_before"))))
         elif len(head) >= 3:
             pats.append(("後", re.compile(r"\S(\s*)" + re.escape(head)), 1, bool(jx.get("gap_after"))))
-        for where, kind, text in _item_texts(main):
+        # WHY(tana02 S1 の誤検知17件の残り): 片側の語しか手掛かりが無いとき(after が空の「メーカー {x.mk}」など)は、語が別の行の項目の例示値に
+        # あるだけで(「メーカーごとに入れる」「メーカー別」)取り違える。この場合は項目の src が JSX の行の近く(前後2行)にある項目だけを見る。src の無い項目は従来どおり見る
+        one_sided = not (len(tail) >= 3 and len(head) >= 3)
+        for where, kind, text, isrc in _item_texts(main, True):
+            if one_sided and not _src_near(isrc, jx.get("src")):
+                continue
             for side, rx, gi, gap in pats:
                 for m in rx.finditer(text):
                     if bool(m.group(gi)) == gap:
@@ -805,7 +823,18 @@ def _selftest_jsx_text_gap() -> bool:
     maker = {"expr": "x.mk", "before": "メーカー", "after": "ごとの", "gap_before": False, "gap_after": True, "src": src}
     maker_far = check_jsx_text_gap(d_with("メーカーごとに入れる欄", joins=(maker,)))
     maker_bad = check_jsx_text_gap(d_with("メーカー A ごとの欄", joins=(maker,)))
+    # 片側の語しか無い式(after が空): 項目の src が JSX の行から離れていれば見ない(別の行の例示値に語があるだけ)。近ければ指摘、src が無ければ従来どおり指摘
+    one = {"expr": "x.mk", "before": "メーカー ", "after": "", "gap_before": True, "gap_after": False,
+           "src": [{"file": "/x/PosReport.tsx", "line_start": 540, "line_end": 540}]}
+
+    def d_src(ls, le):
+        return {"main": {"screen_layout": {"items": [{"no": "IT36", "item_name": "説明", "example": "メーカーごとに入れる",
+                                                      "src": [{"file": "/x/PosReport.tsx", "line_start": ls, "line_end": le}]}]}},
+                "react_draft": {"jsx_text_joins": [one]}}
+    one_far, one_near = check_jsx_text_gap(d_src(314, 314)), check_jsx_text_gap(d_src(539, 541))
+    one_nosrc = check_jsx_text_gap(d_with("メーカーごとに入れる", joins=(one,)))
     return (good == [] and len(bad) == 1 and bad[0].startswith("[ERROR] [JSXの空白] screen_layout.items[IT65]") and "差し戻し先 S1" in bad[0]
+            and one_far == [] and len(one_near) == 1 and len(one_nosrc) == 1
             and len(both) == 2 and "initialization.items[65]" in both[1] and len(keep_bad) >= 1 and keep_ok == [] and nothing
             and maker_far == [] and len(maker_bad) == 1 and maker_bad[0].startswith("[ERROR] [JSXの空白]")
             and check_jsx_text_gap({"main": {}}) == [])
