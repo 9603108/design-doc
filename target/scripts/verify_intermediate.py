@@ -1222,7 +1222,8 @@ def check_structure(merged: dict, project_config: dict) -> list:
 # 2026-10-12 新設: 論理・物理テーブル名の仮表記と物理名の形式（検査 (1)）
 # ponytail: 仮表記は角括弧と「集計結果の列」だけを見る。他の仮表記は見逃すので、増えたら語を足す
 PLACEHOLDER_NAME_RE = re.compile(r"[\[\]［］]|集計結果の列")
-PHYSICAL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# 2026-10-16: PostgreSQL の schema.table(各部分が英数字と _、. は1つまで)も正しい物理名。layout.sites・tana.entries を ERROR にしていた
+PHYSICAL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$")
 # messages[].code のメッセージID形式（例 MSE00001 / MSG_POS_001）（検査 (3)）
 MESSAGE_CODE_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*\d+$")
 
@@ -1312,6 +1313,7 @@ def _has_brace_hole(path: str, s: str) -> bool:
 # 2026-10-13: 画面項目の例示値は、実行時に決まる値(金額・件数・日付など)を {金額} 円 のように書式の例として書く(S1 手順書)。
 # 具体的な値はソースに無く verify_vs_source が止めるため。この道筋の {名前} は未展開の穴とみなさない
 EXAMPLE_PATH_RE = re.compile(r"^screen_layout\.items\[\d+\]\.example$")
+INIT_VALUE_PATH_RE = re.compile(r"^initialization\.items\[\d+\]\.initial_value$")
 # WHY(2026-10-15 run15 差6): messages の可変部は {項目名} で書くのがスキーマの形(15_中間JSONスキーマ.md の例「{項目名}は必須項目です。」)で、
 #   ソースが `（HTTP ${r2.status}）` のようにテンプレートリテラルで組む文面の ${x} に対応する。これを未展開の穴として ERROR にすると、
 #   H4 が正しく書いた「（HTTP {status}）」を語(「HTTP ステータスコード」)に置き換え、画面に出る形と区別できない文面になった。
@@ -1372,7 +1374,11 @@ def check_intermediate_strict(merged: dict) -> list:
         # 理由: 例示値は書式の例として実値で書くのが正(S1 手順書)。穴は S1 へ戻して実値に直させる
         # messages[].message の {名前} は、ソースのテンプレートリテラルの ${x} に対応する可変部の正しい書き方なので穴にしない(MESSAGE_PATH_RE の WHY)
         if "〈" in s or (_has_brace_hole(path, s) and not EXAMPLE_PATH_RE.match(path) and not MESSAGE_PATH_RE.match(path)):
-            issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'"))
+            # WHY(2026-10-16 棚分析): 初期値の穴は、react 下書きの式を state の初期値で評価できなかった残り(props・ループで決まる文言)。
+            # 差し戻しの印が無いと担当が引けず unknown に落ちた。直す場所は S1 の画面項目の initial_value(merge_partials._initial_value が穴の式より優先して使う)
+            hole_back = (" → 差し戻し先 S1（画面項目の initial_value に、初期表示で画面に出る文言か条件分岐の文を書く。式のまま残さない）"
+                         if INIT_VALUE_PATH_RE.match(path) else "")
+            issues.append(("ERROR", f"{path}: 未展開の穴（〈 または {{名前}}）が残存: '{s[:80]}'{hole_back}"))
         # 例示値の {名前} は WARN に留める(最終段で残れば S1 へ差し戻す)。ERROR にすると docx 生成前に止まり、S1 の手戻りを機械的に強制しすぎるため
         elif EXAMPLE_PATH_RE.match(path) and EXAMPLE_HOLE_RE.search(s):
             issues.append(("WARN", f"{path}: 例示値に {{…}} の穴が残る（書式の例を実値で書き直す）: '{s[:80]}' → 差し戻し先 S1"))
