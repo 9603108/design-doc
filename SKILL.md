@@ -35,7 +35,7 @@ design-doc = 詳細設計書、basic-design = 概要設計書（対になる別�
 - 公式 docx スキルは不要。docx は `target/scripts/generate_docx.js` が `docx` パッケージで直接生成する
 - スキル本体は特定の MCP・環境の道具に依存しない
 - `SendUserFile` ツールがある環境では、完了時にそれで docx を送る。無い環境では、出力ファイルの絶対パスを報告する
-- 欄を書く担当は、専用の型 design-doc-unit（道具は codeflow・Bash・Write）で起動する。general-purpose は使わない。担当を起動できるのはメインだけで、model は units.json の値（haiku/sonnet）を Agent の model に明示して渡す。design-doc-unit を起動できる環境では、HTML 単位で並列に処理できる（Phase 1 の成果を固定名の partial 4本で渡す場合は並列にできない。Step 3「Phase 1 の成果物の渡し方」を参照）。起動できない環境では、メインセッションで1画面ずつ順に処理する
+- 欄を書く担当は、専用の型 design-doc-unit（道具は tadori・Bash・Write）で起動する。general-purpose は使わない。担当を起動できるのはメインだけで、model は units.json の値（haiku/sonnet）を Agent の model に明示して渡す。design-doc-unit を起動できる環境では、HTML 単位で並列に処理できる（Phase 1 の成果を固定名の partial 4本で渡す場合は並列にできない。Step 3「Phase 1 の成果物の渡し方」を参照）。起動できない環境では、メインセッションで1画面ずつ順に処理する
 - メインは Bash を使わない。python3 や node の script（run_units.py・verify_*・generate_docx.js・Phase 2 以降のパイプラインなど）は、メインが tool-worker に流させる。コマンドの中身（引数・順序）はこの文書のとおりで、tool-worker に渡す内容になる。欄の作業の中で要る script（`verify_partials.py --units --unit` など）は、担当（design-doc-unit）自身が流す
 - run の作業場所（`--out` の出力先・依頼文・判定の書き先）は、スキルの `target/` の配下に置く（/private/tmp の外）
 - この文書のコマンド例は、カレントディレクトリがこのスキルのフォルダ（SKILL.md のある場所）である前提で書いている

@@ -103,8 +103,8 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     lines = [
         f"design-doc スキルの委譲の単位 {u}({spec['title']})を行う。機能名(FEATURE_NAME): {feat}。",
         "",
-        "【あなたの道具】型 design-doc-unit(codeflow の find・view・edit・create と Bash と Write を持つ)。"
-        "ファイルの読み書きは codeflow(mcp__codeflow__find / view / edit / create)で、絶対パスで行う。"
+        "【あなたの道具】型 design-doc-unit(tadori の ask・view・edit と Bash と Write を持つ)。"
+        "ファイルの読み書きは tadori(mcp__tadori__ask / view / edit)で、絶対パスで行う。"
         "Bash は検査の python3 実行だけに使い、grep/cat/sed でソースを読まない。",
         "",
         "【パス(全て絶対パス)】",
