@@ -11,10 +11,10 @@ WHY: メインが手で組んでいた「単位ごとの依頼文」「検査後
   gate <機能名>                                     after・許可リスト照合・audit の合否を1つ出す(全部合格なら exit 0)
   save-run <機能名> <run名> [--log <path>]...  中間JSON・断片・検査ログ・docx を target/runs/<run名>/ に控える
 
-接続: メインは Bash を使わないので、この script は tool-worker に流させる(メインが直に流さない)。
-prompts の出力は呼出元(メイン)が Agent の prompt に渡し、担当は型 design-doc-unit で起動する
+接続: メインは Bash を使わないので、この script は general-purpose に流させる(メインが直に流さない)。
+prompts の出力は呼出元(メイン)が Agent の prompt に渡し、担当は general-purpose で起動する
 (model は units.json の値を Agent の model に明示する)。after は単位の書込みが終わった後に
-tool-worker が流す。retry は after が出した sendbacks を受けて、その単位だけ呼び直す。
+general-purpose が流す。retry は after が出した sendbacks を受けて、その単位だけ呼び直す。
 出力先(--out など)は target/ の配下に置く(/private/tmp の外)。
 run の保存(save-run)も /private/tmp の片付けで消えないよう target/ の配下に置く。
 標準ライブラリのみ。
@@ -40,8 +40,8 @@ COMMON = SKILL / "prompts" / "_共通.md"
 SENDBACK_RE = re.compile(r"→ 差し戻し先 (\S+)")
 UNIT_LIST_RE = re.compile(r"[A-Za-z0-9_,、/]+")  # 差し戻し先の直後の単位名の並び(説明の括弧は含めない)
 DIAGRAM_MARK = "(構成図)"
-# WHY: 欄を書く担当は専用の型 design-doc-unit で起動する(general-purpose は使わない)。起動できるのはメインだけ。出力の JSON に型を入れ、Agent の subagent_type へそのまま渡せるようにする。
-SUBAGENT_TYPE = "design-doc-unit"
+# WHY: 欄を書く担当は general-purpose で起動する。起動できるのはメインだけ。出力の JSON に型を入れ、Agent の subagent_type へそのまま渡せるようにする。
+SUBAGENT_TYPE = "general-purpose"
 
 
 def _run_env(feat):
@@ -103,7 +103,7 @@ def build_prompt(units, feat, u, srcs=(), sendbacks=()):
     lines = [
         f"design-doc スキルの委譲の単位 {u}({spec['title']})を行う。機能名(FEATURE_NAME): {feat}。",
         "",
-        "【あなたの道具】型 design-doc-unit(tadori の ask・view・edit と Bash と Write を持つ)。"
+        "【あなたの道具】tadori の ask・view・edit と Bash と Write を使う。_unit_*.json は Write で書く。"
         "ファイルの読み書きは tadori(mcp__tadori__ask / view / edit)で、絶対パスで行う。"
         "Bash は検査の python3 実行だけに使い、grep/cat/sed でソースを読まない。",
         "",
@@ -897,7 +897,7 @@ def save_run(feat, run, logs=(), runs_root=None, inter=None, output_dir=None):
     WHY: /private/tmp の片付けで run17・run18 が消えたため。回し直しの比較をするには過去の run が残っている必要がある。
     他の run を壊さないよう保存先が既にあれば FileExistsError。ただし logs/ と仕分けの記録(直下の .md)だけの run は成果物が無いので控えを許す
     (検査ログ・仕分けの記録だけ先に置かれた run への控え。logs/ の同名ファイルは copy2 で置き換わり、.md は触らない)。無い対象は黙って飛ばさず skipped に返す。
-    呼出元: main の save-run(メインの tool-worker が after と audit-check の後に流す)。
+    呼出元: main の save-run(メインの general-purpose が after と audit-check の後に流す)。
     戻り: (dest, copied(dest からの相対パス), skipped(控えられなかった対象の名前))。"""
     if not run or "/" in run or ".." in run:
         raise ValueError(f"run 名が不正(空・'/'・'..' は不可): {run!r}")
@@ -1133,7 +1133,7 @@ def main(argv=None):
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 1 if sendbacks else 0
     if a.cmd == "save-run":
-        # WHY: run の成果物を /private/tmp の片付けで失わないよう target/runs/ に控える。呼出元: メインの tool-worker(after と audit-check の後)。
+        # WHY: run の成果物を /private/tmp の片付けで失わないよう target/runs/ に控える。呼出元: メインの general-purpose(after と audit-check の後)。
         # 飛ばしがあっても控えたことは成立するので 0。上書き・不正な run 名・無いログは握りつぶさず 2。
         try:
             dest, copied, skipped = save_run(a.feature, a.run, logs=a.log)
